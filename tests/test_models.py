@@ -51,8 +51,8 @@ class BasicProfile:
     def should_finish(self, state: RunState) -> bool:
         return False
 
-    def compact(self, state: RunState) -> RunState:
-        return state
+    def compact(self, state: RunState) -> None:
+        return None
 
 
 class RecordingOpenAIProvider(OpenAICompatibleProvider):
