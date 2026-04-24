@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from agentd.contracts import Executor, LocalExecutor, ModelProvider, PolicyEngine, Profile, Tool
-from agentd.output import write_run_outputs
+from agentd.output import write_model_request_artifacts, write_model_response_artifact, write_run_outputs
 from agentd.state import PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, Workspace
 
 
@@ -80,23 +80,39 @@ class Kernel:
                     "visible_tools": [tool.name for tool in visible_tools],
                 },
             )
+            model_call_index = state.turn_count + 1
+            context_artifact, request_artifact = write_model_request_artifacts(
+                state,
+                call_index=model_call_index,
+                provider=self.model.name,
+                messages=messages,
+                tools=visible_tools,
+            )
             state.add_event(
                 "ModelRequest",
                 {
                     "provider": self.model.name,
                     "message_count": len(messages),
                     "tool_count": len(visible_tools),
+                    "context_artifact": context_artifact,
+                    "request_artifact": request_artifact,
                 },
             )
 
             response = self.model.complete(messages, visible_tools, state)
             state.turn_count += 1
+            response_artifact = write_model_response_artifact(
+                state,
+                call_index=model_call_index,
+                response=response,
+            )
             state.add_event(
                 "ModelResponse",
                 {
                     "content_length": len(response.content),
                     "tool_call_count": len(response.tool_calls),
                     "finish_reason": response.finish_reason,
+                    "response_artifact": response_artifact,
                 },
             )
 
