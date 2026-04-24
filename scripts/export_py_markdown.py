@@ -1,4 +1,4 @@
-"""Export repository Python files into one Markdown document."""
+"""Export core repository Python files into one Markdown document."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 
 EXCLUDED_DIRS = {".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tinyagent", ".venv", "__pycache__"}
+CORE_DIRS = {"agentctl", "agentd", "profiles"}
 
 
 def main() -> int:
@@ -30,7 +31,11 @@ def main() -> int:
 
 
 def iter_python_files(root: Path) -> list[Path]:
-    return sorted(path for path in root.rglob("*.py") if not any(part in EXCLUDED_DIRS for part in path.parts))
+    return sorted(
+        path
+        for path in root.rglob("*.py")
+        if path.relative_to(root).parts[0] in CORE_DIRS and not any(part in EXCLUDED_DIRS for part in path.parts)
+    )
 
 
 def render(repo_root: Path, files: list[Path]) -> str:

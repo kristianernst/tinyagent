@@ -408,10 +408,18 @@ The most important thing to avoid next is building a generalized tool registry o
 
 ## Source Bundle
 
-For reviewers who want one file with all Python source, generate:
+For reviewers who want one file with the core Python source, generate:
 
 ```bash
 python3 scripts/export_py_markdown.py
+```
+
+The generated output excludes tests and utility scripts. It includes only core package code from:
+
+```text
+agentctl/
+agentd/
+profiles/
 ```
 
 The generated output is:
