@@ -99,7 +99,11 @@ class Kernel:
                 },
             )
 
-            response = self.model.complete(messages, visible_tools, state)
+            try:
+                response = self.model.complete(messages, visible_tools, state)
+            except Exception as exc:
+                state.fail(f"Model provider error: {exc}")
+                return
             state.turn_count += 1
             response_artifact = write_model_response_artifact(
                 state,
