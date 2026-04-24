@@ -47,6 +47,10 @@ class Event:
     id: str = field(default_factory=lambda: f"evt_{uuid4().hex}")
     time: datetime = field(default_factory=utc_now)
 
+    def __post_init__(self) -> None:
+        if self.type not in EVENT_TYPES:
+            raise ValueError(f"Unknown event type: {self.type}")
+
     def to_json_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,

@@ -120,6 +120,13 @@ class Kernel:
                 },
             )
 
+            if not response.tool_calls:
+                if response.content:
+                    state.finish(response.content)
+                else:
+                    state.fail("Model returned no content and no tool calls.")
+                return
+
             for call in response.tool_calls:
                 if self._tool_budget_exhausted(state):
                     return
@@ -141,24 +148,63 @@ class Kernel:
                 "tool": call.name,
             },
         )
+        state.tool_call_count += 1
 
         decision = self.policy.evaluate(call, state)
         self._record_policy_decision(state, call, decision)
         if not decision.allowed:
-            state.tool_results.append(
-                ToolResult(tool_name=call.name, output=decision.reason or "Policy denied tool call.", ok=False)
+            result = ToolResult(
+                tool_name=call.name,
+                call_id=call.id,
+                output=decision.reason or "Policy denied tool call.",
+                ok=False,
+                data={"blocked": True},
             )
+            state.tool_results.append(result)
+            self._record_tool_result(state, call, result)
             return
 
         tool = self.tools.get(call.name)
         if tool is None:
+            result = ToolResult(
+                tool_name=call.name,
+                call_id=call.id,
+                output=f"Unknown tool requested: {call.name}",
+                ok=False,
+                data={"error_type": "UnknownTool"},
+            )
+            state.tool_results.append(result)
+            self._record_tool_result(state, call, result)
             state.fail(f"Unknown tool requested: {call.name}")
             return
 
         state.add_event("ToolCallStarted", {"tool_call_id": call.id, "tool": call.name})
-        result = self.executor.run_tool(tool, call, state)
-        state.tool_call_count += 1
+        try:
+            result = self.executor.run_tool(tool, call, state)
+        except Exception as exc:
+            result = ToolResult(
+                tool_name=call.name,
+                call_id=call.id,
+                output=f"Tool error: {exc}",
+                ok=False,
+                data={"error_type": type(exc).__name__},
+            )
+        if not result.call_id:
+            result = ToolResult(
+                tool_name=result.tool_name,
+                output=result.output,
+                call_id=call.id,
+                ok=result.ok,
+                data=result.data,
+                finish=result.finish,
+            )
         state.tool_results.append(result)
+        self._record_tool_result(state, call, result)
+
+        if result.finish:
+            state.finish(result.output)
+
+    def _record_tool_result(self, state: RunState, call: ToolCall, result: ToolResult) -> None:
         state.add_event(
             "ToolCallFinished",
             {
@@ -166,11 +212,11 @@ class Kernel:
                 "tool": call.name,
                 "ok": result.ok,
                 "finish": result.finish,
+                "blocked": bool(result.data.get("blocked")),
+                "output": result.output[: state.budgets.max_command_output_chars_visible],
+                "data": result.data,
             },
         )
-
-        if result.finish:
-            state.finish(result.output)
 
     def _record_policy_decision(self, state: RunState, call: ToolCall, decision: PolicyDecision) -> None:
         state.add_event(
