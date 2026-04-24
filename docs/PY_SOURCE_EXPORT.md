@@ -178,7 +178,7 @@ class Event:
             "type": self.type,
             "time": self.time.isoformat().replace("+00:00", "Z"),
             "parent_event_id": self.parent_event_id,
-            "data": self.data,
+            "data": json_safe(self.data),
         }
 
     @classmethod
@@ -196,6 +196,22 @@ class Event:
 
 def load_events_jsonl(path: Path) -> list[Event]:
     return [Event.from_json_dict(json.loads(line)) for line in path.read_text().splitlines() if line.strip()]
+
+
+def json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    if isinstance(value, datetime):
+        return value.isoformat().replace("+00:00", "Z")
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [json_safe(item) for item in value]
+    return repr(value)
 ```
 
 ## `agentd/kernel.py`
@@ -353,7 +369,23 @@ class Kernel:
         )
         state.tool_call_count += 1
 
-        decision = self.policy.evaluate(call, state)
+        try:
+            decision = self.policy.evaluate(call, state)
+        except Exception as exc:
+            decision = PolicyDecision.deny(f"Policy engine error: {exc}")
+            self._record_policy_decision(state, call, decision)
+            result = ToolResult(
+                tool_name=call.name,
+                call_id=call.id,
+                output=decision.reason,
+                ok=False,
+                data={"blocked": True, "error_type": type(exc).__name__},
+            )
+            state.tool_results.append(result)
+            self._record_tool_result(state, call, result)
+            state.fail(decision.reason)
+            return
+
         self._record_policy_decision(state, call, decision)
         if not decision.allowed:
             result = ToolResult(
@@ -374,11 +406,10 @@ class Kernel:
                 call_id=call.id,
                 output=f"Unknown tool requested: {call.name}",
                 ok=False,
-                data={"error_type": "UnknownTool"},
+                data={"error_type": "UnknownTool", "available_tools": sorted(self.tools)},
             )
             state.tool_results.append(result)
             self._record_tool_result(state, call, result)
-            state.fail(f"Unknown tool requested: {call.name}")
             return
 
         state.add_event("ToolCallStarted", {"tool_call_id": call.id, "tool": call.name})
@@ -408,6 +439,8 @@ class Kernel:
             state.finish(result.output)
 
     def _record_tool_result(self, state: RunState, call: ToolCall, result: ToolResult) -> None:
+        output_limit = state.budgets.max_command_output_chars_visible
+        output = result.output[:output_limit]
         state.add_event(
             "ToolCallFinished",
             {
@@ -416,7 +449,9 @@ class Kernel:
                 "ok": result.ok,
                 "finish": result.finish,
                 "blocked": bool(result.data.get("blocked")),
-                "output": result.output[: state.budgets.max_command_output_chars_visible],
+                "output": output,
+                "output_chars": len(result.output),
+                "output_truncated": len(result.output) > output_limit,
                 "data": result.data,
             },
         )
@@ -606,11 +641,10 @@ def _parse_tool_call(call: dict[str, Any]) -> ToolCall:
         raise ProviderError(f"Tool call arguments for {name} are invalid JSON.") from exc
     if not isinstance(args, dict):
         raise ProviderError(f"Tool call arguments for {name} must be a JSON object.")
-    return ToolCall(
-        id=call.get("id") or "",
-        name=name,
-        args=args,
-    )
+    call_id = call.get("id")
+    if call_id:
+        return ToolCall(id=call_id, name=name, args=args)
+    return ToolCall(name=name, args=args)
 ```
 
 ## `agentd/output.py`
@@ -872,7 +906,11 @@ class RunState:
         if not resolved_workspace.root.exists() or not resolved_workspace.root.is_dir():
             raise ValueError(f"Workspace does not exist or is not a directory: {resolved_workspace.root}")
         resolved_run_id = run_id or f"run_{uuid4().hex}"
-        resolved_output_dir = output_dir or resolved_workspace.root / ".tinyagent" / "runs" / resolved_run_id
+        resolved_output_dir = (
+            output_dir.expanduser().resolve()
+            if output_dir
+            else resolved_workspace.root / ".tinyagent" / "runs" / resolved_run_id
+        )
         return cls(
             run_id=resolved_run_id,
             task=task,

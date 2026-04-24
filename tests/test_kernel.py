@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
@@ -19,6 +21,11 @@ class AllowAllPolicy:
 class DenyAllPolicy:
     def evaluate(self, call: ToolCall, state: RunState) -> PolicyDecision:
         return PolicyDecision.deny(f"{call.name} denied")
+
+
+class ExplodingPolicy:
+    def evaluate(self, call: ToolCall, state: RunState) -> PolicyDecision:
+        raise RuntimeError("policy broke")
 
 
 class BasicProfile:
@@ -158,6 +165,8 @@ def test_kernel_dispatches_model_policy_and_tool_until_finish(tmp_path) -> None:
         "finish": True,
         "blocked": False,
         "output": "done",
+        "output_chars": 4,
+        "output_truncated": False,
         "data": {},
     }
 
@@ -251,7 +260,42 @@ def test_denied_tool_call_gets_finished_event_and_counts_requested_call(tmp_path
     assert tool_finished.data["ok"] is False
     assert tool_finished.data["blocked"] is True
     assert tool_finished.data["output"] == "noop denied"
+    assert tool_finished.data["output_chars"] == len("noop denied")
+    assert tool_finished.data["output_truncated"] is False
     assert tool_finished.data["data"] == {"blocked": True}
+
+
+def test_policy_exception_fails_closed_and_records_tool_result(tmp_path) -> None:
+    call = ToolCall(name="noop")
+    model = StaticModel([ModelResponse(tool_calls=[call])])
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[NoopTool()],
+        policy=ExplodingPolicy(),
+    )
+
+    state = kernel.run("policy error", workspace=tmp_path)
+
+    assert state.failed is True
+    assert state.failure_reason == "Policy engine error: policy broke"
+    assert state.tool_call_count == 1
+    assert state.tool_results == [
+        ToolResult(
+            tool_name="noop",
+            output="Policy engine error: policy broke",
+            call_id=call.id,
+            ok=False,
+            data={"blocked": True, "error_type": "RuntimeError"},
+        )
+    ]
+    assert event_types(state)[-3:] == ["PolicyDecision", "ToolCallFinished", "RunFailed"]
+    policy_decision = next(event for event in state.events if event.type == "PolicyDecision")
+    assert policy_decision.data["allowed"] is False
+    assert policy_decision.data["reason"] == "Policy engine error: policy broke"
+    tool_finished = next(event for event in state.events if event.type == "ToolCallFinished")
+    assert tool_finished.data["blocked"] is True
+    assert tool_finished.data["data"] == {"blocked": True, "error_type": "RuntimeError"}
 
 
 def test_tool_exception_gets_finished_event(tmp_path) -> None:
@@ -277,29 +321,39 @@ def test_tool_exception_gets_finished_event(tmp_path) -> None:
     assert tool_finished.data["tool_call_id"] == call.id
     assert tool_finished.data["ok"] is False
     assert tool_finished.data["output"] == "Tool error: boom"
+    assert tool_finished.data["output_chars"] == len("Tool error: boom")
+    assert tool_finished.data["output_truncated"] is False
     assert tool_finished.data["data"] == {"error_type": "RuntimeError"}
 
 
-def test_unknown_tool_gets_finished_event_before_run_failure(tmp_path) -> None:
+def test_unknown_tool_records_result_with_available_tools_and_can_recover(tmp_path) -> None:
     call = ToolCall(name="missing")
-    model = StaticModel([ModelResponse(tool_calls=[call])])
+    finish_call = ToolCall(name="noop")
+    model = StaticModel(
+        [
+            ModelResponse(tool_calls=[call]),
+            ModelResponse(tool_calls=[finish_call]),
+        ]
+    )
     kernel = Kernel(
         model=model,
         profile=BasicProfile(),
-        tools=[],
+        tools=[NoopTool()],
         policy=AllowAllPolicy(),
+        budgets=RunBudgets(max_turns=2),
     )
 
     state = kernel.run("missing tool", workspace=tmp_path)
 
     assert state.failed is True
-    assert state.failure_reason == "Unknown tool requested: missing"
-    assert event_types(state)[-2:] == ["ToolCallFinished", "RunFailed"]
-    tool_finished = next(event for event in state.events if event.type == "ToolCallFinished")
-    assert tool_finished.data["tool_call_id"] == call.id
-    assert tool_finished.data["ok"] is False
-    assert tool_finished.data["output"] == "Unknown tool requested: missing"
-    assert tool_finished.data["data"] == {"error_type": "UnknownTool"}
+    assert state.failure_reason == "Run exceeded max_turns budget."
+    assert state.turn_count == 2
+    assert state.tool_call_count == 2
+    first_finished = [event for event in state.events if event.type == "ToolCallFinished"][0]
+    assert first_finished.data["tool_call_id"] == call.id
+    assert first_finished.data["ok"] is False
+    assert first_finished.data["output"] == "Unknown tool requested: missing"
+    assert first_finished.data["data"] == {"error_type": "UnknownTool", "available_tools": ["noop"]}
 
 
 def test_tool_finished_output_is_truncated(tmp_path) -> None:
@@ -317,6 +371,8 @@ def test_tool_finished_output_is_truncated(tmp_path) -> None:
 
     tool_finished = next(event for event in state.events if event.type == "ToolCallFinished")
     assert tool_finished.data["output"] == "abc"
+    assert tool_finished.data["output_chars"] == 6
+    assert tool_finished.data["output_truncated"] is True
     assert tool_finished.data["data"] == {"full_output_artifact": "artifacts/tool.txt"}
 
 
@@ -367,6 +423,16 @@ def test_workspace_must_be_directory(tmp_path) -> None:
         RunState.create("task", Workspace(file_path))
 
 
+def test_custom_output_dir_is_resolved(tmp_path) -> None:
+    output_dir = tmp_path / "workspace" / ".." / "out"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    state = RunState.create("task", Workspace(workspace), output_dir=output_dir)
+
+    assert state.output_dir == (tmp_path / "out").resolve()
+
+
 def test_event_taxonomy_includes_milestone_zero_required_events() -> None:
     assert {
         "RunStarted",
@@ -392,3 +458,33 @@ def test_event_taxonomy_includes_milestone_zero_required_events() -> None:
 def test_unknown_event_type_rejected() -> None:
     with pytest.raises(ValueError, match="Unknown event type"):
         Event(run_id="run_test", type="TypoEvent")
+
+
+def test_event_data_is_json_safe_for_common_non_json_types(tmp_path) -> None:
+    class Custom:
+        def __repr__(self) -> str:
+            return "<Custom value>"
+
+    event = Event(
+        run_id="run_test",
+        type="ArtifactWritten",
+        data={
+            "path": Path("somewhere"),
+            "time": datetime(2026, 4, 25, tzinfo=UTC),
+            "tuple": ("a", Path("b")),
+            "bytes": b"hello",
+            "custom": Custom(),
+            12: "numeric key",
+        },
+    )
+
+    assert event.to_json_dict()["data"] == {
+        "path": "somewhere",
+        "time": "2026-04-25T00:00:00Z",
+        "tuple": ["a", "b"],
+        "bytes": "hello",
+        "custom": "<Custom value>",
+        "12": "numeric key",
+    }
+    (tmp_path / "events.jsonl").write_text(json.dumps(event.to_json_dict()) + "\n")
+    assert load_events_jsonl(tmp_path / "events.jsonl")[0].data["custom"] == "<Custom value>"

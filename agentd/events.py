@@ -58,7 +58,7 @@ class Event:
             "type": self.type,
             "time": self.time.isoformat().replace("+00:00", "Z"),
             "parent_event_id": self.parent_event_id,
-            "data": self.data,
+            "data": json_safe(self.data),
         }
 
     @classmethod
@@ -76,3 +76,19 @@ class Event:
 
 def load_events_jsonl(path: Path) -> list[Event]:
     return [Event.from_json_dict(json.loads(line)) for line in path.read_text().splitlines() if line.strip()]
+
+
+def json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    if isinstance(value, datetime):
+        return value.isoformat().replace("+00:00", "Z")
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [json_safe(item) for item in value]
+    return repr(value)

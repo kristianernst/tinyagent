@@ -162,6 +162,34 @@ def test_openai_compatible_provider_sends_messages_tools_and_parses_tool_calls()
     assert response.tool_calls == [ToolCall(id="call_1", name="finish", args={"summary": "done"})]
 
 
+def test_openai_compatible_provider_generates_tool_call_id_when_provider_omits_id() -> None:
+    provider = RecordingOpenAIProvider(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "finish",
+                                    "arguments": "{}",
+                                },
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+    )
+
+    response = provider.complete([], [], _state_stub())
+
+    assert response.tool_calls[0].name == "finish"
+    assert response.tool_calls[0].args == {}
+    assert response.tool_calls[0].id.startswith("call_")
+
+
 def test_openai_compatible_provider_rejects_invalid_tool_arguments() -> None:
     provider = RecordingOpenAIProvider(
         {
