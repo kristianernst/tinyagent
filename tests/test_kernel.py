@@ -4,6 +4,7 @@ import json
 from collections.abc import Mapping, Sequence
 
 from agentd.contracts import Tool
+from agentd.events import EVENT_TYPES, load_events_jsonl
 from agentd.kernel import Kernel
 from agentd.state import Message, ModelResponse, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult
 
@@ -93,7 +94,10 @@ def test_kernel_dispatches_model_policy_and_tool_until_finish(tmp_path) -> None:
     assert event_types(state) == [
         "RunStarted",
         "ContextBuilt",
+        "ArtifactWritten",
+        "ArtifactWritten",
         "ModelRequest",
+        "ArtifactWritten",
         "ModelResponse",
         "ToolCallRequested",
         "PolicyDecision",
@@ -106,6 +110,25 @@ def test_kernel_dispatches_model_policy_and_tool_until_finish(tmp_path) -> None:
     metrics = json.loads((state.output_dir / "metrics.json").read_text())
     assert metrics["status"] == "finished"
     assert metrics["turn_count"] == 1
+
+    model_request = next(event for event in state.events if event.type == "ModelRequest")
+    model_response = next(event for event in state.events if event.type == "ModelResponse")
+    assert model_request.data["context_artifact"] == "artifacts/context-0001.md"
+    assert model_request.data["request_artifact"] == "artifacts/model-request-0001.json"
+    assert model_response.data["response_artifact"] == "artifacts/model-response-0001.json"
+
+    context = (state.output_dir / model_request.data["context_artifact"]).read_text()
+    request = json.loads((state.output_dir / model_request.data["request_artifact"]).read_text())
+    response = json.loads((state.output_dir / model_response.data["response_artifact"]).read_text())
+
+    assert "finish the task" in context
+    assert "finish" in context
+    assert request["provider"] == "static-model"
+    assert request["messages"][1] == {"role": "user", "content": "finish the task"}
+    assert response["tool_calls"] == [{"id": finish_call.id, "name": "finish", "args": {"summary": "done"}}]
+
+    loaded_events = load_events_jsonl(state.output_dir / "events.jsonl")
+    assert [event.to_json_dict() for event in loaded_events] == [event.to_json_dict() for event in state.events]
 
 
 def test_kernel_max_turn_failure_writes_required_outputs(tmp_path) -> None:
@@ -161,3 +184,25 @@ def test_kernel_max_tool_call_failure_is_evented(tmp_path) -> None:
     metrics = json.loads((state.output_dir / "metrics.json").read_text())
     assert metrics["status"] == "failed"
     assert metrics["tool_call_count"] == 1
+
+
+def test_event_taxonomy_includes_milestone_zero_required_events() -> None:
+    assert {
+        "RunStarted",
+        "RunFinished",
+        "RunFailed",
+        "ContextBuilt",
+        "ModelRequest",
+        "ModelResponse",
+        "ToolCallRequested",
+        "PolicyDecision",
+        "ToolCallStarted",
+        "ToolCallFinished",
+        "CommandStarted",
+        "CommandFinished",
+        "PatchApplied",
+        "FileRead",
+        "SearchCompleted",
+        "DiffSnapshot",
+        "ArtifactWritten",
+    } <= EVENT_TYPES

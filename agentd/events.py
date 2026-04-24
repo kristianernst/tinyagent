@@ -2,10 +2,34 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
+
+EVENT_TYPES = frozenset(
+    {
+        "RunStarted",
+        "RunFinished",
+        "RunFailed",
+        "ContextBuilt",
+        "ModelRequest",
+        "ModelResponse",
+        "ToolCallRequested",
+        "PolicyDecision",
+        "ToolCallStarted",
+        "ToolCallFinished",
+        "CommandStarted",
+        "CommandFinished",
+        "PatchApplied",
+        "FileRead",
+        "SearchCompleted",
+        "DiffSnapshot",
+        "ArtifactWritten",
+    }
+)
 
 
 def utc_now() -> datetime:
@@ -32,3 +56,19 @@ class Event:
             "parent_event_id": self.parent_event_id,
             "data": self.data,
         }
+
+    @classmethod
+    def from_json_dict(cls, data: dict[str, Any]) -> Event:
+        timestamp = data["time"].replace("Z", "+00:00")
+        return cls(
+            id=data["id"],
+            run_id=data["run_id"],
+            type=data["type"],
+            time=datetime.fromisoformat(timestamp),
+            parent_event_id=data.get("parent_event_id"),
+            data=data.get("data", {}),
+        )
+
+
+def load_events_jsonl(path: Path) -> list[Event]:
+    return [Event.from_json_dict(json.loads(line)) for line in path.read_text().splitlines() if line.strip()]
