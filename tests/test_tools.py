@@ -29,7 +29,7 @@ from agentd.tools import (
     default_tools,
     repo_inspect_tools,
 )
-from agentd.tools_repo import _run_rg_limited
+from agentd.tools.repo import _run_rg_limited
 
 
 def test_list_and_search_exclude_tinyagent_outputs(tmp_path) -> None:
@@ -313,7 +313,7 @@ def test_search_repo_rg_uses_sanitized_environment(tmp_path, monkeypatch) -> Non
     fake_rg.chmod(0o755)
     monkeypatch.setenv("OPENAI_API_KEY", "secret")
     monkeypatch.setenv("TINYAGENT_MODEL_API_KEY", "tiny-secret")
-    monkeypatch.setattr("agentd.tools_repo.shutil.which", lambda _name: str(fake_rg))
+    monkeypatch.setattr("agentd.tools.repo.shutil.which", lambda _name: str(fake_rg))
     state = RunState.create("test", Workspace(tmp_path), run_id="run_test")
 
     result = SearchRepoTool().run(ToolCall(name="search_repo", args={"query": "needle"}), state)
@@ -347,7 +347,7 @@ def test_search_repo_timeout_terminates_rg_before_output(tmp_path) -> None:
 
 
 def test_fallback_search_skips_large_files(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("agentd.tools_repo.shutil.which", lambda _name: None)
+    monkeypatch.setattr("agentd.tools.repo.shutil.which", lambda _name: None)
     (tmp_path / "large.txt").write_text("needle\n" + ("x" * MAX_READ_FILE_BYTES))
     (tmp_path / "small.txt").write_text("needle\n")
     state = RunState.create("test", Workspace(tmp_path), run_id="run_test")
