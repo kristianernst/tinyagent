@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
 from pathlib import Path
 
 from agentd import __version__
+from agentd.events import ConsoleTextSink, JsonlStreamSink
 from agentd.kernel import Kernel
-from agentd.models import FakeModelProvider, OpenAICompatibleProvider, ProviderError
+from agentd.models import FakeModelProvider, ProviderError
 from agentd.policy import default_policy
 from agentd.profiles import ApexCoderProfile
+from agentd.providers.openai_compat import OpenAICompatibleProvider
 from agentd.replay import replay_run
 from agentd.state import ModelResponse, ToolCall
 from agentd.tools import default_tools
@@ -30,6 +33,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--workspace", default=".")
     run_parser.add_argument("--run-id")
     run_parser.add_argument("--output-dir", type=Path)
+    run_parser.add_argument(
+        "--stream",
+        choices=["off", "text", "jsonl"],
+        default="off",
+        help="Stream model progress live while preserving the run trace.",
+    )
 
     replay_parser = subparsers.add_parser("replay", help="Replay a recorded agent run.")
     replay_parser.add_argument("run_path", type=Path, help="Run directory or events.jsonl path.")
@@ -56,16 +65,22 @@ def main(argv: list[str] | None = None) -> int:
             profile=ApexCoderProfile(),
             tools=default_tools(),
             policy=default_policy(),
+            stream=args.stream != "off",
+            event_sink=_stream_sink(args.stream),
         )
         state = kernel.run(args.task, workspace=args.workspace, run_id=args.run_id, output_dir=args.output_dir)
+        if args.stream == "jsonl":
+            return 1 if state.failed else 0
+        if args.stream == "text" and state.final_output:
+            print()
         print(f"run_id: {state.run_id}")
         print(f"output_dir: {state.output_dir}")
-        print(f"status: {'failed' if state.failed else 'finished'}")
+        print(f"status: {'failed' if state.failed else 'completed'}")
         if state.failed:
             print(f"failure: {state.failure_reason}")
             return 1
-        if state.summary:
-            print(state.summary)
+        if state.final_output and args.stream != "text":
+            print(state.final_output)
         return 0
 
     if args.command == "replay":
@@ -82,6 +97,14 @@ def _model_for(provider: str, task: str):
     if provider == "openai-compatible":
         return OpenAICompatibleProvider.from_env()
     raise ValueError(f"Unknown provider: {provider}")
+
+
+def _stream_sink(mode: str):
+    if mode == "text":
+        return ConsoleTextSink(sys.stdout)
+    if mode == "jsonl":
+        return JsonlStreamSink(sys.stdout)
+    return None
 
 
 def _fake_responses(task: str) -> list[ModelResponse]:

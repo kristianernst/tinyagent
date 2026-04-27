@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, Protocol
 
+from agentd.model_stream import ModelDelta
 from agentd.state import Message, ModelResponse, PolicyDecision, RunState, ToolCall, ToolResult
 
 
@@ -21,6 +22,10 @@ class ModelProvider(Protocol):
     name: str
 
     def complete(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState) -> ModelResponse: ...
+
+
+class StreamingModelProvider(ModelProvider, Protocol):
+    def stream(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState) -> Iterable[ModelDelta]: ...
 
 
 class Profile(Protocol):

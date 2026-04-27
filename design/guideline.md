@@ -445,8 +445,8 @@ final artifact paths
 The agent should produce explicit end-of-run artifacts:
 
 ```text
-run.jsonl
-summary.md
+events.jsonl
+final.md
 final.diff
 metrics.json
 artifacts/

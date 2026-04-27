@@ -65,8 +65,8 @@ class ReadFileTool:
         selected = lines[start_line - 1 : start_line - 1 + max_lines]
         numbered = "\n".join(f"{index}: {line}" for index, line in enumerate(selected, start=start_line))
         rel_path = relative_workspace_path(state, path)
-        state.add_event(
-            "FileRead",
+        state.emit(
+            "file.read",
             {
                 "path": rel_path,
                 "start_line": start_line,
@@ -108,8 +108,8 @@ class ListFilesTool:
         truncated = len(files) > max_files
         visible = files[:max_files]
         output = "\n".join(relative_workspace_path(state, path) for path in visible)
-        state.add_event(
-            "FilesListed",
+        state.emit(
+            "files.listed",
             {
                 "path": relative_workspace_path(state, root),
                 "file_count": len(visible),
@@ -167,8 +167,8 @@ class SearchRepoTool:
             captured_output or "No matches.",
             kind="search_captured_output",
         )
-        state.add_event(
-            "SearchCompleted",
+        state.emit(
+            "search.completed",
             {
                 "query": query,
                 "path": relative_workspace_path(state, path),

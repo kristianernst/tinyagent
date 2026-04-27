@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from agentd.events import Event, utc_now
+from agentd.events import Event, EventDurability, EventSink, EventVisibility, utc_now
 
 if TYPE_CHECKING:
     from agentd.context import ContextState
@@ -120,16 +120,18 @@ class RunState:
     budgets: RunBudgets = field(default_factory=RunBudgets)
     started_at: datetime = field(default_factory=utc_now)
     events: list[Event] = field(default_factory=list)
+    seq: int = 0
     tool_steps: list[ToolStep] = field(default_factory=list)
     turn_count: int = 0
     tool_call_count: int = 0
     done: bool = False
     failed: bool = False
     failure_reason: str | None = None
-    summary: str = ""
+    final_output: str = ""
     final_diff: str = ""
     shell_preflight: dict[str, Any] = field(default_factory=dict)
     persist_events: bool = True
+    stream_sink: EventSink | None = None
     context_state: ContextState = field(default_factory=_default_context_state)
     context_checkpoint: str = ""
     context_checkpoint_artifact: str = ""
@@ -168,18 +170,39 @@ class RunState:
             budgets=budgets or RunBudgets(),
         )
 
-    def add_event(self, event_type: str, data: dict[str, Any] | None = None, parent_event_id: str | None = None) -> Event:
+    def emit(
+        self,
+        event_type: str,
+        data: dict[str, Any] | None = None,
+        *,
+        visibility: EventVisibility = "debug",
+        durability: EventDurability = "event_log",
+        artifact_refs: list[str] | None = None,
+        turn_id: str | None = None,
+        item_id: str | None = None,
+        parent_item_id: str | None = None,
+    ) -> Event:
         event = Event(
             run_id=self.run_id,
             type=event_type,
             data=data or {},
-            parent_event_id=parent_event_id,
+            visibility=visibility,
+            durability=durability,
+            artifact_refs=artifact_refs or [],
+            turn_id=turn_id,
+            item_id=item_id,
+            parent_item_id=parent_item_id,
+            seq=self.seq + 1,
         )
-        self.events.append(event)
-        if self.persist_events:
+        self.seq = event.seq
+        if event.durability == "event_log":
+            self.events.append(event)
+        if event.durability == "event_log" and self.persist_events:
             self.output_dir.mkdir(parents=True, exist_ok=True)
             with (self.output_dir / "events.jsonl").open("a") as file:
                 file.write(json.dumps(event.to_json_dict(), sort_keys=True) + "\n")
+        if self.stream_sink is not None:
+            self.stream_sink.emit(event)
         return event
 
     def elapsed_seconds(self) -> float:
@@ -191,11 +214,9 @@ class RunState:
         self.done = True
         self.failed = True
         self.failure_reason = reason
-        self.add_event("RunFailed", {"reason": reason})
 
-    def finish(self, summary: str = "") -> None:
+    def finish(self, final_output: str = "") -> None:
         if self.done:
             return
         self.done = True
-        self.summary = summary or self.summary
-        self.add_event("RunFinished", {"summary": self.summary})
+        self.final_output = final_output or self.final_output

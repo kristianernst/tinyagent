@@ -53,8 +53,8 @@ class ApplyPatchTool:
             output = str(exc)
             ok = False
         artifact = write_tool_output_artifact(state, call, "patch-output", output, kind="patch_output")
-        state.add_event(
-            "PatchApplied",
+        state.emit(
+            "patch.applied",
             {
                 "paths": touched,
                 "ok": ok,

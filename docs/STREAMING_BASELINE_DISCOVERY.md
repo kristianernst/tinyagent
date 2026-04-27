@@ -17,7 +17,7 @@ Local evidence:
 
 - `agentd/models.py`: `ModelProvider.complete(...) -> ModelResponse`; OpenAI-compatible provider calls `/chat/completions` once and parses one full response.
 - `agentd/kernel.py`: the kernel writes `ModelRequest`, calls `model.complete(...)`, then writes one final `ModelResponse` artifact.
-- `agentd/output.py`: context, logical request, HTTP request, response, command output, summary, metrics, and final diff are persisted as artifacts.
+- `agentd/output.py`: context, logical request, HTTP request, response, command output, final output, metrics, and final diff are persisted as artifacts.
 - `agentd/context.py`: context checkpoints are deterministic local summaries.
 - `agentd/replay.py`: replay renders an event timeline and does not execute side effects.
 

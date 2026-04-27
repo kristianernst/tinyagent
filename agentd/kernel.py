@@ -10,7 +10,8 @@ from typing import Any
 
 from agentd.context import BuiltContext, estimate_messages_tokens, estimate_tools_tokens, message_text
 from agentd.contracts import Executor, LocalExecutor, ModelProvider, PolicyEngine, Profile, Tool
-from agentd.events import json_safe
+from agentd.events import EventSink, json_safe
+from agentd.model_stream import complete_model_call
 from agentd.output import (
     capture_final_diff,
     write_model_http_request_artifact,
@@ -36,6 +37,8 @@ class Kernel:
         policy: PolicyEngine,
         executor: Executor | None = None,
         budgets: RunBudgets | None = None,
+        stream: bool = False,
+        event_sink: EventSink | None = None,
     ) -> None:
         self.model = model
         self.profile = profile
@@ -43,6 +46,8 @@ class Kernel:
         self.policy = policy
         self.executor = executor or LocalExecutor()
         self.budgets = budgets or RunBudgets()
+        self.stream = stream
+        self.event_sink = event_sink
 
     def run(
         self,
@@ -51,6 +56,8 @@ class Kernel:
         workspace: Path | str,
         run_id: str | None = None,
         output_dir: Path | None = None,
+        stream: bool | None = None,
+        event_sink: EventSink | None = None,
     ) -> RunState:
         state = RunState.create(
             task,
@@ -59,29 +66,34 @@ class Kernel:
             run_id=run_id,
             output_dir=output_dir,
         )
-        state.add_event(
-            "RunStarted",
+        use_stream = self.stream if stream is None else stream
+        state.stream_sink = event_sink if event_sink is not None else self.event_sink
+        state.emit(
+            "run.started",
             {
                 "task": task,
                 "workspace_root": str(state.workspace.root),
                 "budgets": state.budgets.to_json_dict(),
+                "stream": use_stream,
             },
         )
         if "shell" in self.tools:
             state.shell_preflight = shell_preflight()
-            state.add_event("ShellPreflight", state.shell_preflight)
+            state.emit("shell.preflight.completed", state.shell_preflight)
 
         try:
-            self._run_loop(state)
+            self._run_loop(state, stream=use_stream)
         except Exception as exc:  # pragma: no cover - defensive boundary
             state.fail(f"Unhandled exception: {exc}")
         finally:
+            self._finalize_message(state)
             capture_final_diff(state)
+            self._finalize_run(state)
             write_run_outputs(state)
 
         return state
 
-    def _run_loop(self, state: RunState) -> None:
+    def _run_loop(self, state: RunState, *, stream: bool) -> None:
         while not state.done:
             if self._budget_exhausted(state):
                 return
@@ -96,8 +108,8 @@ class Kernel:
                 self._compact(state)
                 built_context = self._build_context(state, visible_tools)
             messages = built_context.messages
-            state.add_event(
-                "ContextBuilt",
+            state.emit(
+                "context.built",
                 {
                     "message_count": len(messages),
                     "visible_tools": [tool.name for tool in visible_tools],
@@ -123,9 +135,10 @@ class Kernel:
                 call_index=model_call_index,
                 messages=messages,
                 tools=visible_tools,
+                stream=stream,
             )
-            state.add_event(
-                "ModelRequest",
+            state.emit(
+                "model.request.started",
                 {
                     "provider": self.model.name,
                     "base_url": _provider_base_url(self.model),
@@ -138,8 +151,16 @@ class Kernel:
             )
 
             try:
-                response = self.model.complete(messages, visible_tools, state)
+                response = complete_model_call(
+                    self.model,
+                    messages,
+                    visible_tools,
+                    state,
+                    call_index=model_call_index,
+                    stream=stream,
+                )
             except Exception as exc:
+                state.emit("model.failed", {"provider": self.model.name, "reason": str(exc), "turn": model_call_index})
                 state.fail(f"Model provider error: {exc}")
                 return
             state.turn_count += 1
@@ -148,13 +169,16 @@ class Kernel:
                 call_index=model_call_index,
                 response=response,
             )
-            state.add_event(
-                "ModelResponse",
+            state.emit(
+                "model.completed",
                 {
+                    "provider": self.model.name,
+                    "turn": model_call_index,
                     "content_length": len(response.content),
                     "tool_call_count": len(response.tool_calls),
                     "finish_reason": response.finish_reason,
                     "response_artifact": response_artifact,
+                    "streamed": bool(response.raw.get("streamed")),
                 },
             )
 
@@ -173,13 +197,14 @@ class Kernel:
                     return
 
             if self.profile.should_finish(state):
-                state.finish(response.content or state.summary or "Run finished by profile.")
+                state.finish(response.content or state.final_output or "Run finished by profile.")
                 return
 
     def _dispatch_tool_call(self, state: RunState, call: ToolCall, *, visible_tool_names: frozenset[str]) -> None:
         args_preview = _small_event_data(call.args)
-        state.add_event(
-            "ToolCallRequested",
+        state.emit("tool.call.started", {"tool_call_id": call.id, "tool": call.name})
+        state.emit(
+            "tool.args.completed",
             {
                 "tool_call_id": call.id,
                 "tool": call.name,
@@ -244,7 +269,7 @@ class Kernel:
             self._record_tool_result(state, call, result)
             return
 
-        state.add_event("ToolCallStarted", {"tool_call_id": call.id, "tool": call.name})
+        state.emit("tool.execution.started", {"tool_call_id": call.id, "tool": call.name})
         try:
             result = self.executor.run_tool(tool, call, state)
         except Exception as exc:
@@ -270,8 +295,8 @@ class Kernel:
         output_limit = state.budgets.max_command_output_chars_visible
         output = result.output[:output_limit]
         output_chars = _output_chars(result)
-        state.add_event(
-            "ToolCallFinished",
+        state.emit(
+            "tool.execution.completed" if result.ok else "tool.execution.failed",
             {
                 "tool_call_id": call.id,
                 "tool": call.name,
@@ -288,8 +313,8 @@ class Kernel:
         state.tool_steps.append(ToolStep(call=call, result=result))
 
     def _record_policy_decision(self, state: RunState, call: ToolCall, decision: PolicyDecision) -> None:
-        state.add_event(
-            "PolicyDecision",
+        state.emit(
+            "tool.policy.evaluated",
             {
                 "tool_call_id": call.id,
                 "tool": call.name,
@@ -324,14 +349,48 @@ class Kernel:
         call_index: int,
         messages: list[Message],
         tools: list[Tool],
+        stream: bool = False,
     ) -> str | None:
-        build_payload = getattr(self.model, "build_payload", None)
+        build_payload = getattr(self.model, "build_stream_payload" if stream else "build_payload", None)
         if not callable(build_payload):
             return None
         payload = build_payload(messages, tools, state)
         if not isinstance(payload, dict):
             return None
         return write_model_http_request_artifact(state, call_index=call_index, payload=payload)
+
+    def _finalize_message(self, state: RunState) -> None:
+        if not state.done and not state.failed:
+            state.finish("Run finished without explicit final output.")
+        if not state.final_output:
+            return
+        if any(event.type == "message.completed" for event in state.events):
+            return
+        state.emit(
+            "message.completed",
+            {
+                "role": "assistant",
+                "content_chars": len(state.final_output),
+                "path": "final.md",
+            },
+            visibility="user",
+            artifact_refs=["final.md"],
+        )
+
+    def _finalize_run(self, state: RunState) -> None:
+        event_type = "run.failed" if state.failed else "run.completed"
+        if any(event.type == event_type for event in state.events):
+            return
+        data = {
+            "status": "failed" if state.failed else "completed",
+            "turn_count": state.turn_count,
+            "tool_call_count": state.tool_call_count,
+            "final_output_chars": len(state.final_output),
+            "duration_seconds": state.elapsed_seconds(),
+        }
+        if state.failed:
+            data["reason"] = state.failure_reason or "Unknown failure"
+        state.emit(event_type, data)
 
     def _build_context(self, state: RunState, visible_tools: list[Tool]) -> BuiltContext:
         build_context = getattr(self.profile, "build_context", None)
@@ -355,8 +414,8 @@ class Kernel:
         return callable(should_compact) and bool(should_compact(state))
 
     def _compact(self, state: RunState) -> None:
-        state.add_event(
-            "CompactionStarted",
+        state.emit(
+            "compaction.started",
             {
                 "profile": self.profile.name,
                 "token_estimate": state.context_token_estimate,
@@ -364,8 +423,8 @@ class Kernel:
             },
         )
         self.profile.compact(state)
-        state.add_event(
-            "CompactionFinished",
+        state.emit(
+            "checkpoint.completed",
             {
                 "profile": self.profile.name,
                 "compaction_count": state.compaction_count,
