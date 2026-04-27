@@ -74,15 +74,18 @@ class OpenAICompatibleProvider:
         return cls(OpenAICompatibleConfig.from_env(env))
 
     def complete(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState) -> ModelResponse:
+        payload = self.build_payload(messages, tools, state)
+        raw = self._post(payload)
+        return _parse_chat_completion(raw)
+
+    def build_payload(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.config.model,
             "messages": [_message_payload(message) for message in messages],
         }
         if tools:
             payload["tools"] = [_tool_payload(tool) for tool in tools]
-
-        raw = self._post(payload)
-        return _parse_chat_completion(raw)
+        return payload
 
     def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
         body = json.dumps(payload).encode()
@@ -111,7 +114,7 @@ def _chat_completions_url(base_url: str) -> str:
     return f"{base_url.rstrip('/')}/chat/completions"
 
 
-def _message_payload(message: Message) -> dict[str, str]:
+def _message_payload(message: Message) -> dict[str, Any]:
     return {"role": message.role, "content": message.content}
 
 
@@ -131,7 +134,7 @@ def _parse_chat_completion(raw: dict[str, Any]) -> ModelResponse:
 
     return ModelResponse(
         content=message.get("content") or "",
-        tool_calls=[_parse_tool_call(call) for call in message.get("tool_calls") or []],
+        tool_calls=tuple(_parse_tool_call(call) for call in message.get("tool_calls") or []),
         finish_reason=choice.get("finish_reason"),
         raw=raw,
     )

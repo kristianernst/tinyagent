@@ -12,20 +12,20 @@ from agentd.models import FakeModelProvider, OpenAICompatibleConfig, OpenAICompa
 from agentd.state import Message, ModelResponse, PolicyDecision, RunState, ToolCall, ToolResult, Workspace
 
 
-class FinishTool:
-    name = "finish"
+class SampleTool:
+    name = "sample_tool"
     schema = {
-        "name": "finish",
-        "description": "Finish the run.",
+        "name": "sample_tool",
+        "description": "Sample tool.",
         "parameters": {
             "type": "object",
-            "properties": {"summary": {"type": "string"}},
-            "required": ["summary"],
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
         },
     }
 
     def run(self, call: ToolCall, state: RunState) -> ToolResult:
-        return ToolResult(tool_name=self.name, output=call.args["summary"], finish=True)
+        return ToolResult(tool_name=self.name, output=call.args["value"])
 
 
 class AllowAllPolicy:
@@ -133,8 +133,8 @@ def test_openai_compatible_provider_sends_messages_tools_and_parses_tool_calls()
                                 "id": "call_1",
                                 "type": "function",
                                 "function": {
-                                    "name": "finish",
-                                    "arguments": json.dumps({"summary": "done"}),
+                                    "name": "sample_tool",
+                                    "arguments": json.dumps({"value": "done"}),
                                 },
                             }
                         ],
@@ -145,21 +145,70 @@ def test_openai_compatible_provider_sends_messages_tools_and_parses_tool_calls()
     )
 
     response = provider.complete(
-        [Message(role="user", content="finish")],
-        [FinishTool()],
+        [Message(role="user", content="use the sample tool")],
+        [SampleTool()],
         _state_stub(),
     )
 
     assert provider.payloads == [
         {
             "model": "test-model",
-            "messages": [{"role": "user", "content": "finish"}],
-            "tools": [{"type": "function", "function": FinishTool.schema}],
+            "messages": [{"role": "user", "content": "use the sample tool"}],
+            "tools": [{"type": "function", "function": SampleTool.schema}],
         }
     ]
     assert response.content == ""
     assert response.finish_reason == "tool_calls"
-    assert response.tool_calls == [ToolCall(id="call_1", name="finish", args={"summary": "done"})]
+    assert response.tool_calls == (ToolCall(id="call_1", name="sample_tool", args={"value": "done"}),)
+
+
+def test_openai_compatible_provider_does_not_send_message_meta() -> None:
+    provider = RecordingOpenAIProvider(
+        {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"content": "done"},
+                }
+            ]
+        }
+    )
+
+    provider.complete(
+        [Message(role="user", content="hello", meta={"context_layer": "task", "name": "ignored"})],
+        [],
+        _state_stub(),
+    )
+
+    assert provider.payloads[0]["messages"] == [{"role": "user", "content": "hello"}]
+
+
+def test_kernel_writes_exact_openai_compatible_payload_artifact(tmp_path) -> None:
+    provider = RecordingOpenAIProvider(
+        {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"content": "done"},
+                }
+            ]
+        }
+    )
+    kernel = Kernel(
+        model=provider,
+        profile=BasicProfile(),
+        tools=[SampleTool()],
+        policy=AllowAllPolicy(),
+    )
+
+    state = kernel.run("write payload artifact", workspace=tmp_path)
+
+    request = next(event for event in state.events if event.type == "ModelRequest")
+    assert request.data["logical_request_artifact"] == "artifacts/model-request-logical-0001.json"
+    assert request.data["http_request_artifact"] == "artifacts/model-request-http-0001.json"
+    payload = json.loads((state.output_dir / request.data["http_request_artifact"]).read_text())
+    assert payload == provider.payloads[0]
+    assert payload["model"] == "test-model"
 
 
 def test_openai_compatible_provider_generates_tool_call_id_when_provider_omits_id() -> None:
@@ -172,7 +221,7 @@ def test_openai_compatible_provider_generates_tool_call_id_when_provider_omits_i
                             {
                                 "type": "function",
                                 "function": {
-                                    "name": "finish",
+                                    "name": "sample_tool",
                                     "arguments": "{}",
                                 },
                             }
@@ -185,7 +234,7 @@ def test_openai_compatible_provider_generates_tool_call_id_when_provider_omits_i
 
     response = provider.complete([], [], _state_stub())
 
-    assert response.tool_calls[0].name == "finish"
+    assert response.tool_calls[0].name == "sample_tool"
     assert response.tool_calls[0].args == {}
     assert response.tool_calls[0].id.startswith("call_")
 
@@ -200,7 +249,7 @@ def test_openai_compatible_provider_rejects_invalid_tool_arguments() -> None:
                             {
                                 "id": "call_1",
                                 "function": {
-                                    "name": "finish",
+                                    "name": "sample_tool",
                                     "arguments": "[]",
                                 },
                             }
@@ -241,15 +290,15 @@ def test_kernel_surfaces_provider_errors_as_run_failures(tmp_path) -> None:
     kernel = Kernel(
         model=FakeModelProvider([]),
         profile=BasicProfile(),
-        tools=[FinishTool()],
+        tools=[SampleTool()],
         policy=AllowAllPolicy(),
     )
 
-    state = kernel.run("finish", workspace=tmp_path)
+    state = kernel.run("provider failure", workspace=tmp_path)
 
     assert state.failed is True
     assert state.failure_reason == "Model provider error: FakeModelProvider has no response left."
-    assert [event.type for event in state.events][-1] == "RunFailed"
+    assert [event.type for event in state.events][-2] == "RunFailed"
 
 
 def _state_stub() -> RunState:

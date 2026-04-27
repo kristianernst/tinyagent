@@ -1,4 +1,8 @@
 # tinyagent docs
 
-Project documentation starts here. Milestone 0+1 will add focused documents for
-security, providers, extensions, and evaluation as those surfaces are implemented.
+Project documentation starts here.
+
+- `CAPABILITIES.md`: builtins, extensions, skills, prompts, MCP, packages, and
+  the installed/active/visible/allowed/traced invariant.
+- `PHILOSOPHY.md`: Tinyagent design pressure and acceptance bar.
+- `MERGE.md`: checklist for reviewing foundation changes.
