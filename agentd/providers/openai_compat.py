@@ -7,7 +7,7 @@ import os
 import urllib.error
 import urllib.request
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from agentd.contracts import Tool
@@ -22,6 +22,7 @@ class OpenAICompatibleConfig:
     api_key: str
     model: str
     timeout_seconds: int = 60
+    extra_body: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> OpenAICompatibleConfig:
@@ -37,11 +38,13 @@ class OpenAICompatibleConfig:
             timeout_seconds = int(values.get("TINYAGENT_MODEL_TIMEOUT_SECONDS", "60"))
         except ValueError as exc:
             raise ProviderError("TINYAGENT_MODEL_TIMEOUT_SECONDS must be an integer.") from exc
+        extra_body = _extra_body_from_env(values)
         return cls(
             base_url=base_url,
             api_key=api_key,
             model=model,
             timeout_seconds=timeout_seconds,
+            extra_body=extra_body,
         )
 
 
@@ -81,12 +84,16 @@ class OpenAICompatibleProvider:
         }
         if tools:
             payload["tools"] = [_tool_payload(tool) for tool in tools]
+        payload.update(self.config.extra_body)
         return payload
 
     def build_stream_payload(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState) -> dict[str, Any]:
         payload = self.build_payload(messages, tools, state)
         payload["stream"] = True
-        payload["stream_options"] = {"include_usage": True}
+        stream_options = payload.get("stream_options")
+        if not isinstance(stream_options, dict):
+            stream_options = {}
+        payload["stream_options"] = {**stream_options, "include_usage": True}
         return payload
 
     def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -158,3 +165,20 @@ def _tool_payload(tool: Tool) -> dict[str, Any]:
     if schema.get("type") == "function" and "function" in schema:
         return schema
     return {"type": "function", "function": schema}
+
+
+def _extra_body_from_env(values: Mapping[str, str]) -> dict[str, Any]:
+    raw = values.get("TINYAGENT_MODEL_EXTRA_BODY_JSON")
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ProviderError(f"TINYAGENT_MODEL_EXTRA_BODY_JSON must be valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ProviderError("TINYAGENT_MODEL_EXTRA_BODY_JSON must be a JSON object.")
+    protected = {"messages", "model", "stream", "tools"}
+    blocked = sorted(key for key in parsed if key in protected)
+    if blocked:
+        raise ProviderError(f"TINYAGENT_MODEL_EXTRA_BODY_JSON cannot override protected keys: {', '.join(blocked)}")
+    return parsed

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -49,6 +50,7 @@ LIVE_ONLY_EVENT_TYPES = frozenset(
     {
         "model.text.delta",
         "reasoning.summary.delta",
+        "reasoning.visible.delta",
         "reasoning.encrypted",
         "tool.args.delta",
     }
@@ -56,9 +58,67 @@ LIVE_ONLY_EVENT_TYPES = frozenset(
 
 EVENT_TYPES = DURABLE_EVENT_TYPES | LIVE_ONLY_EVENT_TYPES
 
+EVENT_DEBUG_LEVELS = {
+    **dict.fromkeys(
+        ("run.started", "run.completed", "run.failed", "message.completed", "model.text.delta", "model.failed"),
+        0,
+    ),
+    **dict.fromkeys(
+        ("model.request.started", "model.stream.started", "model.completed", "model.usage", "diff.finalized", "reasoning.summary.delta"),
+        1,
+    ),
+    **dict.fromkeys(
+        (
+            "context.built",
+            "compaction.started",
+            "checkpoint.completed",
+            "tool.call.started",
+            "tool.args.completed",
+            "tool.policy.evaluated",
+            "tool.execution.started",
+            "tool.execution.completed",
+            "tool.execution.failed",
+            "shell.preflight.completed",
+            "files.listed",
+            "file.read",
+            "search.completed",
+            "command.started",
+            "command.completed",
+            "patch.applied",
+            "artifact.created",
+            "tool.args.delta",
+        ),
+        2,
+    ),
+    **dict.fromkeys(("reasoning.visible.delta", "reasoning.encrypted"), 4),
+}
+
+VISIBILITY_DEBUG_LEVELS = {
+    "public": 0,
+    "user": 0,
+    "debug": 1,
+    "internal": 4,
+}
+
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def debug_level_from_env(env: dict[str, str] | None = None) -> int:
+    values = os.environ if env is None else env
+    raw = values.get("TINYAGENT_DEBUG", "0")
+    try:
+        level = int(raw)
+    except ValueError as exc:
+        raise ValueError("TINYAGENT_DEBUG must be an integer.") from exc
+    if level < 0:
+        raise ValueError("TINYAGENT_DEBUG must be non-negative.")
+    return level
+
+
+def event_debug_level(event: Event) -> int:
+    return EVENT_DEBUG_LEVELS.get(event.type, VISIBILITY_DEBUG_LEVELS.get(event.visibility, 1))
 
 
 def json_safe(value: Any) -> Any:
@@ -173,10 +233,13 @@ class ConsoleTextSink:
 
 
 class JsonlStreamSink:
-    def __init__(self, file: TextIO | None = None) -> None:
+    def __init__(self, file: TextIO | None = None, *, debug_level: int = 0) -> None:
         self.file = file or sys.stdout
+        self.debug_level = max(debug_level, 0)
 
     def emit(self, event: Event) -> None:
+        if event_debug_level(event) > self.debug_level:
+            return
         self.file.write(json.dumps(event.to_json_dict(), sort_keys=True) + "\n")
         self.file.flush()
 

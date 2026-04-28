@@ -361,6 +361,8 @@ reasoning.failed
 
 Rationale: OpenResponses explicitly supports reasoning `content`, `encrypted_content`, and `summary`; OpenAI Responses exposes reasoning items with summaries and encrypted content. ([Open Responses][1])
 
+Provider-visible reasoning is a live lane, but it is internal/debug-only by default until an explicit consumer opts into showing it. Summary deltas may be user-visible when a provider marks them safe to display. Encrypted or opaque reasoning stays internal.
+
 ### Tool calls
 
 ```text
@@ -539,6 +541,7 @@ artifact.created
 live-only:
 model.text.delta
 reasoning.summary.delta
+reasoning.visible.delta
 reasoning.encrypted
 tool.args.delta
 ```
@@ -643,7 +646,8 @@ Use this policy:
 | --------------------- | ----------: | -------------: | ------------------------: |
 | lifecycle             |         yes |            yes |                        no |
 | text deltas           |         yes |  no by default |       optional raw stream |
-| reasoning deltas      |    optional |  no by default | optional summary artifact |
+| reasoning summaries   |    optional |  no by default | optional summary artifact |
+| visible reasoning     | debug opt-in |  no by default | optional raw stream |
 | encrypted reasoning   |  no display | metadata event |        encrypted artifact |
 | tool args deltas      |         yes |  no by default |      final assembled args |
 | tool execution        |         yes |            yes |           output artifact |

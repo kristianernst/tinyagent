@@ -14,12 +14,13 @@ def load_run_events(run_path: Path) -> list[Event]:
 
 def render_timeline(events: list[Event]) -> str:
     lines = ["# Tinyagent Replay", ""]
-    for index, event in enumerate(events, start=1):
+    for event in events:
         detail = _event_detail(event)
+        seq = event.seq if event.seq > 0 else 0
         if detail:
-            lines.append(f"{index:04d} {event.time.isoformat()} {event.type} {detail}")
+            lines.append(f"{seq:04d} {event.time.isoformat()} {event.type} {detail}")
         else:
-            lines.append(f"{index:04d} {event.time.isoformat()} {event.type}")
+            lines.append(f"{seq:04d} {event.time.isoformat()} {event.type}")
     return "\n".join(lines) + "\n"
 
 
@@ -37,7 +38,7 @@ def _event_detail(event: Event) -> str:
         case "run.failed":
             return str(data.get("reason", ""))
         case "message.completed":
-            return f"{data.get('role', 'assistant')} {data.get('content_chars')} chars {data.get('path', '')}".strip()
+            return f"{data.get('role', 'assistant')} {data.get('content_chars')} chars {data.get('output_path', '')}".strip()
         case "model.request.started":
             artifacts = [
                 data.get("context_artifact"),

@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from agentd import __version__
-from agentd.events import ConsoleTextSink, JsonlStreamSink
+from agentd.events import ConsoleTextSink, JsonlStreamSink, debug_level_from_env
 from agentd.kernel import Kernel
 from agentd.models import FakeModelProvider, ProviderError
 from agentd.policy import default_policy
@@ -39,6 +39,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="off",
         help="Stream model progress live while preserving the run trace.",
     )
+    run_parser.add_argument(
+        "--debug",
+        type=int,
+        help="Live stream verbosity. Defaults to TINYAGENT_DEBUG or 0.",
+    )
 
     replay_parser = subparsers.add_parser("replay", help="Replay a recorded agent run.")
     replay_parser.add_argument("run_path", type=Path, help="Run directory or events.jsonl path.")
@@ -56,6 +61,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "run":
         try:
+            debug_level = _debug_level(args.debug)
+        except ValueError as exc:
+            print(f"debug error: {exc}")
+            return 2
+        try:
             model = _model_for(args.provider, args.task)
         except ProviderError as exc:
             print(f"provider error: {exc}")
@@ -66,7 +76,7 @@ def main(argv: list[str] | None = None) -> int:
             tools=default_tools(),
             policy=default_policy(),
             stream=args.stream != "off",
-            event_sink=_stream_sink(args.stream),
+            event_sink=_stream_sink(args.stream, debug_level),
         )
         state = kernel.run(args.task, workspace=args.workspace, run_id=args.run_id, output_dir=args.output_dir)
         if args.stream == "jsonl":
@@ -99,11 +109,19 @@ def _model_for(provider: str, task: str):
     raise ValueError(f"Unknown provider: {provider}")
 
 
-def _stream_sink(mode: str):
+def _debug_level(level: int | None) -> int:
+    if level is None:
+        return debug_level_from_env()
+    if level < 0:
+        raise ValueError("--debug must be non-negative.")
+    return level
+
+
+def _stream_sink(mode: str, debug_level: int):
     if mode == "text":
         return ConsoleTextSink(sys.stdout)
     if mode == "jsonl":
-        return JsonlStreamSink(sys.stdout)
+        return JsonlStreamSink(sys.stdout, debug_level=debug_level)
     return None
 
 

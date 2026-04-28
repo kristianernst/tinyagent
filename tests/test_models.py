@@ -8,7 +8,7 @@ import pytest
 
 from agentd.contracts import Tool
 from agentd.kernel import Kernel
-from agentd.model_stream import ModelDelta, assemble_model_deltas
+from agentd.model_stream import ModelDelta, assemble_model_deltas, parse_chat_completion_chunk
 from agentd.models import (
     FakeModelProvider,
     ProviderError,
@@ -137,6 +137,7 @@ def test_openai_compatible_config_reads_environment() -> None:
             "TINYAGENT_MODEL_API_KEY": "key",
             "TINYAGENT_MODEL_NAME": "model",
             "TINYAGENT_MODEL_TIMEOUT_SECONDS": "12",
+            "TINYAGENT_MODEL_EXTRA_BODY_JSON": '{"max_tokens":128,"temperature":0}',
         }
     )
 
@@ -144,6 +145,7 @@ def test_openai_compatible_config_reads_environment() -> None:
     assert config.api_key == "key"
     assert config.model == "model"
     assert config.timeout_seconds == 12
+    assert config.extra_body == {"max_tokens": 128, "temperature": 0}
 
 
 def test_openai_compatible_config_requires_key_and_model() -> None:
@@ -161,6 +163,43 @@ def test_openai_compatible_config_requires_key_and_model() -> None:
                 "TINYAGENT_MODEL_TIMEOUT_SECONDS": "soon",
             }
         )
+
+
+def test_openai_compatible_config_validates_extra_body_json() -> None:
+    base_env = {
+        "TINYAGENT_MODEL_API_KEY": "key",
+        "TINYAGENT_MODEL_NAME": "model",
+    }
+
+    with pytest.raises(ProviderError, match="valid JSON"):
+        OpenAICompatibleConfig.from_env({**base_env, "TINYAGENT_MODEL_EXTRA_BODY_JSON": "{"})
+
+    with pytest.raises(ProviderError, match="JSON object"):
+        OpenAICompatibleConfig.from_env({**base_env, "TINYAGENT_MODEL_EXTRA_BODY_JSON": "[]"})
+
+    with pytest.raises(ProviderError, match="protected keys: messages"):
+        OpenAICompatibleConfig.from_env({**base_env, "TINYAGENT_MODEL_EXTRA_BODY_JSON": '{"messages":[]}'})
+
+
+def test_openai_compatible_provider_merges_extra_body_without_overriding_stream_semantics() -> None:
+    provider = OpenAICompatibleProvider(
+        OpenAICompatibleConfig(
+            base_url="https://models.example.test/v1",
+            api_key="test-key",
+            model="test-model",
+            extra_body={"max_tokens": 128, "temperature": 0, "stream_options": {"debug": True}},
+        )
+    )
+
+    payload = provider.build_stream_payload([Message(role="user", content="hello")], [SampleTool()], _state_stub())
+
+    assert payload["model"] == "test-model"
+    assert payload["messages"] == [{"role": "user", "content": "hello"}]
+    assert payload["tools"] == [{"type": "function", "function": SampleTool.schema}]
+    assert payload["max_tokens"] == 128
+    assert payload["temperature"] == 0
+    assert payload["stream"] is True
+    assert payload["stream_options"] == {"debug": True, "include_usage": True}
 
 
 def test_openai_compatible_provider_sends_messages_tools_and_parses_tool_calls() -> None:
@@ -270,6 +309,31 @@ def test_openai_compatible_provider_streams_text_tool_args_and_usage() -> None:
     assert response.tool_calls == (ToolCall(id="call_1", name="sample_tool", args={"value": "done"}),)
     assert response.finish_reason == "tool_calls"
     assert response.raw["usage"] == {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7}
+
+
+def test_chat_completion_chunk_maps_llamacpp_reasoning_content_to_visible_reasoning_delta() -> None:
+    deltas = list(
+        parse_chat_completion_chunk(
+            {
+                "id": "chunk_1",
+                "choices": [
+                    {
+                        "delta": {
+                            "reasoning_content": "raw reasoning",
+                            "content": "answer",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+        )
+    )
+
+    assert deltas[0].kind == "text_delta"
+    assert deltas[1].kind == "reasoning_visible_delta"
+    assert deltas[1].delta == "raw reasoning"
+    assert deltas[1].data["provider_field"] == "reasoning_content"
+    assert assemble_model_deltas("openai-compatible", deltas).content == "answer"
 
 
 def test_stream_assembler_rejects_invalid_partial_tool_arguments() -> None:

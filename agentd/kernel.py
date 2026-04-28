@@ -20,7 +20,7 @@ from agentd.output import (
     write_run_outputs,
 )
 from agentd.state import Message, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, ToolStep, Workspace
-from agentd.tools import shell_preflight
+from agentd.tools.builtins.shell import shell_preflight
 
 MAX_EVENT_DATA_CHARS = 4_000
 
@@ -371,10 +371,9 @@ class Kernel:
             {
                 "role": "assistant",
                 "content_chars": len(state.final_output),
-                "path": "final.md",
+                "output_path": "final.md",
             },
             visibility="user",
-            artifact_refs=["final.md"],
         )
 
     def _finalize_run(self, state: RunState) -> None:
