@@ -6,8 +6,10 @@ import os
 import shutil
 import signal
 import subprocess
+import time
 from typing import Any
 
+from agentd.run_control import RunCancelled
 from agentd.state import RunState, ToolCall, ToolResult
 from agentd.tools.core import combined_output, error_result, tool_env, visible_output, write_tool_output_artifact
 
@@ -62,8 +64,9 @@ class ShellTool:
         except OSError as exc:
             return error_result(self.name, call, exc)
 
+        state.set_current_step("command", call.id)
         try:
-            stdout, stderr = process.communicate(timeout=timeout)
+            stdout, stderr = _communicate_with_cancel(process, state, timeout)
         except subprocess.TimeoutExpired:
             stdout, stderr = _terminate_process_group(process)
             output = combined_output(stdout, stderr) or f"Command timed out after {timeout}s."
@@ -93,6 +96,45 @@ class ShellTool:
                     "output_chars": len(output),
                 },
             )
+        except RunCancelled:
+            state.request_cancel(
+                state.cancel_token.reason or "cancelled",
+                source="sigint" if state.cancel_token.reason == "sigint" else "harness",
+                escalate=state.cancel_token.escalated,
+            )
+            stdout, stderr = _terminate_process_group(process)
+            output = combined_output(stdout, stderr) or "Command cancelled."
+            artifact = write_tool_output_artifact(state, call, "command-output", output, kind="command_output")
+            state.emit(
+                "command.cancelled",
+                {
+                    "tool_call_id": call.id,
+                    "cmd": cmd,
+                    "reason": state.cancel_reason or "cancelled",
+                    "returncode": process.returncode,
+                    "output_artifact": artifact,
+                    "output_chars": len(output),
+                    "escalated": state.cancel_escalated,
+                },
+                visibility="user",
+            )
+            return ToolResult(
+                tool_name=self.name,
+                call_id=call.id,
+                output=visible_output(output, state),
+                ok=False,
+                data={
+                    "cmd": cmd,
+                    "cancelled": True,
+                    "reason": state.cancel_reason or "cancelled",
+                    "returncode": process.returncode,
+                    "output_artifact": artifact,
+                    "output_chars": len(output),
+                },
+            )
+        finally:
+            if state.current_step_kind == "command" and state.current_step_id == call.id:
+                state.set_current_step(None, None)
 
         output = combined_output(stdout, stderr) or f"Command exited {process.returncode}."
         artifact = write_tool_output_artifact(state, call, "command-output", output, kind="command_output")
@@ -122,6 +164,19 @@ class ShellTool:
                 "output_chars": len(output),
             },
         )
+
+
+def _communicate_with_cancel(process: subprocess.Popen[str], state: RunState, timeout: int) -> tuple[str, str]:
+    deadline = time.monotonic() + timeout
+    while True:
+        state.raise_if_cancelled()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(process.args, timeout)
+        try:
+            return process.communicate(timeout=min(0.1, remaining))
+        except subprocess.TimeoutExpired:
+            continue
 
 
 def shell_preflight() -> dict[str, Any]:

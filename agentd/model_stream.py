@@ -134,18 +134,25 @@ def complete_model_call(
     stream: bool,
     call_index: int,
 ) -> ModelResponse:
+    state.raise_if_cancelled()
     if not stream:
-        return model.complete(messages, tools, state)
+        response = model.complete(messages, tools, state)
+        state.raise_if_cancelled()
+        return response
     stream_method = getattr(model, "stream", None)
     if not callable(stream_method):
-        return model.complete(messages, tools, state)
+        response = model.complete(messages, tools, state)
+        state.raise_if_cancelled()
+        return response
 
     state.emit("model.stream.started", {"provider": model.name, "turn": call_index})
     assembler = ModelResponseAssembler(provider=model.name)
     trace = _StreamTraceState()
     for delta in stream_method(messages, tools, state):
+        state.raise_if_cancelled()
         _record_model_delta(state, model.name, trace.normalize(delta))
         assembler.accept(delta)
+        state.raise_if_cancelled()
     return assembler.response()
 
 
@@ -238,18 +245,31 @@ def _record_model_delta(state: RunState, provider: str, delta: ModelDelta) -> No
                 item_id=delta.item_id,
             )
         case "reasoning_summary_delta":
+            data = {
+                "chars": len(delta.delta),
+                "item_id": delta.item_id,
+            }
+            provider_field = delta.data.get("provider_field")
+            if isinstance(provider_field, str) and provider_field:
+                data["provider_field"] = provider_field
             safe_to_display = delta.data.get("safe_to_display", True)
+            if safe_to_display:
+                data["delta"] = delta.delta
             state.emit(
                 "reasoning.summary.delta",
-                _reasoning_event_data(delta, include_delta=safe_to_display),
+                data,
                 visibility="user" if safe_to_display else "debug",
                 durability="ephemeral",
                 item_id=delta.item_id,
             )
         case "reasoning_visible_delta":
+            data = {"delta": delta.delta, "chars": len(delta.delta), "item_id": delta.item_id}
+            provider_field = delta.data.get("provider_field")
+            if isinstance(provider_field, str) and provider_field:
+                data["provider_field"] = provider_field
             state.emit(
                 "reasoning.visible.delta",
-                _reasoning_event_data(delta, include_delta=True),
+                data,
                 visibility="internal",
                 durability="ephemeral",
                 item_id=delta.item_id,
@@ -279,16 +299,6 @@ def _record_model_delta(state: RunState, provider: str, delta: ModelDelta) -> No
             state.emit("model.usage", {"provider": provider, **delta.data})
         case _:
             return
-
-
-def _reasoning_event_data(delta: ModelDelta, *, include_delta: bool) -> dict[str, Any]:
-    data = {"chars": len(delta.delta), "item_id": delta.item_id}
-    if include_delta:
-        data["delta"] = delta.delta
-    provider_field = delta.data.get("provider_field")
-    if isinstance(provider_field, str) and provider_field:
-        data["provider_field"] = provider_field
-    return data
 
 
 def _parse_chat_tool_call_delta(call: dict[str, Any]) -> Iterator[ModelDelta]:

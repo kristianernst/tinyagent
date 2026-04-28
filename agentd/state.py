@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from agentd.events import Event, EventDurability, EventSink, EventVisibility, utc_now
+from agentd.run_control import CancelToken, RunCancelled
 
 if TYPE_CHECKING:
     from agentd.context import ContextState
@@ -126,12 +127,21 @@ class RunState:
     tool_call_count: int = 0
     done: bool = False
     failed: bool = False
+    cancelled: bool = False
+    status: str = "new"
     failure_reason: str | None = None
+    cancel_reason: str | None = None
+    cancel_requested_at: datetime | None = None
+    cancel_signal_count: int = 0
+    cancel_escalated: bool = False
+    current_step_kind: str | None = None
+    current_step_id: str | None = None
     final_output: str = ""
     final_diff: str = ""
     shell_preflight: dict[str, Any] = field(default_factory=dict)
     persist_events: bool = True
     stream_sink: EventSink | None = None
+    cancel_token: CancelToken = field(default_factory=CancelToken, repr=False)
     context_state: ContextState = field(default_factory=_default_context_state)
     context_checkpoint: str = ""
     context_checkpoint_artifact: str = ""
@@ -215,10 +225,52 @@ class RunState:
             return
         self.done = True
         self.failed = True
+        self.status = "failed"
         self.failure_reason = reason
 
     def finish(self, final_output: str = "") -> None:
         if self.done:
             return
         self.done = True
+        self.status = "completed"
         self.final_output = final_output or self.final_output
+
+    def request_cancel(self, reason: str = "cancelled", *, source: str = "harness", escalate: bool = False) -> bool:
+        already_cancelled = self.cancelled
+        if source == "sigint":
+            self.cancel_signal_count = max(self.cancel_signal_count, self.cancel_token.signal_count or self.cancel_signal_count + 1)
+        self.cancel_token.cancel(reason, escalate=escalate)
+        self.cancel_escalated = self.cancel_escalated or escalate or self.cancel_token.escalated
+        if already_cancelled:
+            return False
+        self.done = True
+        self.cancelled = True
+        self.status = "cancelling"
+        self.cancel_reason = reason
+        self.cancel_requested_at = utc_now()
+        self.emit(
+            "run.cancel.requested",
+            {
+                "reason": reason,
+                "source": source,
+                "current_step_kind": self.current_step_kind,
+                "current_step_id": self.current_step_id,
+                "escalated": self.cancel_escalated,
+            },
+            visibility="user",
+        )
+        return True
+
+    def raise_if_cancelled(self) -> None:
+        if self.cancel_token.cancelled:
+            self.request_cancel(
+                self.cancel_token.reason or "cancelled",
+                source="sigint" if self.cancel_token.reason == "sigint" else "harness",
+                escalate=self.cancel_token.escalated,
+            )
+        if self.cancelled:
+            raise RunCancelled(self.cancel_reason or "cancelled")
+
+    def set_current_step(self, kind: str | None, step_id: str | None) -> None:
+        self.current_step_kind = kind
+        self.current_step_id = step_id

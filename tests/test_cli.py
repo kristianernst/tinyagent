@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import signal
 import sys
 
-from agentctl.cli import main
+from agentctl.cli import _sigint_cancel, main
+from agentd.run_control import CancelToken
 
 
 def test_agentctl_help_exits_successfully(capsys) -> None:
@@ -183,3 +185,21 @@ def test_agentctl_run_openai_compatible_missing_env_fails_cleanly(tmp_path, caps
     assert exit_code == 1
     assert captured.out == "provider error: TINYAGENT_MODEL_API_KEY is required for openai-compatible provider.\n"
     assert captured.err == ""
+
+
+def test_sigint_handler_sets_token_without_throwing_and_escalates() -> None:
+    token = CancelToken()
+
+    with _sigint_cancel(token):
+        signal.raise_signal(signal.SIGINT)
+
+    assert token.cancelled is True
+    assert token.reason == "sigint"
+    assert token.signal_count == 1
+    assert token.escalated is False
+
+    with _sigint_cancel(token):
+        signal.raise_signal(signal.SIGINT)
+
+    assert token.signal_count == 2
+    assert token.escalated is True

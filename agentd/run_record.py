@@ -21,6 +21,7 @@ class ModelCallRecord:
     request_artifact: str = ""
     response_artifact: str = ""
     failed: bool = False
+    cancelled: bool = False
     failure_reason: str = ""
 
 
@@ -30,6 +31,7 @@ class ToolCallRecord:
     tool_call_id: str = ""
     ok: bool | None = None
     blocked: bool = False
+    cancelled: bool = False
     output_chars: int = 0
     output_artifact: str = ""
 
@@ -39,6 +41,7 @@ class CommandRecord:
     cmd: str = ""
     ok: bool | None = None
     timeout: bool = False
+    cancelled: bool = False
     returncode: int | None = None
     output_chars: int = 0
     output_artifact: str = ""
@@ -135,7 +138,7 @@ def render_run_inspection(record: RunRecord) -> str:
     lines.extend(["", "## Model Calls"])
     if record.model_calls:
         for call in record.model_calls:
-            status = "failed" if call.failed else "completed"
+            status = "cancelled" if call.cancelled else "failed" if call.failed else "completed"
             lines.append(
                 f"- turn={call.turn} provider={call.provider} status={status} streamed={call.streamed} "
                 f"tools={call.tool_call_count} finish={call.finish_reason or ''} {call.response_artifact}".strip()
@@ -146,7 +149,7 @@ def render_run_inspection(record: RunRecord) -> str:
     if record.tool_calls:
         for call in record.tool_calls:
             lines.append(
-                f"- {call.tool} {call.tool_call_id} ok={call.ok} blocked={call.blocked} "
+                f"- {call.tool} {call.tool_call_id} ok={call.ok} blocked={call.blocked} cancelled={call.cancelled} "
                 f"output_chars={call.output_chars} {call.output_artifact}".strip()
             )
     else:
@@ -155,7 +158,7 @@ def render_run_inspection(record: RunRecord) -> str:
     if record.commands:
         for command in record.commands:
             lines.append(
-                f"- ok={command.ok} timeout={command.timeout} returncode={command.returncode} "
+                f"- ok={command.ok} timeout={command.timeout} cancelled={command.cancelled} returncode={command.returncode} "
                 f"output_chars={command.output_chars} cmd={command.cmd!r} {command.output_artifact}".strip()
             )
     else:
@@ -192,6 +195,13 @@ def _model_calls(events: list[Event]) -> list[ModelCallRecord]:
                 failed=True,
                 failure_reason=str(data.get("reason") or ""),
             )
+        elif event.type == "model.cancelled":
+            turn = int(data.get("turn") or len(records) + 1)
+            records.setdefault(turn, {}).update(
+                provider=str(data.get("provider") or ""),
+                cancelled=True,
+                failure_reason=str(data.get("reason") or ""),
+            )
     return [ModelCallRecord(turn=turn, **values) for turn, values in sorted(records.items())]
 
 
@@ -204,13 +214,14 @@ def _tool_calls(events: list[Event]) -> list[ToolCallRecord]:
             continue
         if event.type == "tool.call.started":
             records.setdefault(tool_call_id, {}).update(tool=str(data.get("tool") or ""), tool_call_id=tool_call_id)
-        elif event.type in {"tool.execution.completed", "tool.execution.failed"}:
+        elif event.type in {"tool.execution.completed", "tool.execution.failed", "tool.execution.cancelled"}:
             payload = data.get("data") if isinstance(data.get("data"), dict) else {}
             records.setdefault(tool_call_id, {}).update(
                 tool=str(data.get("tool") or ""),
                 tool_call_id=tool_call_id,
                 ok=bool(data.get("ok")),
                 blocked=bool(data.get("blocked")),
+                cancelled=event.type == "tool.execution.cancelled",
                 output_chars=int(data.get("output_chars") or 0),
                 output_artifact=str(payload.get("output_artifact") or ""),
             )
@@ -234,6 +245,14 @@ def _commands(events: list[Event]) -> list[CommandRecord]:
                 output_chars=int(data.get("output_chars") or 0),
                 output_artifact=str(data.get("output_artifact") or ""),
             )
+        elif event.type == "command.cancelled":
+            records.setdefault(tool_call_id, {}).update(
+                ok=False,
+                cancelled=True,
+                returncode=data.get("returncode"),
+                output_chars=int(data.get("output_chars") or 0),
+                output_artifact=str(data.get("output_artifact") or ""),
+            )
     return [CommandRecord(**record) for record in records.values()]
 
 
@@ -246,6 +265,8 @@ def _last_event(events: list[Event], event_type: str) -> Event | None:
 
 
 def _status_from_events(events: list[Event]) -> str:
+    if any(event.type == "run.cancelled" for event in events):
+        return "cancelled"
     if any(event.type == "run.failed" for event in events):
         return "failed"
     if any(event.type == "run.completed" for event in events):

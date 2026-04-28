@@ -139,12 +139,41 @@ class LongOutputTool:
         return ToolResult(tool_name=self.name, output="abcdef", data={"output_artifact": "artifacts/tool.txt"})
 
 
+class CancellingTool:
+    name = "cancel"
+    schema = {"name": "cancel"}
+
+    def run(self, call: ToolCall, state: RunState) -> ToolResult:
+        state.request_cancel("test cancellation")
+        return ToolResult(
+            tool_name=self.name,
+            call_id=call.id,
+            output="cancelled",
+            ok=False,
+            data={"cancelled": True, "reason": "test cancellation"},
+        )
+
+
 class LargeDataTool:
     name = "large_data"
     schema = {"name": "large_data"}
 
     def run(self, call: ToolCall, state: RunState) -> ToolResult:
         return ToolResult(tool_name=self.name, output="ok", data={"payload": "x" * 10_000})
+
+
+class CancellingStreamingModel:
+    name = "cancelling-streaming-model"
+
+    def complete(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState) -> ModelResponse:
+        del messages, tools, state
+        raise AssertionError("streaming cancellation test should not call complete")
+
+    def stream(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState):
+        del messages, tools
+        yield ModelDelta(kind="text_delta", delta="partial")
+        state.request_cancel("model cancelled")
+        yield ModelDelta(kind="text_delta", delta="ignored")
 
 
 def event_types(state: RunState) -> list[str]:
@@ -698,6 +727,70 @@ def test_empty_model_response_without_tool_calls_fails(tmp_path) -> None:
     assert event_types(state)[-1] == "run.failed"
 
 
+def test_cancelled_tool_preserves_completed_steps_and_finalizes_without_completion(tmp_path) -> None:
+    first_call = ToolCall(name="noop")
+    cancel_call = ToolCall(name="cancel")
+    model = StaticModel([ModelResponse(tool_calls=[first_call, cancel_call])])
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[NoopTool(), CancellingTool()],
+        policy=AllowAllPolicy(),
+    )
+
+    state = kernel.run("complete one step then cancel", workspace=tmp_path)
+
+    assert state.cancelled is True
+    assert state.failed is False
+    assert state.cancel_reason == "test cancellation"
+    assert [(step.call.name, step.result.data.get("cancelled")) for step in state.tool_steps] == [
+        ("noop", None),
+        ("cancel", True),
+    ]
+    types = event_types(state)
+    assert "tool.execution.completed" in types
+    assert "tool.execution.cancelled" in types
+    cancel_tool_events = [
+        event.type
+        for event in state.events
+        if event.data.get("tool_call_id") == cancel_call.id and event.type.startswith("tool.execution.")
+    ]
+    assert cancel_tool_events == [
+        "tool.execution.started",
+        "tool.execution.cancelled",
+    ]
+    assert "run.completed" not in types
+    assert types[-2:] == ["diff.finalized", "run.cancelled"]
+    assert (state.output_dir / "final.md").read_text() == "# Final output\n\nNo final output produced.\n"
+    metrics = json.loads((state.output_dir / "metrics.json").read_text())
+    assert metrics["status"] == "cancelled"
+    assert metrics["cancel_reason"] == "test cancellation"
+
+
+def test_cancelled_model_stream_keeps_partial_text_live_only(tmp_path) -> None:
+    sink = MemoryEventSink()
+    kernel = Kernel(
+        model=CancellingStreamingModel(),
+        profile=BasicProfile(),
+        tools=[NoopTool()],
+        policy=AllowAllPolicy(),
+        stream=True,
+        event_sink=sink,
+    )
+
+    state = kernel.run("cancel during stream", workspace=tmp_path)
+
+    assert state.cancelled is True
+    assert state.final_output == ""
+    assert [event.data["delta"] for event in sink.events if event.type == "model.text.delta"] == ["partial"]
+    types = event_types(state)
+    assert "model.cancelled" in types
+    assert "model.completed" not in types
+    assert "message.completed" not in types
+    assert "run.completed" not in types
+    assert types[-2:] == ["diff.finalized", "run.cancelled"]
+
+
 def test_workspace_must_exist(tmp_path) -> None:
     missing = tmp_path / "missing"
 
@@ -728,9 +821,12 @@ def test_event_taxonomy_includes_milestone_zero_required_events() -> None:
         "run.started",
         "run.completed",
         "run.failed",
+        "run.cancel.requested",
+        "run.cancelled",
         "context.built",
         "model.request.started",
         "model.completed",
+        "model.cancelled",
         "compaction.started",
         "checkpoint.completed",
         "tool.args.completed",
@@ -738,10 +834,12 @@ def test_event_taxonomy_includes_milestone_zero_required_events() -> None:
         "tool.execution.started",
         "tool.execution.completed",
         "tool.execution.failed",
+        "tool.execution.cancelled",
         "shell.preflight.completed",
         "files.listed",
         "command.started",
         "command.completed",
+        "command.cancelled",
         "patch.applied",
         "file.read",
         "search.completed",
