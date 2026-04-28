@@ -18,6 +18,8 @@ uv run ruff check .
 ```bash
 agentctl run "read hello.txt and answer" --provider fake --workspace .
 agentctl replay .tinyagent/runs/<run_id>
+agentctl inspect .tinyagent/runs/<run_id>
+agentctl eval evals/tiny --provider fake
 ```
 
 For the first disposable real-model spin, use `docs/FIRST_SPIN.md`.

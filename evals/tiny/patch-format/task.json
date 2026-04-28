@@ -1,0 +1,6 @@
+{
+  "id": "patch-format",
+  "task": "Update notes.txt so the status says done. Use apply_patch and inspect the final diff.",
+  "validation_command": "python3 validate.py",
+  "timeout_seconds": 60
+}

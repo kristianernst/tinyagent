@@ -1,0 +1,6 @@
+{
+  "id": "tiny-python-bug",
+  "task": "Fix the bug in calc.py. Run the tests and inspect the final diff.",
+  "validation_command": "python3 -m pytest",
+  "timeout_seconds": 60
+}

@@ -24,6 +24,9 @@ packages = ["agentd", "agentctl"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "integration: requires a live model endpoint and explicit TINYAGENT_RUN_INTEGRATION=1",
+]
 
 [tool.ruff]
 line-length = 140
