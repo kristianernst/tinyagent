@@ -7,9 +7,10 @@ from collections.abc import Iterable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from agentd.context import BuiltContext, estimate_messages_tokens, estimate_tools_tokens, message_text
-from agentd.contracts import Executor, LocalExecutor, ModelProvider, PolicyEngine, Profile, Tool
+from agentd.contracts import ApprovalHandler, Executor, LocalExecutor, ModelProvider, PolicyEngine, Profile, Tool
 from agentd.events import EventSink, json_safe
 from agentd.model_stream import complete_model_call
 from agentd.output import (
@@ -20,8 +21,21 @@ from agentd.output import (
     write_run_outputs,
 )
 from agentd.run_control import CancelToken, RunCancelled
-from agentd.state import Message, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, ToolStep, Workspace
+from agentd.state import (
+    ApprovalGrant,
+    ApprovalMode,
+    ApprovalRequest,
+    ApprovalResolution,
+    Message,
+    PolicyDecision,
+    RunBudgets,
+    RunState,
+    ToolCall,
+    ToolResult,
+    ToolStep,
+)
 from agentd.tools.builtins.shell import shell_preflight
+from agentd.workspace import SandboxMode, WorkspaceMode, prepare_workspace
 
 MAX_EVENT_DATA_CHARS = 4_000
 
@@ -36,19 +50,27 @@ class Kernel:
         profile: Profile,
         tools: Iterable[Tool],
         policy: PolicyEngine,
+        approval_handler: ApprovalHandler | None = None,
         executor: Executor | None = None,
         budgets: RunBudgets | None = None,
         stream: bool = False,
         event_sink: EventSink | None = None,
+        approval_mode: ApprovalMode = "yolo",
+        workspace_mode: WorkspaceMode = "auto",
+        sandbox_mode: SandboxMode = "none",
     ) -> None:
         self.model = model
         self.profile = profile
         self.tools = {tool.name: tool for tool in tools}
         self.policy = policy
+        self.approval_handler = approval_handler
         self.executor = executor or LocalExecutor()
         self.budgets = budgets or RunBudgets()
         self.stream = stream
         self.event_sink = event_sink
+        self.approval_mode = approval_mode
+        self.workspace_mode = workspace_mode
+        self.sandbox_mode = sandbox_mode
 
     def run(
         self,
@@ -60,14 +82,26 @@ class Kernel:
         stream: bool | None = None,
         event_sink: EventSink | None = None,
         cancel_token: CancelToken | None = None,
+        workspace_mode: WorkspaceMode | None = None,
+        approval_mode: ApprovalMode | None = None,
+        sandbox_mode: SandboxMode | None = None,
     ) -> RunState:
+        resolved_run_id = run_id or f"run_{uuid4().hex}"
+        prepared_workspace = prepare_workspace(
+            Path(workspace),
+            mode=workspace_mode or self.workspace_mode,
+            run_id=resolved_run_id,
+            sandbox_mode=sandbox_mode or self.sandbox_mode,
+        )
         state = RunState.create(
             task,
-            Workspace(Path(workspace)),
+            prepared_workspace.workspace,
             budgets=self.budgets,
-            run_id=run_id,
+            run_id=resolved_run_id,
             output_dir=output_dir,
         )
+        state.workspace_envelope = prepared_workspace.envelope
+        state.approval_mode = approval_mode or self.approval_mode
         state.status = "running"
         if cancel_token is not None:
             state.cancel_token = cancel_token
@@ -78,16 +112,27 @@ class Kernel:
             {
                 "task": task,
                 "workspace_root": str(state.workspace.root),
+                "original_workspace_root": (
+                    str(state.workspace_envelope.original_root)
+                    if state.workspace_envelope
+                    else str(Path(workspace).expanduser().resolve())
+                ),
                 "budgets": state.budgets.to_json_dict(),
                 "stream": use_stream,
+                "workspace_mode": state.workspace_envelope.mode if state.workspace_envelope else (workspace_mode or self.workspace_mode),
+                "approval_mode": state.approval_mode,
+                "sandbox_mode": state.workspace_envelope.sandbox_mode if state.workspace_envelope else (sandbox_mode or self.sandbox_mode),
+                "sandbox_enforced": bool(state.workspace_envelope.sandbox_enforced) if state.workspace_envelope else False,
             },
         )
+        self._emit_workspace_boundary(state, prepared_workspace.worktree_created)
         if "shell" in self.tools:
             state.shell_preflight = shell_preflight()
             state.emit("shell.preflight.completed", state.shell_preflight)
 
         try:
             state.raise_if_cancelled()
+            state.start_turn("turn-0001")
             self._run_loop(state, stream=use_stream)
         except RunCancelled as exc:
             state.request_cancel(
@@ -98,8 +143,8 @@ class Kernel:
         except Exception as exc:  # pragma: no cover - defensive boundary
             state.fail(f"Unhandled exception: {exc}")
         finally:
-            self._finalize_message(state)
-            capture_final_diff(state)
+            self._finalize_artifacts(state)
+            state.finish_turn()
             self._finalize_run(state)
             write_run_outputs(state)
 
@@ -135,7 +180,8 @@ class Kernel:
                     "checkpoint_artifact": state.context_checkpoint_artifact or None,
                 },
             )
-            model_call_index = state.turn_count + 1
+            model_call_index = state.model_call_count + 1
+            model_call_id = f"model-call-{model_call_index:04d}"
             context_artifact, request_artifact = write_model_request_artifacts(
                 state,
                 call_index=model_call_index,
@@ -151,12 +197,15 @@ class Kernel:
                 stream=stream,
             )
             state.emit(
-                "model.request.started",
+                "model.call.started",
                 {
                     "provider": self.model.name,
+                    "model_call_id": model_call_id,
+                    "model_call_index": model_call_index,
                     "base_url": _provider_base_url(self.model),
                     "message_count": len(messages),
                     "tool_count": len(visible_tools),
+                    "stream": stream,
                     "context_artifact": context_artifact,
                     "logical_request_artifact": request_artifact,
                     "http_request_artifact": http_request_artifact,
@@ -164,7 +213,12 @@ class Kernel:
             )
 
             try:
-                state.set_current_step("model", f"model-{model_call_index:04d}")
+                state.start_step(
+                    "model_call",
+                    model_call_id,
+                    model_call_id=model_call_id,
+                    data={"provider": self.model.name, "model_call_index": model_call_index},
+                )
                 response = complete_model_call(
                     self.model,
                     messages,
@@ -178,30 +232,55 @@ class Kernel:
                     "model.cancelled",
                     {
                         "provider": self.model.name,
-                        "turn": model_call_index,
+                        "model_call_id": model_call_id,
+                        "model_call_index": model_call_index,
                         "reason": state.cancel_reason or state.cancel_token.reason or "cancelled",
                     },
                     visibility="user",
                 )
+                state.finish_step("cancelled", data={"reason": state.cancel_reason or "cancelled"})
                 raise
             except Exception as exc:
-                state.emit("model.failed", {"provider": self.model.name, "reason": str(exc), "turn": model_call_index})
+                event_type = _model_error_event_type(exc)
+                state.emit(
+                    event_type,
+                    {
+                        "provider": self.model.name,
+                        "reason": str(exc),
+                        "model_call_id": model_call_id,
+                        "model_call_index": model_call_index,
+                    },
+                    visibility="user",
+                )
+                step_status = (
+                    "idle_timeout"
+                    if event_type == "model.idle_timeout"
+                    else "timeout"
+                    if event_type == "model.timeout"
+                    else "failed"
+                )
+                state.finish_step(step_status)
                 state.fail(f"Model provider error: {exc}")
                 return
-            finally:
-                if state.current_step_kind == "model":
-                    state.set_current_step(None, None)
-            state.turn_count += 1
+            state.model_call_count += 1
+            self._record_model_tool_calls(
+                state,
+                response,
+                provider=self.model.name,
+                model_call_id=model_call_id,
+                model_call_index=model_call_index,
+            )
             response_artifact = write_model_response_artifact(
                 state,
                 call_index=model_call_index,
                 response=response,
             )
             state.emit(
-                "model.completed",
+                "model.call.completed",
                 {
                     "provider": self.model.name,
-                    "turn": model_call_index,
+                    "model_call_id": model_call_id,
+                    "model_call_index": model_call_index,
                     "content_length": len(response.content),
                     "tool_call_count": len(response.tool_calls),
                     "finish_reason": response.finish_reason,
@@ -209,6 +288,7 @@ class Kernel:
                     "streamed": bool(response.raw.get("streamed")),
                 },
             )
+            state.finish_step("completed", data={"provider": self.model.name})
 
             if not response.tool_calls:
                 if response.content:
@@ -231,17 +311,6 @@ class Kernel:
 
     def _dispatch_tool_call(self, state: RunState, call: ToolCall, *, visible_tool_names: frozenset[str]) -> None:
         state.raise_if_cancelled()
-        args_preview = _small_event_data(call.args)
-        state.emit("tool.call.started", {"tool_call_id": call.id, "tool": call.name})
-        state.emit(
-            "tool.args.completed",
-            {
-                "tool_call_id": call.id,
-                "tool": call.name,
-                "args": args_preview,
-                "args_preview": args_preview,
-            },
-        )
         state.tool_call_count += 1
 
         tool = self.tools.get(call.name)
@@ -255,6 +324,7 @@ class Kernel:
             )
             self._append_tool_step(state, call, result)
             self._record_tool_result(state, call, result)
+            self._record_tool_blocked(state, call, result.output)
             return
 
         if call.name not in visible_tool_names:
@@ -267,6 +337,7 @@ class Kernel:
             )
             self._append_tool_step(state, call, result)
             self._record_tool_result(state, call, result)
+            self._record_tool_blocked(state, call, result.output)
             return
 
         try:
@@ -283,10 +354,15 @@ class Kernel:
             )
             self._append_tool_step(state, call, result)
             self._record_tool_result(state, call, result)
+            self._record_tool_blocked(state, call, result.output)
             state.fail(decision.reason)
             return
 
         self._record_policy_decision(state, call, decision)
+        if decision.kind == "needs_approval":
+            decision = self._resolve_approval(state, call, decision)
+            if decision.kind == "deny":
+                self._record_policy_decision(state, call, decision)
         if not decision.allowed:
             result = ToolResult(
                 tool_name=call.name,
@@ -297,10 +373,14 @@ class Kernel:
             )
             self._append_tool_step(state, call, result)
             self._record_tool_result(state, call, result)
+            self._record_tool_blocked(state, call, result.output)
             return
 
-        state.emit("tool.execution.started", {"tool_call_id": call.id, "tool": call.name})
-        state.set_current_step("tool", call.id)
+        tool_execution_id = f"tool-exec-{call.id}"
+        self._record_mutation_event(state, "workspace.mutation.planned", call)
+        self._record_mutation_event(state, "workspace.mutation.started", call)
+        state.emit("tool.execution.started", {"tool_call_id": call.id, "tool_execution_id": tool_execution_id, "tool": call.name})
+        state.start_step("tool_execution", tool_execution_id, data={"tool_call_id": call.id, "tool": call.name})
         try:
             result = self.executor.run_tool(tool, call, state)
         except RunCancelled as exc:
@@ -324,9 +404,6 @@ class Kernel:
                 ok=False,
                 data={"error_type": type(exc).__name__},
             )
-        finally:
-            if state.current_step_id == call.id:
-                state.set_current_step(None, None)
         if not result.call_id:
             result = ToolResult(
                 tool_name=result.tool_name,
@@ -337,6 +414,13 @@ class Kernel:
             )
         self._append_tool_step(state, call, result)
         self._record_tool_result(state, call, result)
+        if result.data.get("cancelled"):
+            state.finish_step("cancelled", data={"reason": result.data.get("reason") or "cancelled"})
+        elif result.ok:
+            state.finish_step("completed", data={"tool_call_id": call.id, "tool": call.name})
+        else:
+            state.finish_step("failed", data={"tool_call_id": call.id, "tool": call.name})
+        self._record_mutation_event(state, "workspace.mutation.completed", call, ok=result.ok)
         if result.data.get("cancelled"):
             state.request_cancel(str(result.data.get("reason") or state.cancel_reason or "cancelled"))
 
@@ -358,6 +442,16 @@ class Kernel:
         output_limit = state.budgets.max_command_output_chars_visible
         output = result.output[:output_limit]
         output_chars = _output_chars(result)
+        if result.data.get("output_artifact"):
+            state.emit(
+                "tool.execution.output.snapshot",
+                {
+                    "tool_call_id": call.id,
+                    "tool": call.name,
+                    "output_chars": output_chars,
+                    "output_artifact": result.data.get("output_artifact"),
+                },
+            )
         state.emit(
             "tool.execution.completed" if result.ok else "tool.execution.failed",
             {
@@ -376,22 +470,150 @@ class Kernel:
         state.tool_steps.append(ToolStep(call=call, result=result))
 
     def _record_policy_decision(self, state: RunState, call: ToolCall, decision: PolicyDecision) -> None:
+        approval_id = decision.approval.approval_id if decision.approval else None
         state.emit(
-            "tool.policy.evaluated",
+            "policy.evaluated",
             {
                 "tool_call_id": call.id,
                 "tool": call.name,
+                "kind": decision.kind,
                 "allowed": decision.allowed,
                 "reason": decision.reason,
                 "redacted": decision.redacted,
+                "approval_id": approval_id,
             },
         )
+
+    def _record_tool_blocked(self, state: RunState, call: ToolCall, reason: str) -> None:
+        state.emit(
+            "tool.execution.blocked",
+            {
+                "tool_call_id": call.id,
+                "tool": call.name,
+                "reason": reason,
+            },
+            visibility="user",
+        )
+
+    def _resolve_approval(self, state: RunState, call: ToolCall, decision: PolicyDecision) -> PolicyDecision:
+        approval = decision.approval
+        if approval is None:
+            return PolicyDecision.deny(decision.reason or "approval request missing")
+
+        grant = state.approval_grants.get(approval.grant_key())
+        if grant is not None:
+            state.emit(
+                "approval.resolved",
+                {
+                    "approval_id": approval.approval_id,
+                    "decision": "approved",
+                    "scope": grant.scope,
+                    "reason": "approval_grant",
+                },
+                visibility="user",
+            )
+            return PolicyDecision.allow("approved by run-scoped grant")
+
+        state.pending_approvals[approval.approval_id] = approval
+        state.emit("approval.requested", approval.to_json_dict(), visibility="user")
+
+        if state.approval_mode == "never":
+            resolution = ApprovalResolution(
+                approval_id=approval.approval_id,
+                decision="denied",
+                reason="approval_mode_never",
+            )
+        elif state.approval_mode == "yolo":
+            resolution = _yolo_resolution(approval)
+        elif self.approval_handler is not None:
+            state.start_step("approval_wait", f"approval-{approval.approval_id}", data={"approval_id": approval.approval_id})
+            try:
+                resolution = self.approval_handler.resolve(approval, state)
+            except RunCancelled:
+                state.finish_step("cancelled", data={"approval_id": approval.approval_id})
+                raise
+            except Exception as exc:
+                resolution = ApprovalResolution(
+                    approval_id=approval.approval_id,
+                    decision="denied",
+                    reason=f"approval handler error: {exc}",
+                )
+            else:
+                state.finish_step("completed", data={"approval_id": approval.approval_id, "decision": resolution.decision})
+        else:
+            resolution = ApprovalResolution(
+                approval_id=approval.approval_id,
+                decision="denied",
+                reason="approval_handler_unavailable",
+            )
+
+        state.pending_approvals.pop(approval.approval_id, None)
+        state.emit("approval.resolved", resolution.to_json_dict(), visibility="user")
+        if resolution.decision == "approved":
+            if resolution.scope == "run":
+                state.approval_grants[approval.grant_key()] = ApprovalGrant(
+                    approval_id=approval.approval_id,
+                    grant_key=approval.grant_key(),
+                    scope="run",
+                )
+            return PolicyDecision.allow(resolution.reason or "approved")
+        return PolicyDecision.deny(resolution.reason or f"approval {resolution.decision}")
+
+    def _record_model_tool_calls(
+        self,
+        state: RunState,
+        response,
+        *,
+        provider: str,
+        model_call_id: str,
+        model_call_index: int,
+    ) -> None:
+        for call in response.tool_calls:
+            already = any(
+                event.type == "model.tool_call.assembly.completed" and event.data.get("tool_call_id") == call.id
+                for event in state.events
+            )
+            if already:
+                continue
+            state.emit(
+                "model.tool_call.assembly.started",
+                {
+                    "provider": provider,
+                    "model_call_id": model_call_id,
+                    "model_call_index": model_call_index,
+                    "tool_call_id": call.id,
+                    "tool": call.name,
+                },
+            )
+            state.emit(
+                "model.tool_call.assembly.completed",
+                {
+                    "provider": provider,
+                    "model_call_id": model_call_id,
+                    "model_call_index": model_call_index,
+                    "tool_call_id": call.id,
+                    "tool": call.name,
+                    "args": _small_event_data(call.args),
+                },
+            )
+
+    def _record_mutation_event(self, state: RunState, event_type: str, call: ToolCall, *, ok: bool | None = None) -> None:
+        if call.name not in {"apply_patch", "shell"}:
+            return
+        data: dict[str, Any] = {
+            "tool_call_id": call.id,
+            "tool": call.name,
+            "workspace_root": str(state.workspace.root),
+        }
+        if ok is not None:
+            data["ok"] = ok
+        state.emit(event_type, data)
 
     def _budget_exhausted(self, state: RunState) -> bool:
         if state.elapsed_seconds() > state.budgets.max_run_seconds:
             state.fail("Run exceeded max_run_seconds budget.")
             return True
-        if state.turn_count >= state.budgets.max_turns:
+        if state.model_call_count >= state.budgets.max_turns:
             state.fail("Run exceeded max_turns budget.")
             return True
         if state.tool_call_count >= state.budgets.max_tool_calls:
@@ -422,15 +644,43 @@ class Kernel:
             return None
         return write_model_http_request_artifact(state, call_index=call_index, payload=payload)
 
+    def _emit_workspace_boundary(self, state: RunState, worktree_created: bool) -> None:
+        envelope = state.workspace_envelope
+        if envelope is None:
+            return
+        state.emit(
+            "workspace.opened",
+            {
+                "root": str(envelope.root),
+                "original_root": str(envelope.original_root),
+                "mode": envelope.mode,
+                "effective_mode": envelope.effective_mode,
+            },
+        )
+        dirty = envelope.dirty_state_before
+        if dirty.is_git_repo and not dirty.clean:
+            state.emit("workspace.dirty.detected", dirty.to_json_dict(), visibility="user")
+        if worktree_created:
+            state.emit(
+                "worktree.created",
+                {
+                    "path": str(envelope.worktree_path),
+                    "git_head": envelope.git_head_before,
+                    "original_root": str(envelope.original_root),
+                },
+                visibility="user",
+            )
+        state.emit("workspace.boundary", envelope.to_json_dict(), visibility="user")
+
     def _finalize_message(self, state: RunState) -> None:
         if not state.done and not state.failed and not state.cancelled:
             state.finish("Run finished without explicit final output.")
         if not state.final_output:
             return
-        if any(event.type == "message.completed" for event in state.events):
+        if any(event.type == "model.message.completed" and event.data.get("output_path") == "final.md" for event in state.events):
             return
         state.emit(
-            "message.completed",
+            "model.message.completed",
             {
                 "role": "assistant",
                 "content_chars": len(state.final_output),
@@ -439,6 +689,23 @@ class Kernel:
             visibility="user",
         )
 
+    def _finalize_artifacts(self, state: RunState) -> None:
+        state.finalization_attempted = True
+        state.start_step("artifact_finalization", "artifact-finalization-0001")
+        state.emit("artifact.finalization.started", {"output_dir": str(state.output_dir)})
+        try:
+            self._finalize_message(state)
+            capture_final_diff(state)
+            for path in ("final.md", "metrics.json", "final.diff"):
+                state.emit("artifact.materialized", {"path": path, "kind": "run_output"})
+            state.emit("artifact.finalization.completed", {"output_dir": str(state.output_dir)})
+            state.finish_step("completed")
+        except Exception as exc:  # pragma: no cover - defensive finalization boundary
+            state.emit("artifact.finalization.failed", {"reason": str(exc)}, visibility="user")
+            state.finish_step("failed", data={"reason": str(exc)})
+            if not state.failed and not state.cancelled:
+                state.fail(f"artifact finalization failed: {exc}")
+
     def _finalize_run(self, state: RunState) -> None:
         event_type = "run.cancelled" if state.cancelled else "run.failed" if state.failed else "run.completed"
         if any(event.type == event_type for event in state.events):
@@ -446,9 +713,16 @@ class Kernel:
         data = {
             "status": "cancelled" if state.cancelled else "failed" if state.failed else "completed",
             "turn_count": state.turn_count,
+            "model_call_count": state.model_call_count,
             "tool_call_count": state.tool_call_count,
             "final_output_chars": len(state.final_output),
             "duration_seconds": state.elapsed_seconds(),
+            "workspace_mode": state.workspace_envelope.mode if state.workspace_envelope else None,
+            "workspace_effective_mode": state.workspace_envelope.effective_mode if state.workspace_envelope else None,
+            "approval_mode": state.approval_mode,
+            "sandbox_mode": state.workspace_envelope.sandbox_mode if state.workspace_envelope else "none",
+            "sandbox_enforced": state.workspace_envelope.sandbox_enforced if state.workspace_envelope else False,
+            "finalization_attempted": state.finalization_attempted,
         }
         if state.cancelled:
             data["reason"] = state.cancel_reason or "cancelled"
@@ -518,6 +792,30 @@ def _small_event_data(data: dict[str, Any]) -> dict[str, Any]:
 def _output_chars(result: ToolResult) -> int:
     value = result.data.get("output_chars")
     return value if isinstance(value, int) else len(result.output)
+
+
+def _yolo_resolution(approval: ApprovalRequest) -> ApprovalResolution:
+    if approval.action_kind in {"network", "workspace_escape"}:
+        return ApprovalResolution(
+            approval_id=approval.approval_id,
+            decision="denied",
+            reason=f"approval-mode=yolo does not allow {approval.action_kind}",
+        )
+    return ApprovalResolution(
+        approval_id=approval.approval_id,
+        decision="approved",
+        scope="once",
+        reason="approval_mode_yolo_in_workspace",
+    )
+
+
+def _model_error_event_type(exc: Exception) -> str:
+    text = str(exc).lower()
+    if "idle" in text and "timeout" in text:
+        return "model.idle_timeout"
+    if "timed out" in text or "timeout" in text:
+        return "model.timeout"
+    return "model.call.failed"
 
 
 def _provider_base_url(model: ModelProvider) -> str | None:

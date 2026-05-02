@@ -16,6 +16,8 @@ from agentd.events import EventSink
 from agentd.kernel import Kernel
 from agentd.run_control import CancelToken
 from agentd.run_record import RunRecord, load_run_record
+from agentd.state import ApprovalMode
+from agentd.workspace import SandboxMode, WorkspaceMode
 
 ModelFactory = Callable[[str], ModelProvider]
 
@@ -70,6 +72,9 @@ def run_eval_suite(
     stream: bool = False,
     event_sink: EventSink | None = None,
     cancel_token: CancelToken | None = None,
+    workspace_mode: WorkspaceMode = "current",
+    approval_mode: ApprovalMode = "yolo",
+    sandbox_mode: SandboxMode = "none",
 ) -> EvalRun:
     suite_path = suite_path.expanduser().resolve()
     output_dir = output_dir.expanduser().resolve()
@@ -97,6 +102,9 @@ def run_eval_suite(
             stream=stream,
             event_sink=event_sink,
             cancel_token=cancel_token,
+            workspace_mode=workspace_mode,
+            approval_mode=approval_mode,
+            sandbox_mode=sandbox_mode,
         )
         results.append(result)
         if result.status == "cancelled":
@@ -177,6 +185,9 @@ def _run_case(
     stream: bool,
     event_sink: EventSink | None,
     cancel_token: CancelToken | None,
+    workspace_mode: WorkspaceMode,
+    approval_mode: ApprovalMode,
+    sandbox_mode: SandboxMode,
 ) -> EvalResult:
     case_dir = suite_path / case.id
     _prepare_workspace(case_dir, workspace_dir, setup_git=case.setup_git)
@@ -187,8 +198,20 @@ def _run_case(
         policy=policy,
         stream=stream,
         event_sink=event_sink,
+        workspace_mode=workspace_mode,
+        approval_mode=approval_mode,
+        sandbox_mode=sandbox_mode,
     )
-    kernel.run(case.task, workspace=workspace_dir, run_id=case.id, output_dir=run_dir, cancel_token=cancel_token)
+    kernel.run(
+        case.task,
+        workspace=workspace_dir,
+        run_id=case.id,
+        output_dir=run_dir,
+        cancel_token=cancel_token,
+        workspace_mode=workspace_mode,
+        approval_mode=approval_mode,
+        sandbox_mode=sandbox_mode,
+    )
     record = load_run_record(run_dir)
     validation_exit_code = None
     validation_ok = True

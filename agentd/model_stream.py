@@ -145,15 +145,37 @@ def complete_model_call(
         state.raise_if_cancelled()
         return response
 
-    state.emit("model.stream.started", {"provider": model.name, "turn": call_index})
     assembler = ModelResponseAssembler(provider=model.name)
     trace = _StreamTraceState()
     for delta in stream_method(messages, tools, state):
         state.raise_if_cancelled()
-        _record_model_delta(state, model.name, trace.normalize(delta))
-        assembler.accept(delta)
+        normalized = trace.normalize(delta)
+        _record_model_delta(state, model.name, normalized)
+        assembler.accept(normalized)
         state.raise_if_cancelled()
-    return assembler.response()
+    if trace.reasoning_seen:
+        state.emit("model.reasoning.completed", {"provider": model.name, "model_call_index": call_index})
+    try:
+        response = assembler.response()
+    except Exception as exc:
+        state.emit(
+            "model.tool_call.assembly.failed",
+            {"provider": model.name, "model_call_index": call_index, "reason": str(exc)},
+            visibility="user",
+        )
+        raise
+    for call in response.tool_calls:
+        state.emit(
+            "model.tool_call.assembly.completed",
+            {
+                "provider": model.name,
+                "model_call_index": call_index,
+                "tool_call_id": call.id,
+                "tool": call.name,
+                "args": call.args,
+            },
+        )
+    return response
 
 
 def assemble_model_deltas(provider: str, deltas: Iterable[ModelDelta]) -> ModelResponse:
@@ -256,7 +278,7 @@ def _record_model_delta(state: RunState, provider: str, delta: ModelDelta) -> No
             if safe_to_display:
                 data["delta"] = delta.delta
             state.emit(
-                "reasoning.summary.delta",
+                "model.reasoning.delta",
                 data,
                 visibility="user" if safe_to_display else "debug",
                 durability="ephemeral",
@@ -268,7 +290,7 @@ def _record_model_delta(state: RunState, provider: str, delta: ModelDelta) -> No
             if isinstance(provider_field, str) and provider_field:
                 data["provider_field"] = provider_field
             state.emit(
-                "reasoning.visible.delta",
+                "model.reasoning.delta",
                 data,
                 visibility="internal",
                 durability="ephemeral",
@@ -283,10 +305,18 @@ def _record_model_delta(state: RunState, provider: str, delta: ModelDelta) -> No
                 item_id=delta.item_id,
             )
         case "tool_call_started":
-            return
+            if delta.data.get("_first_seen"):
+                state.emit(
+                    "model.tool_call.assembly.started",
+                    {
+                        "tool_call_id": delta.tool_call_id,
+                        "tool": delta.data.get("name"),
+                        "provider_tool_call_id": delta.data.get("id"),
+                    },
+                )
         case "tool_call_args_delta":
             state.emit(
-                "tool.args.delta",
+                "model.tool_call.args.delta",
                 {
                     "tool_call_id": delta.tool_call_id,
                     "tool": delta.data.get("name"),
@@ -350,12 +380,19 @@ class _StreamTraceState:
     def __init__(self) -> None:
         self.tool_call_ids: dict[str, str] = {}
         self.tool_names: dict[str, str] = {}
+        self.started_keys: set[str] = set()
+        self.reasoning_seen = False
 
     def normalize(self, delta: ModelDelta) -> ModelDelta:
+        if delta.kind in {"reasoning_summary_delta", "reasoning_visible_delta", "reasoning_encrypted"}:
+            self.reasoning_seen = True
         if not delta.kind.startswith("tool_call_"):
             return delta
 
         key = _stream_tool_key(delta)
+        first_seen = key not in self.started_keys and delta.kind == "tool_call_started"
+        if first_seen:
+            self.started_keys.add(key)
         provider_id = _provider_tool_call_id(delta)
         if provider_id:
             self.tool_call_ids[key] = provider_id
@@ -370,6 +407,8 @@ class _StreamTraceState:
             data["id"] = resolved_id
         if resolved_name and not data.get("name"):
             data["name"] = resolved_name
+        if first_seen:
+            data["_first_seen"] = True
         return replace(delta, tool_call_id=resolved_id, data=data)
 
 

@@ -126,7 +126,7 @@ def _collect_event_context(state: RunState, context_state: ContextState) -> None
         elif event.type == "patch.applied":
             for path in data.get("paths", []):
                 context_state.files_changed[str(path)] = "changed by apply_patch"
-        elif event.type == "command.completed":
+        elif event.type in {"command.completed", "command.failed", "command.timeout"}:
             command = str(data.get("cmd", ""))
             if not command:
                 continue

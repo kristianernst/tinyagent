@@ -205,9 +205,11 @@ def _final_text(state: RunState) -> str:
 
 
 def _metrics(state: RunState) -> dict[str, Any]:
+    envelope = state.workspace_envelope
     return {
         "run_id": state.run_id,
         "status": "cancelled" if state.cancelled else "failed" if state.failed else "completed",
+        "terminal_status": state.terminal_status,
         "failure_reason": state.failure_reason,
         "cancel_reason": state.cancel_reason,
         "cancel_requested": state.cancelled,
@@ -217,8 +219,10 @@ def _metrics(state: RunState) -> dict[str, Any]:
         "final_output_path": "final.md",
         "task": state.task,
         "workspace_root": str(state.workspace.root),
+        "original_workspace_root": str(envelope.original_root) if envelope else str(state.workspace.root),
         "output_dir": str(state.output_dir),
         "turn_count": state.turn_count,
+        "model_call_count": state.model_call_count,
         "tool_call_count": state.tool_call_count,
         "event_count": state.seq,
         "durable_event_count": len(state.events),
@@ -232,7 +236,15 @@ def _metrics(state: RunState) -> dict[str, Any]:
         "shell_env": "sanitized",
         "shell_process_group": "posix",
         "shell_preflight": state.shell_preflight,
-        "sandbox_mode": "none",
+        "workspace_mode": envelope.mode if envelope else "current",
+        "workspace_effective_mode": envelope.effective_mode if envelope else "current",
+        "workspace_allowed_roots": [str(root) for root in envelope.allowed_roots] if envelope else [str(state.workspace.root)],
+        "approval_mode": state.approval_mode,
+        "sandbox_mode": envelope.sandbox_mode if envelope else "none",
+        "sandbox_enforced": envelope.sandbox_enforced if envelope else False,
+        "finalization_attempted": state.finalization_attempted,
+        "pending_approval_count": len(state.pending_approvals),
+        "approval_grant_count": len(state.approval_grants),
     }
 
 

@@ -72,6 +72,7 @@ def render_environment_context(state: RunState, config: ContextConfig | None = N
     shell = config.shell or os.environ.get("SHELL") or "/bin/sh"
     preflight = state.shell_preflight or {}
     commands = preflight.get("commands") if isinstance(preflight.get("commands"), dict) else {}
+    envelope = state.workspace_envelope
     command_lines = [
         f"    {name}: {bool(commands.get(name, False))}" for name in sorted(set(DEFAULT_SHELL_PREFLIGHT_COMMANDS) | set(commands))
     ]
@@ -83,7 +84,11 @@ def render_environment_context(state: RunState, config: ContextConfig | None = N
             "  shell_preflight:",
             *command_lines,
             f"    python_available: {bool(preflight.get('python_available', False))}",
-            "  sandbox_mode: none",
+            f"  workspace_mode: {envelope.mode if envelope else 'current'}",
+            f"  workspace_effective_mode: {envelope.effective_mode if envelope else 'current'}",
+            f"  approval_mode: {state.approval_mode}",
+            f"  sandbox_mode: {envelope.sandbox_mode if envelope else 'none'}",
+            f"  sandbox_enforced: {bool(envelope.sandbox_enforced) if envelope else False}",
             "  shell_env: sanitized",
             f"  writable_root: {state.workspace.root}",
             "</environment_context>",

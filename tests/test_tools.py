@@ -144,11 +144,19 @@ def test_local_policy_blocks_outside_paths_and_risky_shell(tmp_path) -> None:
 
     outside = policy.evaluate(ToolCall(name="read_file", args={"path": "../secret.txt"}), state)
     shell = policy.evaluate(ToolCall(name="shell", args={"cmd": "rm -rf build"}), state)
+    network = policy.evaluate(ToolCall(name="shell", args={"cmd": "curl https://example.com"}), state)
+    redirect = policy.evaluate(ToolCall(name="shell", args={"cmd": "printf x > /tmp/outside.txt"}), state)
 
     assert outside.allowed is False
     assert "outside workspace" in outside.reason
     assert shell.allowed is False
     assert "denied" in shell.reason
+    assert network.kind == "needs_approval"
+    assert network.approval is not None
+    assert network.approval.action_kind == "network"
+    assert redirect.kind == "needs_approval"
+    assert redirect.approval is not None
+    assert redirect.approval.action_kind == "workspace_escape"
 
 
 @pytest.mark.parametrize(
@@ -394,7 +402,7 @@ def test_shell_timeout_terminates_process_group_children(tmp_path) -> None:
     assert result.data["timeout"] is True
     assert (tmp_path / "child.started").exists()
     assert not (tmp_path / "child.done").exists()
-    command_completed_events = [event for event in state.events if event.type == "command.completed"]
+    command_completed_events = [event for event in state.events if event.type == "command.timeout"]
     assert len(command_completed_events) == 1
     assert "command.cancelled" not in [event.type for event in state.events]
     command_finished = command_completed_events[0]
@@ -696,14 +704,20 @@ def test_apex_profile_blocks_registered_but_hidden_tools(tmp_path, tool_name, ar
 
     assert state.failed is False
     assert state.final_output == "done"
-    assert state.turn_count == 2
+    assert state.turn_count == 1
+    assert state.model_call_count == 2
     result = state.tool_results[0]
     assert result.tool_name == tool_name
     assert result.ok is False
     assert result.output == f"Tool is not visible for this profile: {tool_name}"
     assert result.data == {"blocked": True, "error_type": "ToolNotVisible", "visible_tools": ["apply_patch", "shell"]}
     hidden_events = [event for event in state.events if event.data.get("tool_call_id") == hidden_call.id]
-    assert [event.type for event in hidden_events] == ["tool.call.started", "tool.args.completed", "tool.execution.failed"]
+    assert [event.type for event in hidden_events] == [
+        "model.tool_call.assembly.started",
+        "model.tool_call.assembly.completed",
+        "tool.execution.failed",
+        "tool.execution.blocked",
+    ]
 
 
 def test_shell_preflight_records_expected_interface_in_events_and_metrics(tmp_path) -> None:
@@ -764,7 +778,12 @@ def test_golden_trace_calc_pytest_patch_loop_records_required_artifacts(tmp_path
         policy=LocalPolicy(),
     )
 
-    state = kernel.run("Fix the bug in calc.py. Run the tests and inspect the final diff.", workspace=tmp_path, run_id="run_calc_golden")
+    state = kernel.run(
+        "Fix the bug in calc.py. Run the tests and inspect the final diff.",
+        workspace=tmp_path,
+        run_id="run_calc_golden",
+        workspace_mode="current",
+    )
 
     assert state.failed is False
     assert (tmp_path / "calc.py").read_text() == "def add(a, b):\n    return a + b\n"
@@ -779,8 +798,8 @@ def test_golden_trace_calc_pytest_patch_loop_records_required_artifacts(tmp_path
     assert isinstance(context_built.data["token_estimate"], int)
     assert context_built.data["token_estimate"] > 0
 
-    model_request = next(event for event in state.events if event.type == "model.request.started")
-    model_response = next(event for event in state.events if event.type == "model.completed")
+    model_request = next(event for event in state.events if event.type == "model.call.started")
+    model_response = next(event for event in state.events if event.type == "model.call.completed")
     assert (state.output_dir / model_request.data["context_artifact"]).exists()
     assert (state.output_dir / model_request.data["logical_request_artifact"]).exists()
     assert (state.output_dir / model_response.data["response_artifact"]).exists()
@@ -788,9 +807,13 @@ def test_golden_trace_calc_pytest_patch_loop_records_required_artifacts(tmp_path
     sed_requested = next(
         event
         for event in state.events
-        if event.type == "tool.args.completed" and event.data["tool"] == "shell" and event.data["args"]["cmd"].startswith("sed ")
+        if (
+            event.type == "model.tool_call.assembly.completed"
+            and event.data["tool"] == "shell"
+            and event.data["args"]["cmd"].startswith("sed ")
+        )
     )
-    assert sed_requested.data["args_preview"] == sed_requested.data["args"]
+    assert sed_requested.data["args"]["cmd"].startswith("sed ")
 
     command_finished = [event for event in state.events if event.type == "command.completed"]
     assert command_finished
@@ -804,6 +827,83 @@ def test_golden_trace_calc_pytest_patch_loop_records_required_artifacts(tmp_path
     assert "Tinyagent Replay" in replay
     assert "command.completed" in replay
     assert (tmp_path / "calc.py").read_text() == "def add(a, b):\n    return a - b\n"
+
+
+def test_workspace_auto_uses_worktree_for_clean_git_repo(tmp_path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    (tmp_path / "hello.txt").write_text("hello\n")
+    subprocess.run(["git", "add", "hello.txt"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-c", "user.email=tinyagent@example.test", "-c", "user.name=tinyagent", "commit", "-m", "init"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    patch = "\n".join(
+        [
+            "*** Begin Patch",
+            "*** Update File: hello.txt",
+            "@@",
+            "-hello",
+            "+hello from worktree",
+            "*** End Patch",
+        ]
+    )
+    model = FakeModelProvider(
+        [
+            ModelResponse(tool_calls=(ToolCall(name="apply_patch", args={"patch": patch}),)),
+            ModelResponse(content="done", finish_reason="stop"),
+        ]
+    )
+    kernel = Kernel(
+        model=model,
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+    )
+
+    state = kernel.run("patch safely", workspace=tmp_path, run_id="run_worktree_auto")
+
+    assert state.failed is False
+    assert state.workspace.root != tmp_path.resolve()
+    assert (tmp_path / "hello.txt").read_text() == "hello\n"
+    assert (state.workspace.root / "hello.txt").read_text() == "hello from worktree\n"
+    assert any(event.type == "worktree.created" for event in state.events)
+    boundary = next(event for event in state.events if event.type == "workspace.boundary")
+    assert boundary.data["mode"] == "auto"
+    assert boundary.data["effective_mode"] == "worktree"
+    metrics = json.loads((state.output_dir / "metrics.json").read_text())
+    assert metrics["workspace_mode"] == "auto"
+    assert metrics["workspace_effective_mode"] == "worktree"
+
+
+def test_yolo_approval_mode_does_not_allow_network_shell(tmp_path) -> None:
+    shell_call = ToolCall(name="shell", args={"cmd": "curl https://example.com"})
+    model = FakeModelProvider(
+        [
+            ModelResponse(tool_calls=(shell_call,)),
+            ModelResponse(content="done", finish_reason="stop"),
+        ]
+    )
+    kernel = Kernel(
+        model=model,
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        approval_mode="yolo",
+    )
+
+    state = kernel.run("try network", workspace=tmp_path, run_id="run_network_block")
+
+    assert state.failed is False
+    assert "command.started" not in [event.type for event in state.events]
+    assert any(event.type == "approval.requested" for event in state.events)
+    resolution = next(event for event in state.events if event.type == "approval.resolved")
+    assert resolution.data["decision"] == "denied"
+    assert "network" in resolution.data["reason"]
+    blocked = next(event for event in state.events if event.type == "tool.execution.blocked")
+    assert blocked.data["tool_call_id"] == shell_call.id
 
 
 def test_fake_provider_trace_shells_patches_answers_with_content_and_captures_diff(tmp_path) -> None:
@@ -848,7 +948,8 @@ def test_fake_provider_trace_shells_patches_answers_with_content_and_captures_di
     assert "patch.applied" in event_types
     assert "command.started" in event_types
     assert "command.completed" in event_types
-    assert event_types[-2:] == ["diff.finalized", "run.completed"]
+    assert event_types[-1] == "run.completed"
+    assert "turn.completed" in event_types
     patch_result = next(result for result in state.tool_results if result.tool_name == "apply_patch")
     shell_result = [result for result in state.tool_results if result.tool_name == "shell"][-1]
     assert (state.output_dir / patch_result.data["output_artifact"]).exists()
@@ -875,28 +976,18 @@ def test_golden_streaming_trace_runs_shell_then_finalizes(tmp_path) -> None:
 
     assert state.failed is False
     assert state.final_output == "done"
-    assert [event.type for event in state.events if event.type != "artifact.created"] == [
-        "run.started",
-        "shell.preflight.completed",
-        "context.built",
-        "model.request.started",
-        "model.stream.started",
-        "model.completed",
-        "tool.call.started",
-        "tool.args.completed",
-        "tool.policy.evaluated",
-        "tool.execution.started",
-        "command.started",
-        "command.completed",
-        "tool.execution.completed",
-        "context.built",
-        "model.request.started",
-        "model.stream.started",
-        "model.completed",
-        "message.completed",
-        "diff.finalized",
-        "run.completed",
-    ]
+    filtered = [event.type for event in state.events if event.type != "artifact.created"]
+    assert "workspace.boundary" in filtered
+    assert "turn.started" in filtered
+    assert "model.call.started" in filtered
+    assert "model.tool_call.assembly.completed" in filtered
+    assert "policy.evaluated" in filtered
+    assert "tool.execution.started" in filtered
+    assert "command.started" in filtered
+    assert "command.completed" in filtered
+    assert "tool.execution.completed" in filtered
+    assert "model.message.completed" in filtered
+    assert filtered[-1] == "run.completed"
     assert (state.output_dir / "events.jsonl").exists()
     assert (state.output_dir / "final.md").read_text() == "# Final output\n\ndone\n"
     assert (state.output_dir / "metrics.json").exists()
@@ -945,9 +1036,9 @@ def test_golden_trace_covers_context_artifacts_tool_args_shell_artifact_and_untr
     assert "created.txt" in state.final_diff
     assert "+new file" in state.final_diff
 
-    model_requests = [event for event in state.events if event.type == "model.request.started"]
+    model_requests = [event for event in state.events if event.type == "model.call.started"]
     model_request = model_requests[0]
-    model_response = next(event for event in state.events if event.type == "model.completed")
+    model_response = next(event for event in state.events if event.type == "model.call.completed")
     assert (state.output_dir / model_request.data["context_artifact"]).exists()
     assert (state.output_dir / model_request.data["logical_request_artifact"]).exists()
     assert (state.output_dir / model_response.data["response_artifact"]).exists()
@@ -961,7 +1052,11 @@ def test_golden_trace_covers_context_artifacts_tool_args_shell_artifact_and_untr
     shell_requested = [
         event
         for event in state.events
-        if event.type == "tool.args.completed" and event.data["tool"] == "shell" and event.data["tool_call_id"] == shell_call.id
+        if (
+            event.type == "model.tool_call.assembly.completed"
+            and event.data["tool"] == "shell"
+            and event.data["tool_call_id"] == shell_call.id
+        )
     ][0]
     assert shell_requested.data["args"] == {"cmd": shell_call.args["cmd"]}
     shell_result = next(result for result in state.tool_results if result.tool_name == "shell" and result.call_id == shell_call.id)

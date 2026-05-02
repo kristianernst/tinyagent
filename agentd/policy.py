@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from agentd.contracts import PolicyEngine
-from agentd.state import PolicyDecision, RunState, ToolCall
+from agentd.state import ApprovalRequest, PolicyDecision, RunState, ToolCall
 from agentd.tools import patch_paths, resolve_workspace_path
 
 
@@ -30,7 +31,7 @@ class LocalPolicy:
                 case "apply_patch":
                     return self._evaluate_patch(call, state)
                 case "shell":
-                    return self._evaluate_shell(call)
+                    return self._evaluate_shell(call, state)
         except Exception as exc:
             return PolicyDecision.deny(str(exc))
         return PolicyDecision.deny(f"Unknown tool for policy: {call.name}")
@@ -42,9 +43,14 @@ class LocalPolicy:
             return PolicyDecision.deny("Patch did not declare any file paths.")
         for path in paths:
             resolve_workspace_path(state, path, allow_run_artifacts=self.allow_run_artifacts)
+        if _dirty_current_workspace(state):
+            return PolicyDecision.needs_approval(
+                "patch would mutate a dirty current workspace",
+                _approval_request(call, state, action_kind="dirty_mutation", risk="medium"),
+            )
         return PolicyDecision.allow("patch paths are inside workspace")
 
-    def _evaluate_shell(self, call: ToolCall) -> PolicyDecision:
+    def _evaluate_shell(self, call: ToolCall, state: RunState) -> PolicyDecision:
         cmd = str(call.args.get("cmd", ""))
         if not cmd:
             return PolicyDecision.deny("Shell command is required.")
@@ -52,6 +58,24 @@ class LocalPolicy:
         for pattern, reason in RISKY_SHELL_PATTERNS:
             if re.search(pattern, lower):
                 return PolicyDecision.deny(reason)
+        redirect_escape = _outside_redirect_target(cmd, state)
+        if redirect_escape:
+            return PolicyDecision.needs_approval(
+                f"shell redirects outside workspace envelope: {redirect_escape}",
+                _approval_request(
+                    call,
+                    state,
+                    action_kind="workspace_escape",
+                    risk="high",
+                    args_preview=cmd,
+                    command=cmd,
+                ),
+            )
+        if _NETWORK_SHELL_PATTERN.search(lower):
+            return PolicyDecision.needs_approval(
+                "network-looking shell command requires approval",
+                _approval_request(call, state, action_kind="network", risk="high", args_preview=cmd, command=cmd),
+            )
         return PolicyDecision.allow("shell command passed local denylist")
 
 
@@ -64,6 +88,58 @@ RISKY_SHELL_PATTERNS = (
     (r"\bshutdown\b|\breboot\b", "machine power commands are denied by default."),
     (r":\(\)\s*\{\s*:\|:", "fork-bomb-like shell functions are denied by default."),
 )
+
+_NETWORK_SHELL_PATTERN = re.compile(r"\b(curl|wget|ssh|scp|sftp|rsync|nc|ncat|telnet)\b")
+_REDIRECT_PATTERN = re.compile(r"(?:^|[\s;&|])(?:>|>>|<)\s*(?P<path>[^()\s;&|]+)")
+
+
+def _dirty_current_workspace(state: RunState) -> bool:
+    envelope = state.workspace_envelope
+    if envelope is None or envelope.effective_mode != "current":
+        return False
+    dirty = envelope.dirty_state_before
+    return dirty.is_git_repo and not dirty.clean
+
+
+def _outside_redirect_target(cmd: str, state: RunState) -> str:
+    for match in _REDIRECT_PATTERN.finditer(cmd):
+        raw = match.group("path").strip("'\"")
+        if not raw or raw.startswith("&"):
+            continue
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            continue
+        envelope = state.workspace_envelope
+        if envelope is not None:
+            if not envelope.contains(path):
+                return raw
+        elif not state.workspace.contains(path):
+            return raw
+    return ""
+
+
+def _approval_request(
+    call: ToolCall,
+    state: RunState,
+    *,
+    action_kind: str,
+    risk: str,
+    args_preview: str | None = None,
+    command: str | None = None,
+) -> ApprovalRequest:
+    preview = args_preview if args_preview is not None else str(call.args)
+    return ApprovalRequest(
+        approval_id=f"approval_{call.id}",
+        run_id=state.run_id,
+        turn_id=state.current_turn_id,
+        step_id=state.current_step_id,
+        action_kind=action_kind,  # type: ignore[arg-type]
+        tool_name=call.name,
+        cwd=str(state.workspace.root),
+        args_preview=preview[:1000],
+        command=command,
+        risk=risk,  # type: ignore[arg-type]
+    )
 
 
 def default_policy() -> PolicyEngine:
