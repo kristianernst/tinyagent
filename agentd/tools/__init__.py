@@ -3,29 +3,11 @@
 from __future__ import annotations
 
 from agentd.contracts import Tool
-from agentd.tools.builtins.patch import ApplyPatchTool, apply_openai_patch, patch_paths
-from agentd.tools.builtins.shell import ShellTool, shell_preflight
-from agentd.tools.core import (
-    SAFE_ENV_KEYS,
-    ToolError,
-    combined_output,
-    error_result,
-    is_relative_to,
-    relative_workspace_path,
-    resolve_workspace_path,
-    safe_artifact_name,
-    tool_env,
-    visible_output,
-    write_tool_output_artifact,
-)
-from agentd.tools.repo import (
-    EXCLUDED_SEARCH_DIRS,
-    MAX_READ_FILE_BYTES,
-    ListFilesTool,
-    ReadFileTool,
-    SearchRepoTool,
-    repo_inspect_tools,
-)
+from agentd.tools.builtins.patch import ApplyPatchTool, patch_paths
+from agentd.tools.builtins.shell import ShellTool
+from agentd.tools.core import resolve_workspace_path
+from agentd.tools.repo import ListFilesTool, ReadFileTool, SearchRepoTool
+from agentd.tools.repo import repo_inspect_tools as _repo_inspect_tools
 
 
 def builtin_tools() -> list[Tool]:
@@ -33,7 +15,7 @@ def builtin_tools() -> list[Tool]:
 
 
 def all_tools() -> list[Tool]:
-    return [*builtin_tools(), *repo_inspect_tools()]
+    return [*builtin_tools(), *_repo_inspect_tools()]
 
 
 def default_tools() -> list[Tool]:
@@ -41,29 +23,14 @@ def default_tools() -> list[Tool]:
 
 
 __all__ = [
-    "EXCLUDED_SEARCH_DIRS",
-    "MAX_READ_FILE_BYTES",
-    "SAFE_ENV_KEYS",
     "ApplyPatchTool",
     "ListFilesTool",
     "ReadFileTool",
     "SearchRepoTool",
     "ShellTool",
-    "ToolError",
     "all_tools",
-    "apply_openai_patch",
     "builtin_tools",
-    "combined_output",
     "default_tools",
-    "error_result",
-    "is_relative_to",
     "patch_paths",
-    "relative_workspace_path",
-    "repo_inspect_tools",
     "resolve_workspace_path",
-    "safe_artifact_name",
-    "shell_preflight",
-    "tool_env",
-    "visible_output",
-    "write_tool_output_artifact",
 ]

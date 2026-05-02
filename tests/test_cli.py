@@ -80,6 +80,51 @@ def test_agentctl_run_fake_streams_text(tmp_path, capsys) -> None:
     assert captured.out.count("Fake run finished after reading hello.txt.") == 1
 
 
+def test_agentctl_run_jsonl_stream_respects_debug_level(tmp_path, capsys) -> None:
+    exit_code = main(
+        [
+            "run",
+            "answer",
+            "--provider",
+            "fake",
+            "--workspace",
+            str(tmp_path),
+            "--run-id",
+            "run_jsonl_debug",
+            "--stream",
+            "jsonl",
+            "--debug",
+            "0",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert '"type": "run.started"' in captured.out
+    assert '"type": "model.text.delta"' in captured.out
+    assert '"type": "artifact.created"' not in captured.out
+    assert '"type": "model.completed"' not in captured.out
+
+
+def test_agentctl_run_rejects_invalid_debug_level(tmp_path, capsys) -> None:
+    exit_code = main(
+        [
+            "run",
+            "answer",
+            "--provider",
+            "fake",
+            "--workspace",
+            str(tmp_path),
+            "--debug",
+            "-1",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 2
+    assert captured.out == "debug error: --debug must be non-negative.\n"
+
+
 def test_agentctl_run_openai_compatible_missing_env_fails_cleanly(tmp_path, capsys, monkeypatch) -> None:
     monkeypatch.delenv("TINYAGENT_MODEL_API_KEY", raising=False)
     monkeypatch.delenv("TINYAGENT_MODEL_NAME", raising=False)

@@ -3,14 +3,27 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
+from io import StringIO
 from pathlib import Path
 
 import pytest
 
 from agentd.contracts import Tool
-from agentd.events import DURABLE_EVENT_TYPES, EVENT_TYPES, LIVE_ONLY_EVENT_TYPES, Event, MemoryEventSink, load_events_jsonl
+from agentd.events import (
+    DURABLE_EVENT_TYPES,
+    EVENT_DEBUG_LEVELS,
+    EVENT_TYPES,
+    LIVE_ONLY_EVENT_TYPES,
+    Event,
+    JsonlStreamSink,
+    MemoryEventSink,
+    debug_level_from_env,
+    event_debug_level,
+    load_events_jsonl,
+)
 from agentd.kernel import Kernel
 from agentd.model_stream import ModelDelta
+from agentd.replay import render_timeline
 from agentd.state import Message, ModelResponse, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, Workspace
 
 
@@ -187,6 +200,9 @@ def test_kernel_dispatches_model_policy_tool_then_finishes_from_content(tmp_path
     ]
     assert (state.output_dir / "events.jsonl").exists()
     assert (state.output_dir / "final.md").read_text() == "# Final output\n\ndone\n"
+    message = next(event for event in state.events if event.type == "message.completed")
+    assert message.data["output_path"] == "final.md"
+    assert message.artifact_refs == []
     metrics = json.loads((state.output_dir / "metrics.json").read_text())
     assert metrics["status"] == "completed"
     assert metrics["turn_count"] == 2
@@ -529,6 +545,55 @@ def test_streaming_text_is_live_but_final_response_path_is_shared(tmp_path) -> N
     assert response["raw"] == {"streamed": True}
 
 
+def test_streaming_reasoning_visibility_distinguishes_visible_and_private(tmp_path) -> None:
+    sink = MemoryEventSink()
+    model = StreamingModel(
+        [
+            [
+                ModelDelta(kind="reasoning_visible_delta", delta="visible thought"),
+                ModelDelta(kind="reasoning_summary_delta", delta="safe summary"),
+                ModelDelta(
+                    kind="reasoning_summary_delta",
+                    delta="private chain",
+                    data={"provider_field": "reasoning_content", "safe_to_display": False},
+                ),
+                ModelDelta(kind="reasoning_encrypted", delta="opaque"),
+                ModelDelta(kind="text_delta", delta="done"),
+                ModelDelta(kind="completed", data={"finish_reason": "stop"}),
+            ]
+        ]
+    )
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[NoopTool()],
+        policy=AllowAllPolicy(),
+        stream=True,
+        event_sink=sink,
+    )
+
+    state = kernel.run("stream reasoning", workspace=tmp_path)
+
+    assert state.failed is False
+    assert state.final_output == "done"
+    assert not any(event.type.startswith("reasoning.") for event in state.events)
+    visible = next(event for event in sink.events if event.type == "reasoning.visible.delta")
+    safe_summary = [
+        event for event in sink.events if event.type == "reasoning.summary.delta" and event.data.get("delta")
+    ][0]
+    private_summary = [
+        event for event in sink.events if event.type == "reasoning.summary.delta" and not event.data.get("delta")
+    ][0]
+    encrypted = next(event for event in sink.events if event.type == "reasoning.encrypted")
+    assert visible.visibility == "internal"
+    assert visible.data["delta"] == "visible thought"
+    assert safe_summary.visibility == "user"
+    assert safe_summary.data["delta"] == "safe summary"
+    assert private_summary.visibility == "debug"
+    assert private_summary.data == {"chars": 13, "item_id": None, "provider_field": "reasoning_content"}
+    assert encrypted.visibility == "internal"
+
+
 def test_streaming_tool_arguments_are_buffered_before_tool_execution(tmp_path) -> None:
     sink = MemoryEventSink()
     model = StreamingModel(
@@ -539,9 +604,9 @@ def test_streaming_tool_arguments_are_buffered_before_tool_execution(tmp_path) -
                     tool_call_id="call_1",
                     data={"id": "call_1", "index": 0, "name": "noop"},
                 ),
-                ModelDelta(kind="tool_call_args_delta", tool_call_id="call_1", delta="{", data={"index": 0}),
-                ModelDelta(kind="tool_call_args_delta", tool_call_id="call_1", delta="}", data={"index": 0}),
-                ModelDelta(kind="tool_call_completed", tool_call_id="call_1", data={"index": 0}),
+                ModelDelta(kind="tool_call_args_delta", tool_call_id="index_0", delta="{", data={"index": 0}),
+                ModelDelta(kind="tool_call_args_delta", tool_call_id="index_0", delta="}", data={"index": 0}),
+                ModelDelta(kind="tool_call_completed", tool_call_id="index_0", data={"index": 0}),
                 ModelDelta(kind="completed", data={"finish_reason": "tool_calls"}),
             ],
             [
@@ -571,10 +636,50 @@ def test_streaming_tool_arguments_are_buffered_before_tool_execution(tmp_path) -
         "tool.execution.started",
         "tool.execution.completed",
     ]
-    assert [event.data["delta"] for event in sink.events if event.type == "tool.args.delta"] == ["{", "}"]
+    arg_delta_events = [event for event in sink.events if event.type == "tool.args.delta"]
+    assert [event.data["delta"] for event in arg_delta_events] == ["{", "}"]
+    assert [event.data["tool_call_id"] for event in arg_delta_events] == ["call_1", "call_1"]
+    assert [event.data["tool"] for event in arg_delta_events] == ["noop", "noop"]
     tool_requested = next(event for event in state.events if event.type == "tool.args.completed")
     assert tool_requested.data["tool_call_id"] == "call_1"
     assert tool_requested.data["args_preview"] == {}
+
+
+def test_invalid_streamed_tool_arguments_fail_without_tool_execution(tmp_path) -> None:
+    model = StreamingModel(
+        [
+            [
+                ModelDelta(
+                    kind="tool_call_started",
+                    tool_call_id="call_1",
+                    data={"id": "call_1", "index": 0, "name": "noop"},
+                ),
+                ModelDelta(kind="tool_call_args_delta", tool_call_id="call_1", delta="[", data={"index": 0}),
+                ModelDelta(kind="tool_call_args_delta", tool_call_id="call_1", delta="]", data={"index": 0}),
+                ModelDelta(kind="completed", data={"finish_reason": "tool_calls"}),
+            ]
+        ]
+    )
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[NoopTool()],
+        policy=AllowAllPolicy(),
+        stream=True,
+        event_sink=MemoryEventSink(),
+    )
+
+    state = kernel.run("stream invalid tool args", workspace=tmp_path)
+
+    assert state.failed is True
+    assert state.failure_reason == "Model provider error: Tool call arguments for noop must be a JSON object."
+    assert "model.failed" in event_types(state)
+    assert "tool.execution.started" not in event_types(state)
+    assert event_types(state)[-2:] == ["diff.finalized", "run.failed"]
+    assert (state.output_dir / "events.jsonl").exists()
+    assert (state.output_dir / "final.md").exists()
+    assert (state.output_dir / "metrics.json").exists()
+    assert (state.output_dir / "final.diff").exists()
 
 
 def test_empty_model_response_without_tool_calls_fails(tmp_path) -> None:
@@ -664,6 +769,47 @@ def test_live_only_protocol_events_are_not_durable_events() -> None:
     assert event.type == "model.text.delta"
 
 
+def test_all_events_have_explicit_debug_levels() -> None:
+    assert EVENT_TYPES <= EVENT_DEBUG_LEVELS.keys()
+
+
+def test_debug_level_from_env_validates_values() -> None:
+    assert debug_level_from_env({}) == 0
+    assert debug_level_from_env({"TINYAGENT_DEBUG": "3"}) == 3
+
+    with pytest.raises(ValueError, match="integer"):
+        debug_level_from_env({"TINYAGENT_DEBUG": "verbose"})
+
+    with pytest.raises(ValueError, match="non-negative"):
+        debug_level_from_env({"TINYAGENT_DEBUG": "-1"})
+
+
+def test_jsonl_stream_sink_filters_events_by_debug_level() -> None:
+    output = StringIO()
+    sink = JsonlStreamSink(output, debug_level=1)
+    events = [
+        Event(run_id="run_test", type="run.started", data={"task": "debug"}),
+        Event(run_id="run_test", type="reasoning.visible.delta", data={"delta": "thought"}, durability="ephemeral"),
+        Event(run_id="run_test", type="model.completed", data={"provider": "fake"}),
+        Event(run_id="run_test", type="context.built"),
+        Event(run_id="run_test", type="tool.args.delta", data={"delta": "{}"}, durability="ephemeral"),
+        Event(run_id="run_test", type="reasoning.summary.delta", data={"chars": 3}, durability="ephemeral"),
+        Event(run_id="run_test", type="reasoning.encrypted", data={"chars": 8}, durability="ephemeral"),
+    ]
+
+    for event in events:
+        sink.emit(event)
+
+    streamed = [json.loads(line)["type"] for line in output.getvalue().splitlines()]
+    assert streamed == ["run.started", "model.completed", "reasoning.summary.delta"]
+    assert [event_debug_level(event) for event in events] == [0, 4, 1, 2, 2, 1, 4]
+
+    internal_output = StringIO()
+    internal_sink = JsonlStreamSink(internal_output, debug_level=4)
+    internal_sink.emit(events[1])
+    assert json.loads(internal_output.getvalue())["data"]["delta"] == "thought"
+
+
 def test_run_state_emit_uses_one_sequence_for_durable_and_live_events(tmp_path) -> None:
     sink = MemoryEventSink()
     state = RunState.create("emit", Workspace(tmp_path))
@@ -678,6 +824,8 @@ def test_run_state_emit_uses_one_sequence_for_durable_and_live_events(tmp_path) 
     assert [event.seq for event in sink.events] == [1, 2, 3]
     persisted = load_events_jsonl(state.output_dir / "events.jsonl")
     assert [event.seq for event in persisted] == [1, 3]
+    replay_lines = render_timeline(persisted).splitlines()[2:]
+    assert [line.split()[0] for line in replay_lines] == ["0001", "0003"]
 
 
 def test_event_data_is_json_safe_for_common_non_json_types(tmp_path) -> None:

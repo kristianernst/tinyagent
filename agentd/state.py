@@ -182,6 +182,8 @@ class RunState:
         item_id: str | None = None,
         parent_item_id: str | None = None,
     ) -> Event:
+        # Single event boundary: durable events go to events.jsonl and sinks,
+        # ephemeral events go to sinks only, and large payloads go to artifacts.
         event = Event(
             run_id=self.run_id,
             type=event_type,

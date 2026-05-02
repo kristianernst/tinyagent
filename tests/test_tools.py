@@ -11,25 +11,23 @@ import pytest
 
 from agentd.kernel import Kernel
 from agentd.models import FakeModelProvider
-from agentd.output import capture_final_diff
+from agentd.output import MAX_UNTRACKED_DIFF_BYTES, capture_final_diff
 from agentd.policy import LocalPolicy
 from agentd.profiles import ApexCoderProfile
 from agentd.replay import replay_run
 from agentd.state import ModelResponse, RunBudgets, RunState, ToolCall, Workspace
 from agentd.tools import (
-    MAX_READ_FILE_BYTES,
     ApplyPatchTool,
     ListFilesTool,
     ReadFileTool,
     SearchRepoTool,
     ShellTool,
     all_tools,
-    apply_openai_patch,
     builtin_tools,
     default_tools,
-    repo_inspect_tools,
 )
-from agentd.tools.repo import _run_rg_limited
+from agentd.tools.builtins.patch import apply_openai_patch
+from agentd.tools.repo import MAX_READ_FILE_BYTES, _run_rg_limited, repo_inspect_tools
 
 
 def test_list_and_search_exclude_tinyagent_outputs(tmp_path) -> None:
@@ -109,6 +107,33 @@ def test_custom_output_dir_is_excluded_from_list_search_and_final_diff(tmp_path)
     assert searched_output_dir.output == "No matches."
     assert "real.txt" in state.final_diff
     assert "run-output" not in state.final_diff
+
+
+def test_final_diff_skips_untracked_symlink_without_reading_target(tmp_path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    outside = tmp_path.parent / "outside-secret.txt"
+    outside.write_text("outside secret\n")
+    try:
+        os.symlink(outside, tmp_path / "leak")
+    except (AttributeError, OSError) as exc:
+        pytest.skip(f"symlink unavailable: {exc}")
+    state = RunState.create("test", Workspace(tmp_path), run_id="run_symlink")
+
+    capture_final_diff(state)
+
+    assert "outside secret" not in state.final_diff
+    assert "leak" not in state.final_diff
+
+
+def test_final_diff_caps_large_untracked_file_content(tmp_path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    (tmp_path / "large.txt").write_text("secret\n" + ("x" * MAX_UNTRACKED_DIFF_BYTES))
+    state = RunState.create("test", Workspace(tmp_path), run_id="run_large")
+
+    capture_final_diff(state)
+
+    assert "secret" not in state.final_diff
+    assert "Binary files /dev/null and b/large.txt differ" in state.final_diff
 
 
 def test_local_policy_blocks_outside_paths_and_risky_shell(tmp_path) -> None:
@@ -235,7 +260,8 @@ def test_shell_sanitizes_environment_and_persists_full_output(tmp_path, monkeypa
                     f"{sys.executable} -c 'import os; "
                     'print(os.environ.get("OPENAI_API_KEY", "missing")); '
                     'print(os.environ.get("TINYAGENT_MODEL_API_KEY", "missing")); '
-                    'print(os.environ.get("HOME", "missing"))\''
+                    'print(os.environ.get("HOME", "missing")); '
+                    'print(os.environ.get("PYTHONDONTWRITEBYTECODE", "missing"))\''
                 )
             },
         ),
@@ -243,7 +269,7 @@ def test_shell_sanitizes_environment_and_persists_full_output(tmp_path, monkeypa
     )
 
     assert result.ok is True
-    assert result.output.splitlines() == ["missing", "missing", str(state.output_dir / "home")]
+    assert result.output.splitlines() == ["missing", "missing", str(state.output_dir / "home"), "1"]
     assert result.data["cmd"]
     assert result.data["output_chars"] == len(result.output)
     artifact = state.output_dir / result.data["output_artifact"]
@@ -307,6 +333,7 @@ def test_search_repo_rg_uses_sanitized_environment(tmp_path, monkeypatch) -> Non
                 "print(os.environ.get('OPENAI_API_KEY', 'missing'))",
                 "print(os.environ.get('TINYAGENT_MODEL_API_KEY', 'missing'))",
                 "print(os.environ.get('HOME', 'missing'))",
+                "print(os.environ.get('PYTHONDONTWRITEBYTECODE', 'missing'))",
             ]
         )
     )
@@ -319,7 +346,7 @@ def test_search_repo_rg_uses_sanitized_environment(tmp_path, monkeypatch) -> Non
     result = SearchRepoTool().run(ToolCall(name="search_repo", args={"query": "needle"}), state)
 
     assert result.ok is True
-    assert result.output.splitlines() == ["missing", "missing", str(state.output_dir / "home")]
+    assert result.output.splitlines() == ["missing", "missing", str(state.output_dir / "home"), "1"]
 
 
 def test_search_repo_timeout_terminates_rg_before_output(tmp_path) -> None:
@@ -535,6 +562,23 @@ def test_tool_collections_name_builtin_and_repo_groups() -> None:
     assert "finish" not in {tool.name for tool in default_tools()}
 
 
+def test_tools_public_export_surface_stays_small() -> None:
+    import agentd.tools as tools
+
+    assert sorted(tools.__all__) == [
+        "ApplyPatchTool",
+        "ListFilesTool",
+        "ReadFileTool",
+        "SearchRepoTool",
+        "ShellTool",
+        "all_tools",
+        "builtin_tools",
+        "default_tools",
+        "patch_paths",
+        "resolve_workspace_path",
+    ]
+
+
 def test_apex_profile_visible_tools_are_overridable_for_ablations(tmp_path) -> None:
     state = RunState.create("test", Workspace(tmp_path), run_id="run_test")
     tools = {tool.name: tool for tool in default_tools()}
@@ -732,6 +776,55 @@ def test_fake_provider_trace_shells_patches_answers_with_content_and_captures_di
     assert (state.output_dir / shell_result.data["output_artifact"]).read_text() == "hello tinyagent\n"
 
 
+def test_golden_streaming_trace_runs_shell_then_finalizes(tmp_path) -> None:
+    shell_call = ToolCall(name="shell", args={"cmd": "printf 'shell output\\n'"})
+    model = FakeModelProvider(
+        [
+            ModelResponse(tool_calls=(shell_call,), finish_reason="tool_calls"),
+            ModelResponse(content="done", finish_reason="stop"),
+        ]
+    )
+    kernel = Kernel(
+        model=model,
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        stream=True,
+    )
+
+    state = kernel.run("stream shell then answer", workspace=tmp_path, run_id="run_stream_golden")
+
+    assert state.failed is False
+    assert state.final_output == "done"
+    assert [event.type for event in state.events if event.type != "artifact.created"] == [
+        "run.started",
+        "shell.preflight.completed",
+        "context.built",
+        "model.request.started",
+        "model.stream.started",
+        "model.completed",
+        "tool.call.started",
+        "tool.args.completed",
+        "tool.policy.evaluated",
+        "tool.execution.started",
+        "command.started",
+        "command.completed",
+        "tool.execution.completed",
+        "context.built",
+        "model.request.started",
+        "model.stream.started",
+        "model.completed",
+        "message.completed",
+        "diff.finalized",
+        "run.completed",
+    ]
+    assert (state.output_dir / "events.jsonl").exists()
+    assert (state.output_dir / "final.md").read_text() == "# Final output\n\ndone\n"
+    assert (state.output_dir / "metrics.json").exists()
+    shell_result = next(result for result in state.tool_results if result.tool_name == "shell")
+    assert (state.output_dir / shell_result.data["output_artifact"]).read_text() == "shell output\n"
+
+
 def test_golden_trace_covers_context_artifacts_tool_args_shell_artifact_and_untracked_diff(tmp_path) -> None:
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
     (tmp_path / "hello.txt").write_text("hello needle\n")
@@ -802,4 +895,5 @@ def test_golden_trace_covers_context_artifacts_tool_args_shell_artifact_and_untr
 
     metrics = json.loads((state.output_dir / "metrics.json").read_text())
     assert metrics["shell_env"] == "sanitized"
+    assert metrics["shell_process_group"] == "posix"
     assert metrics["sandbox_mode"] == "none"

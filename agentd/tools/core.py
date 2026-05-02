@@ -73,6 +73,7 @@ def tool_env(state: RunState) -> dict[str, str]:
     home = state.output_dir / "home"
     home.mkdir(parents=True, exist_ok=True)
     env["HOME"] = str(home)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
 
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Iterator, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 from agentd.events import utc_now
@@ -142,8 +142,9 @@ def complete_model_call(
 
     state.emit("model.stream.started", {"provider": model.name, "turn": call_index})
     assembler = ModelResponseAssembler(provider=model.name)
+    trace = _StreamTraceState()
     for delta in stream_method(messages, tools, state):
-        _record_model_delta(state, model.name, delta)
+        _record_model_delta(state, model.name, trace.normalize(delta))
         assembler.accept(delta)
     return assembler.response()
 
@@ -208,6 +209,16 @@ def parse_chat_completion_chunk(raw: dict[str, Any]) -> Iterator[ModelDelta]:
         content = delta.get("content")
         if isinstance(content, str) and content:
             yield ModelDelta(kind="text_delta", delta=content, data={"provider_chunk_id": raw.get("id")})
+        reasoning_content = delta.get("reasoning_content")
+        if isinstance(reasoning_content, str) and reasoning_content:
+            yield ModelDelta(
+                kind="reasoning_visible_delta",
+                delta=reasoning_content,
+                data={
+                    "provider_chunk_id": raw.get("id"),
+                    "provider_field": "reasoning_content",
+                },
+            )
         for call in delta.get("tool_calls") or []:
             if isinstance(call, dict):
                 yield from _parse_chat_tool_call_delta(call)
@@ -227,9 +238,19 @@ def _record_model_delta(state: RunState, provider: str, delta: ModelDelta) -> No
                 item_id=delta.item_id,
             )
         case "reasoning_summary_delta":
+            safe_to_display = delta.data.get("safe_to_display", True)
             state.emit(
                 "reasoning.summary.delta",
-                {"delta": delta.delta, "chars": len(delta.delta)},
+                _reasoning_event_data(delta, include_delta=safe_to_display),
+                visibility="user" if safe_to_display else "debug",
+                durability="ephemeral",
+                item_id=delta.item_id,
+            )
+        case "reasoning_visible_delta":
+            state.emit(
+                "reasoning.visible.delta",
+                _reasoning_event_data(delta, include_delta=True),
+                visibility="internal",
                 durability="ephemeral",
                 item_id=delta.item_id,
             )
@@ -258,6 +279,16 @@ def _record_model_delta(state: RunState, provider: str, delta: ModelDelta) -> No
             state.emit("model.usage", {"provider": provider, **delta.data})
         case _:
             return
+
+
+def _reasoning_event_data(delta: ModelDelta, *, include_delta: bool) -> dict[str, Any]:
+    data = {"chars": len(delta.delta), "item_id": delta.item_id}
+    if include_delta:
+        data["delta"] = delta.delta
+    provider_field = delta.data.get("provider_field")
+    if isinstance(provider_field, str) and provider_field:
+        data["provider_field"] = provider_field
+    return data
 
 
 def _parse_chat_tool_call_delta(call: dict[str, Any]) -> Iterator[ModelDelta]:
@@ -303,6 +334,42 @@ def _stream_tool_key(delta: ModelDelta) -> str:
     if delta.tool_call_id:
         return delta.tool_call_id
     return "index:0"
+
+
+class _StreamTraceState:
+    def __init__(self) -> None:
+        self.tool_call_ids: dict[str, str] = {}
+        self.tool_names: dict[str, str] = {}
+
+    def normalize(self, delta: ModelDelta) -> ModelDelta:
+        if not delta.kind.startswith("tool_call_"):
+            return delta
+
+        key = _stream_tool_key(delta)
+        provider_id = _provider_tool_call_id(delta)
+        if provider_id:
+            self.tool_call_ids[key] = provider_id
+        name = delta.data.get("name")
+        if isinstance(name, str) and name:
+            self.tool_names[key] = name
+
+        resolved_id = self.tool_call_ids.get(key, delta.tool_call_id)
+        resolved_name = self.tool_names.get(key)
+        data = dict(delta.data)
+        if resolved_id and not data.get("id"):
+            data["id"] = resolved_id
+        if resolved_name and not data.get("name"):
+            data["name"] = resolved_name
+        return replace(delta, tool_call_id=resolved_id, data=data)
+
+
+def _provider_tool_call_id(delta: ModelDelta) -> str:
+    provider_id = delta.data.get("id")
+    if isinstance(provider_id, str) and provider_id:
+        return provider_id
+    if delta.tool_call_id and not delta.tool_call_id.startswith("index_"):
+        return delta.tool_call_id
+    return ""
 
 
 def _provider_error(message: str):
