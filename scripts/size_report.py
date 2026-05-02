@@ -12,6 +12,7 @@ DEFAULT_PATHS = [
     "agentd/events.py",
     "agentd/model_stream.py",
     "agentd/models.py",
+    "agentd/run_control.py",
     "agentd/providers/openai_compat.py",
     "agentd/context/__init__.py",
     "agentd/context/builder.py",

@@ -40,11 +40,27 @@ def capture_final_diff(state: RunState) -> None:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         state.final_diff = ""
-        _emit_diff_finalized(state, available=False, reason=f"git unavailable: {exc}")
+        state.emit(
+            "diff.finalized",
+            {
+                "available": False,
+                "reason": f"git unavailable: {exc}",
+                "path": "final.diff",
+                "chars": 0,
+            },
+        )
         return
     if result.returncode != 0:
         state.final_diff = ""
-        _emit_diff_finalized(state, available=False, reason="workspace is not a git worktree")
+        state.emit(
+            "diff.finalized",
+            {
+                "available": False,
+                "reason": "workspace is not a git worktree",
+                "path": "final.diff",
+                "chars": 0,
+            },
+        )
         return
 
     try:
@@ -58,15 +74,27 @@ def capture_final_diff(state: RunState) -> None:
         untracked = _untracked_files(state)
     except (OSError, subprocess.TimeoutExpired) as exc:
         state.final_diff = ""
-        _emit_diff_finalized(state, available=False, reason=f"git diff failed: {exc}")
+        state.emit(
+            "diff.finalized",
+            {
+                "available": False,
+                "reason": f"git diff failed: {exc}",
+                "path": "final.diff",
+                "chars": 0,
+            },
+        )
         return
     untracked_diff = "".join(_new_file_diff(root, path) for path in untracked)
     state.final_diff = _join_diff_parts(diff.stdout, untracked_diff) if diff.returncode == 0 else ""
-    _emit_diff_finalized(
-        state,
-        available=diff.returncode == 0,
-        reason="" if diff.returncode == 0 else (diff.stderr.strip() or "git diff failed"),
-        untracked_file_count=len(untracked),
+    state.emit(
+        "diff.finalized",
+        {
+            "available": diff.returncode == 0,
+            "reason": "" if diff.returncode == 0 else (diff.stderr.strip() or "git diff failed"),
+            "path": "final.diff",
+            "chars": len(state.final_diff),
+            "untracked_file_count": len(untracked),
+        },
     )
 
 
@@ -85,24 +113,6 @@ def _git_has_head(root: Path) -> bool:
         check=False,
     )
     return result.returncode == 0
-
-
-def _emit_diff_finalized(
-    state: RunState,
-    *,
-    available: bool,
-    reason: str,
-    untracked_file_count: int | None = None,
-) -> None:
-    data: dict[str, Any] = {
-        "available": available,
-        "reason": reason,
-        "path": "final.diff",
-        "chars": len(state.final_diff),
-    }
-    if untracked_file_count is not None:
-        data["untracked_file_count"] = untracked_file_count
-    state.emit("diff.finalized", data)
 
 
 def write_text_artifact(state: RunState, name: str, content: str, *, kind: str) -> str:
@@ -197,8 +207,12 @@ def _final_text(state: RunState) -> str:
 def _metrics(state: RunState) -> dict[str, Any]:
     return {
         "run_id": state.run_id,
-        "status": "failed" if state.failed else "completed",
+        "status": "cancelled" if state.cancelled else "failed" if state.failed else "completed",
         "failure_reason": state.failure_reason,
+        "cancel_reason": state.cancel_reason,
+        "cancel_requested": state.cancelled,
+        "cancel_signal_count": max(state.cancel_signal_count, state.cancel_token.signal_count),
+        "cancel_escalated": state.cancel_escalated,
         "final_output_chars": len(state.final_output),
         "final_output_path": "final.md",
         "task": state.task,
@@ -240,17 +254,19 @@ def _new_file_diff(root: Path, relative_path: str) -> str:
     path = root / relative_path
     if path.is_symlink():
         return ""
-    header = f"diff --git a/{relative_path} b/{relative_path}\nnew file mode 100644\nindex 0000000..0000000\n"
-    binary_diff = f"{header}Binary files /dev/null and b/{relative_path} differ\n"
     try:
         file_size = path.stat().st_size
-        if file_size > MAX_UNTRACKED_DIFF_BYTES:
-            return binary_diff
+    except OSError:
+        return ""
+    header = f"diff --git a/{relative_path} b/{relative_path}\nnew file mode 100644\nindex 0000000..0000000\n"
+    if file_size > MAX_UNTRACKED_DIFF_BYTES:
+        return f"{header}Binary files /dev/null and b/{relative_path} differ\n"
+    try:
         raw = path.read_bytes()
     except OSError:
         return ""
     if b"\0" in raw:
-        return binary_diff
+        return f"{header}Binary files /dev/null and b/{relative_path} differ\n"
     text = raw.decode(errors="replace")
     lines = text.splitlines()
     body_lines = difflib.unified_diff([], lines, fromfile="/dev/null", tofile=f"b/{relative_path}", lineterm="")

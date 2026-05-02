@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 import re
+import signal
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from agentd import __version__
@@ -16,6 +19,7 @@ from agentd.policy import default_policy
 from agentd.profiles import ApexCoderProfile
 from agentd.providers.openai_compat import OpenAICompatibleProvider
 from agentd.replay import replay_run
+from agentd.run_control import CancelToken, RunCancelled
 from agentd.run_record import load_run_record, render_run_inspection
 from agentd.state import ModelResponse, ToolCall
 from agentd.tools import default_tools
@@ -99,14 +103,31 @@ def main(argv: list[str] | None = None) -> int:
             stream=args.stream != "off",
             event_sink=_stream_sink(args.stream, debug_level),
         )
-        state = kernel.run(args.task, workspace=args.workspace, run_id=args.run_id, output_dir=args.output_dir)
+        cancel_token = CancelToken()
+        try:
+            with _sigint_cancel(cancel_token):
+                state = kernel.run(
+                    args.task,
+                    workspace=args.workspace,
+                    run_id=args.run_id,
+                    output_dir=args.output_dir,
+                    cancel_token=cancel_token,
+                )
+        except RunCancelled:
+            print("run cancelled: sigint")
+            return 130
         if args.stream == "jsonl":
+            if state.cancelled:
+                return 130
             return 1 if state.failed else 0
         if args.stream == "text" and state.final_output:
             print()
         print(f"run_id: {state.run_id}")
         print(f"output_dir: {state.output_dir}")
-        print(f"status: {'failed' if state.failed else 'completed'}")
+        print(f"status: {'cancelled' if state.cancelled else 'failed' if state.failed else 'completed'}")
+        if state.cancelled:
+            print(f"cancellation: {state.cancel_reason or 'cancelled'}")
+            return 130
         if state.failed:
             print(f"failure: {state.failure_reason}")
             return 1
@@ -129,17 +150,23 @@ def main(argv: list[str] | None = None) -> int:
             print(f"debug error: {exc}")
             return 2
         output_dir = args.output_dir or default_eval_output_dir(args.suite_path)
+        cancel_token = CancelToken()
         try:
-            eval_run = run_eval_suite(
-                args.suite_path,
-                output_dir=output_dir,
-                model_factory=lambda task: _model_for(args.provider, task),
-                profile=ApexCoderProfile(),
-                tools=default_tools(),
-                policy=default_policy(),
-                stream=args.stream != "off",
-                event_sink=_stream_sink(args.stream, debug_level),
-            )
+            with _sigint_cancel(cancel_token):
+                eval_run = run_eval_suite(
+                    args.suite_path,
+                    output_dir=output_dir,
+                    model_factory=lambda task: _model_for(args.provider, task),
+                    profile=ApexCoderProfile(),
+                    tools=default_tools(),
+                    policy=default_policy(),
+                    stream=args.stream != "off",
+                    event_sink=_stream_sink(args.stream, debug_level),
+                    cancel_token=cancel_token,
+                )
+        except RunCancelled:
+            print("eval cancelled: sigint")
+            return 130
         except (OSError, ValueError, ProviderError) as exc:
             print(f"eval error: {exc}")
             return 1
@@ -173,6 +200,23 @@ def _stream_sink(mode: str, debug_level: int):
     if mode == "jsonl":
         return JsonlStreamSink(sys.stdout, debug_level=debug_level)
     return None
+
+
+@contextmanager
+def _sigint_cancel(token: CancelToken) -> Iterator[None]:
+    previous = signal.getsignal(signal.SIGINT)
+
+    def handle_sigint(signum, frame):
+        del signum, frame
+        already_cancelled = token.cancelled
+        token.signal_count += 1
+        token.cancel("sigint", escalate=already_cancelled)
+
+    signal.signal(signal.SIGINT, handle_sigint)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
 
 
 def _fake_responses(task: str) -> list[ModelResponse]:

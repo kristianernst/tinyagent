@@ -14,6 +14,7 @@ from typing import Any
 from agentd.contracts import ModelProvider, PolicyEngine, Profile, Tool
 from agentd.events import EventSink
 from agentd.kernel import Kernel
+from agentd.run_control import CancelToken
 from agentd.run_record import RunRecord, load_run_record
 
 ModelFactory = Callable[[str], ModelProvider]
@@ -68,6 +69,7 @@ def run_eval_suite(
     policy: PolicyEngine,
     stream: bool = False,
     event_sink: EventSink | None = None,
+    cancel_token: CancelToken | None = None,
 ) -> EvalRun:
     suite_path = suite_path.expanduser().resolve()
     output_dir = output_dir.expanduser().resolve()
@@ -78,8 +80,11 @@ def run_eval_suite(
     for path in (workspaces_dir, runs_dir, validation_dir):
         path.mkdir(parents=True, exist_ok=True)
 
-    results = [
-        _run_case(
+    results: list[EvalResult] = []
+    for case in load_eval_cases(suite_path):
+        if cancel_token is not None and cancel_token.cancelled:
+            break
+        result = _run_case(
             case,
             suite_path=suite_path,
             workspace_dir=workspaces_dir / case.id,
@@ -91,9 +96,11 @@ def run_eval_suite(
             policy=policy,
             stream=stream,
             event_sink=event_sink,
+            cancel_token=cancel_token,
         )
-        for case in load_eval_cases(suite_path)
-    ]
+        results.append(result)
+        if result.status == "cancelled":
+            break
     _write_results(output_dir, suite_path=suite_path, results=results)
     return EvalRun(suite_path=suite_path, output_dir=output_dir, results=results)
 
@@ -169,6 +176,7 @@ def _run_case(
     policy: PolicyEngine,
     stream: bool,
     event_sink: EventSink | None,
+    cancel_token: CancelToken | None,
 ) -> EvalResult:
     case_dir = suite_path / case.id
     _prepare_workspace(case_dir, workspace_dir, setup_git=case.setup_git)
@@ -180,14 +188,16 @@ def _run_case(
         stream=stream,
         event_sink=event_sink,
     )
-    kernel.run(case.task, workspace=workspace_dir, run_id=case.id, output_dir=run_dir)
+    kernel.run(case.task, workspace=workspace_dir, run_id=case.id, output_dir=run_dir, cancel_token=cancel_token)
     record = load_run_record(run_dir)
     validation_exit_code = None
     validation_ok = True
     validation_output_path = ""
-    if case.validation_command:
+    if case.validation_command and record.status == "completed":
         validation_exit_code, validation_output_path = _run_validation(case, workspace_dir, validation_dir)
         validation_ok = validation_exit_code == 0
+    elif case.validation_command:
+        validation_ok = False
     success = record.status == "completed" and validation_ok
     return _result_from_record(
         case,

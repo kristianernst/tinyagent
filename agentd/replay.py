@@ -37,6 +37,10 @@ def _event_detail(event: Event) -> str:
             return f"turns={data.get('turn_count')} tools={data.get('tool_call_count')}"
         case "run.failed":
             return str(data.get("reason", ""))
+        case "run.cancel.requested":
+            return f"{data.get('reason', '')} current={data.get('current_step_kind') or ''}:{data.get('current_step_id') or ''}".strip()
+        case "run.cancelled":
+            return f"{data.get('reason', '')} turns={data.get('turn_count')} tools={data.get('tool_call_count')}".strip()
         case "message.completed":
             return f"{data.get('role', 'assistant')} {data.get('content_chars')} chars {data.get('output_path', '')}".strip()
         case "model.request.started":
@@ -60,14 +64,25 @@ def _event_detail(event: Event) -> str:
             )
         case "model.failed":
             return f"provider={data.get('provider')} {data.get('reason', '')}"
+        case "model.cancelled":
+            return f"provider={data.get('provider')} turn={data.get('turn')} {data.get('reason', '')}".strip()
         case "model.usage":
             total = data.get("total_tokens")
             return f"provider={data.get('provider')} total_tokens={total}" if total is not None else f"provider={data.get('provider')}"
-        case "tool.call.started" | "tool.args.completed" | "tool.execution.started" | "tool.execution.completed" | "tool.execution.failed":
+        case (
+            "tool.call.started"
+            | "tool.args.completed"
+            | "tool.execution.started"
+            | "tool.execution.completed"
+            | "tool.execution.failed"
+            | "tool.execution.cancelled"
+        ):
             artifact = ""
             if isinstance(data.get("data"), dict):
                 artifact = str(data["data"].get("output_artifact") or "")
             return f"{data.get('tool')} {data.get('tool_call_id')} {artifact}".strip()
+        case "command.cancelled":
+            return f"{data.get('cmd')} returncode={data.get('returncode')} {data.get('output_artifact') or ''}".strip()
         case "tool.policy.evaluated":
             return f"{data.get('tool')} allowed={data.get('allowed')} {data.get('reason', '')}"
         case "diff.finalized":

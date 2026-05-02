@@ -5,6 +5,7 @@ import os
 import shlex
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -15,7 +16,8 @@ from agentd.output import MAX_UNTRACKED_DIFF_BYTES, capture_final_diff
 from agentd.policy import LocalPolicy
 from agentd.profiles import ApexCoderProfile
 from agentd.replay import replay_run
-from agentd.state import ModelResponse, RunBudgets, RunState, ToolCall, Workspace
+from agentd.run_control import CancelToken
+from agentd.state import ModelResponse, RunBudgets, RunState, ToolCall, ToolResult, Workspace
 from agentd.tools import (
     ApplyPatchTool,
     ListFilesTool,
@@ -209,6 +211,80 @@ def test_local_policy_blocks_patch_symlink_escape(tmp_path) -> None:
     assert "outside workspace" in decision.reason
 
 
+def test_shell_cancel_kills_command_and_records_cancelled(tmp_path) -> None:
+    state = RunState.create("cancel shell", Workspace(tmp_path), run_id="run_cancel_shell")
+    call = ToolCall(
+        name="shell",
+        args={"cmd": f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(20)'", "timeout_seconds": 20},
+    )
+    result_box: dict[str, object] = {}
+
+    def run_shell() -> None:
+        result_box["result"] = ShellTool().run(call, state)
+
+    thread = threading.Thread(target=run_shell)
+    thread.start()
+    time.sleep(0.2)
+    state.request_cancel("test cancellation")
+    thread.join(timeout=5)
+
+    assert thread.is_alive() is False
+    result = result_box["result"]
+    assert isinstance(result, ToolResult)
+    assert result.ok is False
+    assert result.data["cancelled"] is True
+    assert [event.type for event in state.events if event.type in {"run.cancel.requested", "command.cancelled"}] == [
+        "run.cancel.requested",
+        "command.cancelled",
+    ]
+    assert not any(
+        event.type == "command.completed" and event.data.get("tool_call_id") == call.id for event in state.events
+    )
+    command = next(event for event in state.events if event.type == "command.cancelled")
+    assert command.data["cmd"] == call.args["cmd"]
+    assert command.data["output_artifact"].startswith("artifacts/command-output-")
+
+
+def test_kernel_shell_cancel_records_only_cancelled_tool_and_command_events(tmp_path) -> None:
+    call = ToolCall(
+        name="shell",
+        args={"cmd": f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(20)'", "timeout_seconds": 20},
+    )
+    token = CancelToken()
+    kernel = Kernel(
+        model=FakeModelProvider([ModelResponse(tool_calls=(call,))]),
+        profile=ApexCoderProfile(),
+        tools=[ShellTool()],
+        policy=LocalPolicy(),
+    )
+    state_box: dict[str, RunState] = {}
+
+    def run_kernel() -> None:
+        state_box["state"] = kernel.run("run a cancellable shell command", workspace=tmp_path, cancel_token=token)
+
+    thread = threading.Thread(target=run_kernel)
+    thread.start()
+    time.sleep(0.2)
+    token.cancel("test cancellation")
+    thread.join(timeout=5)
+
+    assert thread.is_alive() is False
+    state = state_box["state"]
+    assert state.cancelled is True
+    command_events = [
+        event.type
+        for event in state.events
+        if event.data.get("tool_call_id") == call.id and event.type.startswith("command.")
+    ]
+    tool_execution_events = [
+        event.type
+        for event in state.events
+        if event.data.get("tool_call_id") == call.id and event.type.startswith("tool.execution.")
+    ]
+    assert command_events == ["command.started", "command.cancelled"]
+    assert tool_execution_events == ["tool.execution.started", "tool.execution.cancelled"]
+
+
 def test_apply_patch_denies_direct_symlink_paths(tmp_path) -> None:
     target = tmp_path / "target.txt"
     target.write_text("original\n")
@@ -318,7 +394,10 @@ def test_shell_timeout_terminates_process_group_children(tmp_path) -> None:
     assert result.data["timeout"] is True
     assert (tmp_path / "child.started").exists()
     assert not (tmp_path / "child.done").exists()
-    command_finished = next(event for event in state.events if event.type == "command.completed")
+    command_completed_events = [event for event in state.events if event.type == "command.completed"]
+    assert len(command_completed_events) == 1
+    assert "command.cancelled" not in [event.type for event in state.events]
+    command_finished = command_completed_events[0]
     assert command_finished.data["timeout"] is True
     assert command_finished.data["output_artifact"] == result.data["output_artifact"]
 

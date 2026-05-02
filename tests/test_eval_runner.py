@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
+from agentd.contracts import Tool
 from agentd.eval_runner import load_eval_cases, render_eval_report, run_eval_suite
 from agentd.models import FakeModelProvider
 from agentd.policy import default_policy
 from agentd.profiles import ApexCoderProfile
+from agentd.run_control import CancelToken
 from agentd.run_record import load_run_record, render_run_inspection
-from agentd.state import ModelResponse, ToolCall
+from agentd.state import Message, ModelResponse, PolicyDecision, RunState, ToolCall, ToolResult
 from agentd.tools import default_tools
 
 
@@ -64,6 +67,32 @@ def test_eval_suite_runs_cases_and_writes_report(tmp_path) -> None:
     assert "read-file" in (output_dir / "report.md").read_text()
 
 
+def test_eval_suite_stops_after_cancelled_case_and_skips_validation(tmp_path) -> None:
+    suite = _write_cancelling_suite(tmp_path)
+    output_dir = tmp_path / "eval-cancelled"
+    token = CancelToken()
+
+    eval_run = run_eval_suite(
+        suite,
+        output_dir=output_dir,
+        model_factory=lambda _task: FakeModelProvider([ModelResponse(tool_calls=(ToolCall(name="cancel"),))]),
+        profile=AllToolsProfile(),
+        tools=[CancellingTool()],
+        policy=AllowAllPolicy(),
+        cancel_token=token,
+    )
+
+    assert [result.case_id for result in eval_run.results] == ["cancel-first"]
+    result = eval_run.results[0]
+    assert result.status == "cancelled"
+    assert result.success is False
+    assert result.validation_ok is False
+    assert result.validation_exit_code is None
+    assert result.validation_output_path == ""
+    assert not (output_dir / "validation" / "cancel-first.txt").exists()
+    assert not (output_dir / "workspaces" / "run-second").exists()
+
+
 def _write_suite(tmp_path: Path) -> Path:
     suite = tmp_path / "suite"
     case = suite / "read-file"
@@ -83,9 +112,90 @@ def _write_suite(tmp_path: Path) -> Path:
     return suite
 
 
+def _write_cancelling_suite(tmp_path: Path) -> Path:
+    suite = tmp_path / "cancel-suite"
+    first = suite / "cancel-first"
+    first_files = first / "files"
+    first_files.mkdir(parents=True)
+    validation = f"{sys.executable} -c \"from pathlib import Path; Path('validated.txt').write_text('yes')\""
+    (first / "task.json").write_text(
+        json.dumps(
+            {
+                "id": "cancel-first",
+                "task": "cancel",
+                "validation_command": validation,
+                "setup_git": False,
+            }
+        )
+    )
+    second = suite / "run-second"
+    second_files = second / "files"
+    second_files.mkdir(parents=True)
+    (second / "task.json").write_text(
+        json.dumps(
+            {
+                "id": "run-second",
+                "task": "should not run",
+                "setup_git": False,
+            }
+        )
+    )
+    return suite
+
+
 def _fake_eval_responses(task: str) -> list[ModelResponse]:
     assert "hello.txt" in task
     return [
         ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "sed -n '1,120p' hello.txt"}),)),
         ModelResponse(content="done", finish_reason="stop"),
     ]
+
+
+class AllToolsProfile:
+    name = "all-tools"
+
+    def system_prompt(self) -> str:
+        return "test"
+
+    def build_messages(self, state: RunState) -> Sequence[Message]:
+        return [Message(role="user", content=state.task)]
+
+    def visible_tools(self, state: RunState, all_tools: Mapping[str, Tool]) -> Sequence[Tool]:
+        del state
+        return list(all_tools.values())
+
+    def should_continue(self, state: RunState) -> bool:
+        del state
+        return True
+
+    def should_finish(self, state: RunState) -> bool:
+        del state
+        return False
+
+    def should_compact(self, state: RunState) -> bool:
+        del state
+        return False
+
+    def compact(self, state: RunState) -> None:
+        del state
+
+
+class CancellingTool:
+    name = "cancel"
+    schema = {"name": "cancel"}
+
+    def run(self, call: ToolCall, state: RunState) -> ToolResult:
+        state.request_cancel("eval cancellation")
+        return ToolResult(
+            tool_name=self.name,
+            call_id=call.id,
+            output="cancelled",
+            ok=False,
+            data={"cancelled": True, "reason": "eval cancellation"},
+        )
+
+
+class AllowAllPolicy:
+    def evaluate(self, call: ToolCall, state: RunState) -> PolicyDecision:
+        del state
+        return PolicyDecision.allow(f"{call.name} allowed")

@@ -19,6 +19,7 @@ from agentd.output import (
     write_model_response_artifact,
     write_run_outputs,
 )
+from agentd.run_control import CancelToken, RunCancelled
 from agentd.state import Message, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, ToolStep, Workspace
 from agentd.tools.builtins.shell import shell_preflight
 
@@ -58,6 +59,7 @@ class Kernel:
         output_dir: Path | None = None,
         stream: bool | None = None,
         event_sink: EventSink | None = None,
+        cancel_token: CancelToken | None = None,
     ) -> RunState:
         state = RunState.create(
             task,
@@ -66,6 +68,9 @@ class Kernel:
             run_id=run_id,
             output_dir=output_dir,
         )
+        state.status = "running"
+        if cancel_token is not None:
+            state.cancel_token = cancel_token
         use_stream = self.stream if stream is None else stream
         state.stream_sink = event_sink if event_sink is not None else self.event_sink
         state.emit(
@@ -82,7 +87,14 @@ class Kernel:
             state.emit("shell.preflight.completed", state.shell_preflight)
 
         try:
+            state.raise_if_cancelled()
             self._run_loop(state, stream=use_stream)
+        except RunCancelled as exc:
+            state.request_cancel(
+                str(exc) or "cancelled",
+                source="sigint" if state.cancel_token.reason == "sigint" else "harness",
+                escalate=state.cancel_token.escalated,
+            )
         except Exception as exc:  # pragma: no cover - defensive boundary
             state.fail(f"Unhandled exception: {exc}")
         finally:
@@ -95,6 +107,7 @@ class Kernel:
 
     def _run_loop(self, state: RunState, *, stream: bool) -> None:
         while not state.done:
+            state.raise_if_cancelled()
             if self._budget_exhausted(state):
                 return
             if not self.profile.should_continue(state):
@@ -151,6 +164,7 @@ class Kernel:
             )
 
             try:
+                state.set_current_step("model", f"model-{model_call_index:04d}")
                 response = complete_model_call(
                     self.model,
                     messages,
@@ -159,10 +173,24 @@ class Kernel:
                     call_index=model_call_index,
                     stream=stream,
                 )
+            except RunCancelled:
+                state.emit(
+                    "model.cancelled",
+                    {
+                        "provider": self.model.name,
+                        "turn": model_call_index,
+                        "reason": state.cancel_reason or state.cancel_token.reason or "cancelled",
+                    },
+                    visibility="user",
+                )
+                raise
             except Exception as exc:
                 state.emit("model.failed", {"provider": self.model.name, "reason": str(exc), "turn": model_call_index})
                 state.fail(f"Model provider error: {exc}")
                 return
+            finally:
+                if state.current_step_kind == "model":
+                    state.set_current_step(None, None)
             state.turn_count += 1
             response_artifact = write_model_response_artifact(
                 state,
@@ -190,6 +218,7 @@ class Kernel:
                 return
 
             for call in response.tool_calls:
+                state.raise_if_cancelled()
                 if self._tool_budget_exhausted(state):
                     return
                 self._dispatch_tool_call(state, call, visible_tool_names=visible_tool_names)
@@ -201,6 +230,7 @@ class Kernel:
                 return
 
     def _dispatch_tool_call(self, state: RunState, call: ToolCall, *, visible_tool_names: frozenset[str]) -> None:
+        state.raise_if_cancelled()
         args_preview = _small_event_data(call.args)
         state.emit("tool.call.started", {"tool_call_id": call.id, "tool": call.name})
         state.emit(
@@ -270,8 +300,22 @@ class Kernel:
             return
 
         state.emit("tool.execution.started", {"tool_call_id": call.id, "tool": call.name})
+        state.set_current_step("tool", call.id)
         try:
             result = self.executor.run_tool(tool, call, state)
+        except RunCancelled as exc:
+            state.request_cancel(
+                str(exc) or "cancelled",
+                source="sigint" if state.cancel_token.reason == "sigint" else "harness",
+                escalate=state.cancel_token.escalated,
+            )
+            result = ToolResult(
+                tool_name=call.name,
+                call_id=call.id,
+                output=state.cancel_reason or "cancelled",
+                ok=False,
+                data={"cancelled": True, "reason": state.cancel_reason or "cancelled"},
+            )
         except Exception as exc:
             result = ToolResult(
                 tool_name=call.name,
@@ -280,6 +324,9 @@ class Kernel:
                 ok=False,
                 data={"error_type": type(exc).__name__},
             )
+        finally:
+            if state.current_step_id == call.id:
+                state.set_current_step(None, None)
         if not result.call_id:
             result = ToolResult(
                 tool_name=result.tool_name,
@@ -290,8 +337,24 @@ class Kernel:
             )
         self._append_tool_step(state, call, result)
         self._record_tool_result(state, call, result)
+        if result.data.get("cancelled"):
+            state.request_cancel(str(result.data.get("reason") or state.cancel_reason or "cancelled"))
 
     def _record_tool_result(self, state: RunState, call: ToolCall, result: ToolResult) -> None:
+        if result.data.get("cancelled"):
+            state.emit(
+                "tool.execution.cancelled",
+                {
+                    "tool_call_id": call.id,
+                    "tool": call.name,
+                    "reason": result.data.get("reason") or state.cancel_reason or "cancelled",
+                    "output": result.output[: state.budgets.max_command_output_chars_visible],
+                    "output_chars": _output_chars(result),
+                    "data": _small_event_data(result.data),
+                },
+                visibility="user",
+            )
+            return
         output_limit = state.budgets.max_command_output_chars_visible
         output = result.output[:output_limit]
         output_chars = _output_chars(result)
@@ -360,7 +423,7 @@ class Kernel:
         return write_model_http_request_artifact(state, call_index=call_index, payload=payload)
 
     def _finalize_message(self, state: RunState) -> None:
-        if not state.done and not state.failed:
+        if not state.done and not state.failed and not state.cancelled:
             state.finish("Run finished without explicit final output.")
         if not state.final_output:
             return
@@ -377,18 +440,26 @@ class Kernel:
         )
 
     def _finalize_run(self, state: RunState) -> None:
-        event_type = "run.failed" if state.failed else "run.completed"
+        event_type = "run.cancelled" if state.cancelled else "run.failed" if state.failed else "run.completed"
         if any(event.type == event_type for event in state.events):
             return
         data = {
-            "status": "failed" if state.failed else "completed",
+            "status": "cancelled" if state.cancelled else "failed" if state.failed else "completed",
             "turn_count": state.turn_count,
             "tool_call_count": state.tool_call_count,
             "final_output_chars": len(state.final_output),
             "duration_seconds": state.elapsed_seconds(),
         }
+        if state.cancelled:
+            data["reason"] = state.cancel_reason or "cancelled"
+            data["current_step_kind"] = state.current_step_kind
+            data["current_step_id"] = state.current_step_id
+            data["escalated"] = state.cancel_escalated
+            data["signal_count"] = max(state.cancel_signal_count, state.cancel_token.signal_count)
         if state.failed:
             data["reason"] = state.failure_reason or "Unknown failure"
+        if state.cancelled:
+            state.status = "cancelled"
         state.emit(event_type, data)
 
     def _build_context(self, state: RunState, visible_tools: list[Tool]) -> BuiltContext:
