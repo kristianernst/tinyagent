@@ -13,13 +13,17 @@ DEFAULT_PATHS = [
     "agentd/model_stream.py",
     "agentd/models.py",
     "agentd/providers/openai_compat.py",
-    "agentd/context.py",
+    "agentd/context/__init__.py",
+    "agentd/context/builder.py",
+    "agentd/context/checkpoint.py",
+    "agentd/context/instructions.py",
+    "agentd/context/types.py",
     "agentd/output.py",
-    "agentd/tools.py",
-    "agentd/tool_core.py",
-    "agentd/builtins/shell.py",
-    "agentd/builtins/patch.py",
-    "agentd/tools_repo.py",
+    "agentd/tools/__init__.py",
+    "agentd/tools/core.py",
+    "agentd/tools/builtins/shell.py",
+    "agentd/tools/builtins/patch.py",
+    "agentd/tools/repo.py",
 ]
 
 

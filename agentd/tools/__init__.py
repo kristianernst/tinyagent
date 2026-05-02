@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from agentd.builtins.patch import ApplyPatchTool, apply_openai_patch, patch_paths
-from agentd.builtins.shell import ShellTool, shell_preflight
 from agentd.contracts import Tool
-from agentd.tool_core import (
+from agentd.tools.builtins.patch import ApplyPatchTool, apply_openai_patch, patch_paths
+from agentd.tools.builtins.shell import ShellTool, shell_preflight
+from agentd.tools.core import (
     SAFE_ENV_KEYS,
     ToolError,
     combined_output,
@@ -18,7 +18,7 @@ from agentd.tool_core import (
     visible_output,
     write_tool_output_artifact,
 )
-from agentd.tools_repo import (
+from agentd.tools.repo import (
     EXCLUDED_SEARCH_DIRS,
     MAX_READ_FILE_BYTES,
     ListFilesTool,

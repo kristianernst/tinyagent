@@ -1,4 +1,4 @@
-wrote docs/PY_SOURCE_EXPORT.md with 22 Python files
+wrote docs/PY_SOURCE_EXPORT.md with 26 Python files
 _py_markdown.py`.
 
 ## `agentctl/__init__.py`
@@ -148,593 +148,75 @@ __all__ = ["__version__"]
 __version__ = "0.1.0"
 ```
 
-## `agentd/builtins/__init__.py`
+## `agentd/context/__init__.py`
 
 ```python
-"""Builtin tinyagent tools."""
+"""Context construction and deterministic compaction."""
 
-from agentd.builtins.patch import ApplyPatchTool, apply_openai_patch, patch_paths
-from agentd.builtins.shell import ShellTool, shell_preflight
-
-__all__ = ["ApplyPatchTool", "ShellTool", "apply_openai_patch", "patch_paths", "shell_preflight"]
-```
-
-## `agentd/builtins/patch.py`
-
-```python
-"""Builtin OpenAI-style patch tool."""
-
-from __future__ import annotations
-
-import re
-from dataclasses import dataclass
-from pathlib import Path
-
-from agentd.state import RunState, ToolCall, ToolResult
-from agentd.tool_core import (
-    ToolError,
-    error_result,
-    relative_workspace_path,
-    resolve_workspace_path,
-    visible_output,
-    write_tool_output_artifact,
+from agentd.context.builder import (
+    ContextBuilder,
+    estimate_messages_tokens,
+    estimate_tokens,
+    estimate_tools_tokens,
+    message_text,
+    render_context_checkpoint,
+    render_environment_context,
+    render_project_instructions,
+    render_recent_tool_steps,
 )
+from agentd.context.checkpoint import (
+    artifact_refs_from_tool_steps,
+    compact_state,
+    context_state_to_markdown,
+    summarize_context_state,
+)
+from agentd.context.instructions import PROJECT_INSTRUCTION_FILE, load_project_instructions
+from agentd.context.types import ArtifactRef, BuiltContext, ContextConfig, ContextState, ProjectInstructions
 
-
-class ApplyPatchTool:
-    name = "apply_patch"
-    schema = {
-        "name": "apply_patch",
-        "description": "Apply a patch inside the workspace.",
-        "parameters": {
-            "type": "object",
-            "properties": {"patch": {"type": "string"}},
-            "required": ["patch"],
-        },
-    }
-
-    def __init__(self, *, allow_run_artifacts: bool = False) -> None:
-        self.allow_run_artifacts = allow_run_artifacts
-
-    def run(self, call: ToolCall, state: RunState) -> ToolResult:
-        patch = str(call.args.get("patch", ""))
-        if not patch:
-            return ToolResult(tool_name=self.name, call_id=call.id, output="patch is required", ok=False)
-        try:
-            touched = [
-                relative_workspace_path(state, resolve_workspace_path(state, path, allow_run_artifacts=self.allow_run_artifacts))
-                for path in patch_paths(patch)
-            ]
-        except Exception as exc:
-            return error_result(self.name, call, exc)
-        if not touched:
-            return ToolResult(tool_name=self.name, call_id=call.id, output="patch did not declare any file paths", ok=False)
-
-        try:
-            output = apply_openai_patch(state.workspace.root, patch)
-            ok = True
-        except Exception as exc:
-            output = str(exc)
-            ok = False
-        artifact = write_tool_output_artifact(state, call, "patch-output", output, kind="patch_output")
-        state.emit(
-            "patch.applied",
-            {
-                "paths": touched,
-                "ok": ok,
-                "output_chars": len(output),
-            },
-        )
-        return ToolResult(
-            tool_name=self.name,
-            call_id=call.id,
-            output=visible_output(output, state),
-            ok=ok,
-            data={"paths": touched, "output_artifact": artifact, "output_chars": len(output)},
-        )
-
-
-@dataclass(frozen=True)
-class PatchOperation:
-    action: str
-    path: str
-    lines: tuple[str, ...]
-    move_to: str | None = None
-
-
-@dataclass(frozen=True)
-class _PatchSnapshot:
-    existed: bool
-    data: bytes | None = None
-
-
-def apply_openai_patch(root: Path, patch: str) -> str:
-    operations = _parse_openai_patch(patch)
-    _deny_symlink_patch_paths(root, operations)
-    touched_paths = _patch_touched_paths(root, operations)
-    snapshots = _snapshot_patch_paths(touched_paths)
-    existing_dirs = _existing_parent_dirs(root, touched_paths)
-    changed: list[str] = []
-    try:
-        for operation in operations:
-            match operation.action:
-                case "add":
-                    _apply_add(root, operation)
-                    changed.append(f"A {operation.path}")
-                case "delete":
-                    _apply_delete(root, operation)
-                    changed.append(f"D {operation.path}")
-                case "update":
-                    _apply_update(root, operation)
-                    changed.append(f"M {operation.path}" if operation.move_to is None else f"R {operation.path} -> {operation.move_to}")
-                case _:
-                    raise ToolError(f"Unsupported patch operation: {operation.action}")
-    except Exception:
-        _restore_patch_snapshot(snapshots)
-        _prune_new_empty_dirs(root, touched_paths, existing_dirs)
-        raise
-    return "Applied patch.\n" + "\n".join(changed) + ("\n" if changed else "")
-
-
-def _parse_openai_patch(patch: str) -> list[PatchOperation]:
-    lines = patch.splitlines()
-    if not lines or lines[0] != "*** Begin Patch":
-        raise ToolError("patch must start with *** Begin Patch")
-    if lines[-1] != "*** End Patch":
-        raise ToolError("patch must end with *** End Patch")
-
-    operations: list[PatchOperation] = []
-    index = 1
-    while index < len(lines) - 1:
-        line = lines[index]
-        match = re.match(r"^\*\*\* (Add|Delete|Update) File: (.+)$", line)
-        if not match:
-            raise ToolError(f"Expected file operation, got: {line}")
-        operation = match.group(1).lower()
-        path = match.group(2)
-        index += 1
-        move_to: str | None = None
-        if operation == "update" and index < len(lines) - 1:
-            move_match = re.match(r"^\*\*\* Move to: (.+)$", lines[index])
-            if move_match:
-                move_to = move_match.group(1)
-                index += 1
-        body: list[str] = []
-        while index < len(lines) - 1 and not lines[index].startswith("*** "):
-            body.append(lines[index])
-            index += 1
-        operations.append(PatchOperation(action=operation, path=path, lines=tuple(body), move_to=move_to))
-    return operations
-
-
-def _patch_touched_paths(root: Path, operations: list[PatchOperation]) -> list[Path]:
-    paths: list[Path] = []
-    seen: set[Path] = set()
-    for operation in operations:
-        for path in (operation.path, operation.move_to):
-            if path is None:
-                continue
-            resolved = _patch_path(root, path)
-            if resolved not in seen:
-                seen.add(resolved)
-                paths.append(resolved)
-    return paths
-
-
-def _snapshot_patch_paths(paths: list[Path]) -> dict[Path, _PatchSnapshot]:
-    snapshots: dict[Path, _PatchSnapshot] = {}
-    for path in paths:
-        if not path.exists():
-            snapshots[path] = _PatchSnapshot(existed=False)
-            continue
-        if not path.is_file():
-            raise ToolError(f"Patch path is not a regular file: {path}")
-        snapshots[path] = _PatchSnapshot(existed=True, data=path.read_bytes())
-    return snapshots
-
-
-def _restore_patch_snapshot(snapshots: dict[Path, _PatchSnapshot]) -> None:
-    for path, snapshot in snapshots.items():
-        if snapshot.existed:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(snapshot.data or b"")
-        elif path.exists():
-            if path.is_file() or path.is_symlink():
-                path.unlink()
-            else:
-                raise ToolError(f"Cannot roll back non-file patch path: {path}")
-
-
-def _existing_parent_dirs(root: Path, paths: list[Path]) -> set[Path]:
-    root = root.resolve()
-    dirs = set(_parent_dirs(root, paths))
-    return {path for path in dirs if path.exists()}
-
-
-def _prune_new_empty_dirs(root: Path, paths: list[Path], existing_dirs: set[Path]) -> None:
-    for path in sorted(_parent_dirs(root.resolve(), paths), key=lambda item: len(item.parts), reverse=True):
-        if path in existing_dirs:
-            continue
-        try:
-            path.rmdir()
-        except OSError:
-            continue
-
-
-def _parent_dirs(root: Path, paths: list[Path]) -> set[Path]:
-    dirs: set[Path] = set()
-    for path in paths:
-        parent = path.parent.resolve()
-        while parent != root:
-            try:
-                parent.relative_to(root)
-            except ValueError:
-                break
-            dirs.add(parent)
-            parent = parent.parent
-    return dirs
-
-
-def _patch_path(root: Path, path: str) -> Path:
-    root = root.resolve()
-    candidate = Path(path).expanduser()
-    resolved = candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
-    try:
-        resolved.relative_to(root)
-    except ValueError as exc:
-        raise ToolError(f"Path is outside workspace: {path}") from exc
-    return resolved
-
-
-def _raw_patch_path(root: Path, path: str) -> Path:
-    candidate = Path(path).expanduser()
-    return candidate if candidate.is_absolute() else root / candidate
-
-
-def _deny_symlink_patch_paths(root: Path, operations: list[PatchOperation]) -> None:
-    for operation in operations:
-        for path in (operation.path, operation.move_to):
-            if path is not None and _raw_patch_path(root, path).is_symlink():
-                raise ToolError(f"Cannot patch symlink path: {path}")
-
-
-def _apply_add(root: Path, operation: PatchOperation) -> None:
-    path = _patch_path(root, operation.path)
-    if path.exists():
-        raise ToolError(f"Cannot add existing file: {operation.path}")
-    content = []
-    for line in operation.lines:
-        if not line.startswith("+"):
-            raise ToolError(f"Add file lines must start with '+': {operation.path}")
-        content.append(line[1:])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(_join_patch_lines(content, trailing_newline=bool(content)))
-
-
-def _apply_delete(root: Path, operation: PatchOperation) -> None:
-    path = _patch_path(root, operation.path)
-    if not path.exists():
-        raise ToolError(f"Cannot delete missing file: {operation.path}")
-    path.unlink()
-
-
-def _apply_update(root: Path, operation: PatchOperation) -> None:
-    source = _patch_path(root, operation.path)
-    if not source.exists():
-        raise ToolError(f"Cannot update missing file: {operation.path}")
-    original_text = source.read_text(errors="replace")
-    original_lines = original_text.splitlines()
-    updated_lines = _apply_hunks(original_lines, operation.lines)
-    target = _patch_path(root, operation.move_to or operation.path)
-    if operation.move_to is not None and target.exists() and target.resolve() != source.resolve():
-        raise ToolError(f"Cannot move over existing file: {operation.move_to}")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(_join_patch_lines(updated_lines, trailing_newline=original_text.endswith("\n")))
-    if operation.move_to is not None and target.resolve() != source.resolve():
-        source.unlink()
-
-
-def _apply_hunks(original_lines: list[str], patch_lines: tuple[str, ...]) -> list[str]:
-    if not patch_lines:
-        return original_lines
-    output = list(original_lines)
-    cursor = 0
-    for hunk in _split_hunks(patch_lines):
-        old_lines = [line[1:] for line in hunk if line and line[0] in {" ", "-"}]
-        new_lines = [line[1:] for line in hunk if line and line[0] in {" ", "+"}]
-        position = _find_subsequence(output, old_lines, start=cursor)
-        if position is None:
-            raise ToolError("Patch hunk did not match file content.")
-        output[position : position + len(old_lines)] = new_lines
-        cursor = position + len(new_lines)
-    return output
-
-
-def _split_hunks(lines: tuple[str, ...]) -> list[list[str]]:
-    hunks: list[list[str]] = []
-    current: list[str] = []
-    for line in lines:
-        if line.startswith("@@"):
-            if current:
-                hunks.append(current)
-            current = []
-            continue
-        if line.startswith("\\ No newline"):
-            continue
-        if not line or line[0] not in {" ", "-", "+"}:
-            raise ToolError(f"Invalid patch hunk line: {line}")
-        current.append(line)
-    if current:
-        hunks.append(current)
-    return hunks
-
-
-def _find_subsequence(lines: list[str], needle: list[str], *, start: int) -> int | None:
-    if not needle:
-        return start
-    stop = len(lines) - len(needle) + 1
-    for index in range(start, max(stop, start)):
-        if lines[index : index + len(needle)] == needle:
-            return index
-    return None
-
-
-def _join_patch_lines(lines: list[str], *, trailing_newline: bool) -> str:
-    text = "\n".join(lines)
-    if trailing_newline:
-        return text + "\n"
-    return text
-
-
-def patch_paths(patch: str) -> list[str]:
-    paths: list[str] = []
-    for line in patch.splitlines():
-        match = re.match(r"^\*\*\* (?:Update|Add|Delete) File: (.+)$", line)
-        if match:
-            paths.append(match.group(1))
-            continue
-        match = re.match(r"^\*\*\* Move to: (.+)$", line)
-        if match:
-            paths.append(match.group(1))
-    return paths
+__all__ = [
+    "PROJECT_INSTRUCTION_FILE",
+    "ArtifactRef",
+    "BuiltContext",
+    "ContextBuilder",
+    "ContextConfig",
+    "ContextState",
+    "ProjectInstructions",
+    "artifact_refs_from_tool_steps",
+    "compact_state",
+    "context_state_to_markdown",
+    "estimate_messages_tokens",
+    "estimate_tokens",
+    "estimate_tools_tokens",
+    "load_project_instructions",
+    "message_text",
+    "render_context_checkpoint",
+    "render_environment_context",
+    "render_project_instructions",
+    "render_recent_tool_steps",
+    "summarize_context_state",
+]
 ```
 
-## `agentd/builtins/shell.py`
+## `agentd/context/builder.py`
 
 ```python
-"""Builtin shell tool."""
-
-from __future__ import annotations
-
-import os
-import shutil
-import signal
-import subprocess
-from typing import Any
-
-from agentd.state import RunState, ToolCall, ToolResult
-from agentd.tool_core import combined_output, error_result, tool_env, visible_output, write_tool_output_artifact
-
-SHELL_PREFLIGHT_COMMANDS = ("rg", "git", "python3", "python", "sed")
-
-
-class ShellTool:
-    name = "shell"
-    schema = {
-        "name": "shell",
-        "description": "Run a shell command with cwd set to the workspace root.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "cmd": {"type": "string"},
-                "timeout_seconds": {"type": "integer", "minimum": 1},
-            },
-            "required": ["cmd"],
-        },
-    }
-
-    def run(self, call: ToolCall, state: RunState) -> ToolResult:
-        cmd = str(call.args.get("cmd", ""))
-        if not cmd:
-            return ToolResult(tool_name=self.name, call_id=call.id, output="cmd is required", ok=False)
-        try:
-            requested_timeout = int(call.args.get("timeout_seconds", state.budgets.max_shell_timeout_seconds))
-        except ValueError as exc:
-            return error_result(self.name, call, exc)
-        timeout = min(max(requested_timeout, 1), state.budgets.max_shell_timeout_seconds)
-        state.emit(
-            "command.started",
-            {
-                "tool_call_id": call.id,
-                "cmd": cmd,
-                "cwd": str(state.workspace.root),
-                "timeout_seconds": timeout,
-                "env": "sanitized",
-            },
-        )
-        try:
-            process = subprocess.Popen(
-                cmd,
-                cwd=state.workspace.root,
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=tool_env(state),
-                start_new_session=True,
-            )
-        except OSError as exc:
-            return error_result(self.name, call, exc)
-
-        try:
-            stdout, stderr = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            stdout, stderr = _terminate_process_group(process)
-            output = combined_output(stdout, stderr) or f"Command timed out after {timeout}s."
-            artifact = write_tool_output_artifact(state, call, "command-output", output, kind="command_output")
-            state.emit(
-                "command.completed",
-                {
-                    "tool_call_id": call.id,
-                    "cmd": cmd,
-                    "ok": False,
-                    "timeout": True,
-                    "returncode": process.returncode,
-                    "output_artifact": artifact,
-                    "output_chars": len(output),
-                },
-            )
-            return ToolResult(
-                tool_name=self.name,
-                call_id=call.id,
-                output=visible_output(output, state),
-                ok=False,
-                data={
-                    "cmd": cmd,
-                    "timeout": True,
-                    "returncode": process.returncode,
-                    "output_artifact": artifact,
-                    "output_chars": len(output),
-                },
-            )
-
-        output = combined_output(stdout, stderr) or f"Command exited {process.returncode}."
-        artifact = write_tool_output_artifact(state, call, "command-output", output, kind="command_output")
-        state.emit(
-            "command.completed",
-            {
-                "tool_call_id": call.id,
-                "cmd": cmd,
-                "ok": process.returncode == 0,
-                "timeout": False,
-                "returncode": process.returncode,
-                "stdout_chars": len(stdout),
-                "stderr_chars": len(stderr),
-                "output_artifact": artifact,
-                "output_chars": len(output),
-            },
-        )
-        return ToolResult(
-            tool_name=self.name,
-            call_id=call.id,
-            output=visible_output(output, state),
-            ok=process.returncode == 0,
-            data={
-                "cmd": cmd,
-                "returncode": process.returncode,
-                "output_artifact": artifact,
-                "output_chars": len(output),
-            },
-        )
-
-
-def shell_preflight() -> dict[str, Any]:
-    paths = {name: shutil.which(name) for name in SHELL_PREFLIGHT_COMMANDS}
-    return {
-        "commands": {name: path is not None for name, path in paths.items()},
-        "python_available": paths["python3"] is not None or paths["python"] is not None,
-    }
-
-
-def _terminate_process_group(process: subprocess.Popen[str]) -> tuple[str, str]:
-    _signal_process_group(process, signal.SIGTERM)
-    try:
-        stdout, stderr = process.communicate(timeout=1)
-    except subprocess.TimeoutExpired:
-        _signal_process_group(process, signal.SIGKILL)
-        stdout, stderr = process.communicate()
-    return stdout or "", stderr or ""
-
-
-def _signal_process_group(process: subprocess.Popen[str], sig: signal.Signals) -> None:
-    if process.poll() is not None:
-        return
-    try:
-        os.killpg(process.pid, sig)
-    except ProcessLookupError:
-        return
-```
-
-## `agentd/context.py`
-
-```python
-"""Model-visible context construction and local compaction."""
+"""Model-visible context rendering."""
 
 from __future__ import annotations
 
 import json
 import os
-import re
-import subprocess
 from collections.abc import Sequence
-from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
+from agentd.context.checkpoint import artifact_refs_from_tool_steps, is_test_command_text
+from agentd.context.instructions import load_project_instructions
+from agentd.context.types import BuiltContext, ContextConfig, ProjectInstructions
 from agentd.contracts import Tool
 from agentd.events import json_safe
-from agentd.output import write_text_artifact
 from agentd.state import Message, RunState, ToolStep
 
-PROJECT_INSTRUCTION_FILE = "AGENTS.md"
 DEFAULT_SHELL_PREFLIGHT_COMMANDS = ("rg", "git", "python3", "python", "sed")
-
-
-@dataclass(frozen=True)
-class ContextConfig:
-    project_instruction_max_chars: int = 32 * 1024
-    max_recent_tool_tokens: int = 12_000
-    compact_after_tool_steps: int = 16
-    model_context_window: int = 128_000
-    compact_at_tokens: int = 96_000
-    reserve_output_tokens: int = 8_000
-    shell: str | None = None
-
-    @property
-    def effective_compact_at_tokens(self) -> int:
-        return min(self.compact_at_tokens, max(1, self.model_context_window - self.reserve_output_tokens))
-
-
-@dataclass(frozen=True)
-class ArtifactRef:
-    path: str
-    description: str = ""
-
-
-@dataclass
-class ContextState:
-    objective: str = ""
-    constraints: list[str] = field(default_factory=list)
-    files_seen: dict[str, str] = field(default_factory=dict)
-    files_changed: dict[str, str] = field(default_factory=dict)
-    commands_run: list[str] = field(default_factory=list)
-    tests_run: list[str] = field(default_factory=list)
-    known_facts: list[str] = field(default_factory=list)
-    open_issues: list[str] = field(default_factory=list)
-    next_steps: list[str] = field(default_factory=list)
-    artifacts: list[ArtifactRef] = field(default_factory=list)
-    compaction_count: int = 0
-
-
-@dataclass(frozen=True)
-class ProjectInstructions:
-    content: str = ""
-    files: tuple[str, ...] = ()
-    truncated: bool = False
-
-    @property
-    def chars(self) -> int:
-        return len(self.content)
-
-
-@dataclass(frozen=True)
-class BuiltContext:
-    messages: list[Message]
-    token_estimate: int
-    static_context_chars: int
-    tool_context_chars: int
-    project_instruction_chars: int
-    artifacts: list[ArtifactRef] = field(default_factory=list)
 
 
 class ContextBuilder:
@@ -785,37 +267,6 @@ def message_text(message: Message) -> str:
     if isinstance(message.content, str):
         return message.content
     return json.dumps(json_safe(message.content), sort_keys=True)
-
-
-def load_project_instructions(workspace_root: Path, config: ContextConfig | None = None) -> ProjectInstructions:
-    config = config or ContextConfig()
-    paths = _instruction_paths(workspace_root)
-    chunks: list[str] = []
-    files: list[str] = []
-    remaining = max(config.project_instruction_max_chars, 0)
-    truncated = False
-
-    for path in paths:
-        if not path.exists() or not path.is_file():
-            continue
-        try:
-            text = path.read_text(errors="replace")
-        except OSError:
-            continue
-        chunk = f"## {path}\n\n{text.strip()}\n"
-        files.append(str(path))
-        if remaining <= 0:
-            truncated = True
-            continue
-        if len(chunk) > remaining:
-            chunks.append(chunk[:remaining].rstrip())
-            truncated = True
-            remaining = 0
-            continue
-        chunks.append(chunk.rstrip())
-        remaining -= len(chunk)
-
-    return ProjectInstructions(content="\n\n".join(chunks), files=tuple(files), truncated=truncated)
 
 
 def render_environment_context(state: RunState, config: ContextConfig | None = None) -> str:
@@ -880,6 +331,96 @@ def render_recent_tool_steps(state: RunState, config: ContextConfig | None = Non
     for index in selected_indexes:
         sections.append(rendered[index])
     return "\n\n".join(sections)
+
+
+def _tool_steps_since_checkpoint(state: RunState) -> list[ToolStep]:
+    return state.tool_steps[state.context_checkpoint_tool_step_count :]
+
+
+def _select_recent_tool_indexes(steps: Sequence[ToolStep], rendered: Sequence[str], config: ContextConfig) -> list[int]:
+    mandatory = {
+        len(steps) - 1,
+        _latest_index(steps, lambda step: not step.result.ok),
+        _latest_index(steps, _is_diff_or_status_step),
+        _latest_index(steps, lambda step: step.call.name == "apply_patch"),
+        _latest_index(steps, _is_test_step),
+    }
+    selected = {index for index in mandatory if index is not None and index >= 0}
+    token_count = sum(estimate_tokens(rendered[index]) for index in selected)
+    budget = max(config.max_recent_tool_tokens, 0)
+
+    for index in range(len(steps) - 1, -1, -1):
+        if index in selected:
+            continue
+        next_tokens = estimate_tokens(rendered[index])
+        if token_count + next_tokens <= budget:
+            selected.add(index)
+            token_count += next_tokens
+    return sorted(selected)
+
+
+def _latest_index(steps: Sequence[ToolStep], predicate: Any) -> int | None:
+    for index in range(len(steps) - 1, -1, -1):
+        if predicate(steps[index]):
+            return index
+    return None
+
+
+def _render_tool_step(step: ToolStep, state: RunState) -> str:
+    call = step.call
+    result = step.result
+    limit = state.budgets.max_command_output_chars_visible
+    output = result.output[:limit]
+    suffix = "\n[truncated]" if len(result.output) > limit else ""
+    return "\n".join(
+        [
+            f"Tool: {call.name}",
+            f"Call ID: {call.id}",
+            f"Args: {_small_json(call.args)}",
+            f"OK: {result.ok}",
+            f"Data: {_small_json(result.data)}",
+            "Output:",
+            f"{output}{suffix}",
+        ]
+    )
+
+
+def _is_diff_or_status_step(step: ToolStep) -> bool:
+    if step.call.name != "shell":
+        return False
+    cmd = str(step.call.args.get("cmd", "")).lower()
+    return any(pattern in cmd for pattern in ("git status", "git diff", "git show", "git log"))
+
+
+def _is_test_step(step: ToolStep) -> bool:
+    return step.call.name == "shell" and is_test_command_text(str(step.call.args.get("cmd", "")))
+
+
+def _small_json(value: object, *, max_chars: int = 2_000) -> str:
+    encoded = json.dumps(json_safe(value), sort_keys=True)
+    if len(encoded) <= max_chars:
+        return encoded
+    return json.dumps({"_truncated": True, "json_chars": len(encoded), "preview": encoded[:max_chars]}, sort_keys=True)
+
+
+def _tool_dict(tool: Tool) -> dict[str, Any]:
+    return {"name": tool.name, "schema": dict(tool.schema)}
+```
+
+## `agentd/context/checkpoint.py`
+
+```python
+"""Deterministic local context compaction."""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Sequence
+from typing import Any
+
+from agentd.context.types import ArtifactRef, ContextConfig, ContextState
+from agentd.output import write_text_artifact
+from agentd.state import RunState, ToolStep
 
 
 def compact_state(state: RunState, config: ContextConfig | None = None) -> str:
@@ -972,6 +513,153 @@ def artifact_refs_from_tool_steps(steps: Sequence[ToolStep]) -> list[ArtifactRef
     return refs
 
 
+def is_test_command_text(command: str) -> bool:
+    return bool(
+        re.search(
+            r"(^|[;&|]\s*)((uv\s+run\s+)?pytest|python\s+-m\s+pytest|python\s+-m\s+unittest|npm\s+test|pnpm\s+test|yarn\s+test|cargo\s+test|go\s+test)\b",
+            command,
+        )
+    )
+
+
+def _collect_event_context(state: RunState, context_state: ContextState) -> None:
+    commands: list[str] = []
+    tests: list[str] = []
+    for event in state.events:
+        data = event.data
+        if event.type == "file.read":
+            path = str(data.get("path", ""))
+            if path:
+                context_state.files_seen[path] = f"read {data.get('line_count', 0)} line(s)"
+        elif event.type == "search.completed":
+            path = str(data.get("path", "."))
+            query = str(data.get("query", ""))
+            context_state.files_seen[path] = f"searched for {query!r}"
+        elif event.type == "patch.applied":
+            for path in data.get("paths", []):
+                context_state.files_changed[str(path)] = "changed by apply_patch"
+        elif event.type == "command.completed":
+            command = str(data.get("cmd", ""))
+            if not command:
+                continue
+            outcome = _command_outcome(data)
+            commands.append(f"{command} -> {outcome}")
+            if is_test_command_text(command):
+                tests.append(f"{command} -> {outcome}")
+    context_state.commands_run = _dedupe_preserve_order(commands)[-20:]
+    context_state.tests_run = _dedupe_preserve_order(tests)[-10:]
+
+
+def _collect_tool_context(state: RunState, context_state: ContextState) -> None:
+    issues: list[str] = []
+    for step in state.tool_steps:
+        if step.call.name == "apply_patch":
+            for path in step.result.data.get("paths", []):
+                context_state.files_changed[str(path)] = "changed by apply_patch" if step.result.ok else "attempted apply_patch"
+        if not step.result.ok:
+            issues.append(f"{step.call.name} {step.call.id}: {_first_line(step.result.output)}")
+    context_state.open_issues = issues[-8:]
+
+
+def _command_outcome(data: dict[str, Any]) -> str:
+    if data.get("timeout"):
+        return "timed out"
+    if data.get("ok"):
+        return "ok"
+    return f"exit {data.get('returncode')}"
+
+
+def _artifact_description(step: ToolStep) -> str:
+    if step.call.name == "shell":
+        cmd = str(step.call.args.get("cmd", ""))
+        return f"shell output for {cmd[:120]}"
+    if step.call.name == "apply_patch":
+        paths = step.result.data.get("paths", [])
+        return f"apply_patch output for {', '.join(str(path) for path in paths)}"
+    return f"{step.call.name} output"
+
+
+def _first_line(text: str) -> str:
+    line = text.strip().splitlines()[0] if text.strip() else ""
+    return line[:240]
+
+
+def _dedupe_preserve_order(values: Sequence[str]) -> list[str]:
+    output: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        output.append(value)
+    return output
+
+
+def _list_block(values: Sequence[str]) -> str:
+    if not values:
+        return "- None recorded."
+    return "\n".join(f"- {value}" for value in values)
+
+
+def _dict_block(values: dict[str, str]) -> str:
+    if not values:
+        return "- None recorded."
+    return "\n".join(f"- {path}: {description}" for path, description in sorted(values.items()))
+
+
+def _artifact_block(refs: Sequence[ArtifactRef]) -> str:
+    if not refs:
+        return "- None recorded."
+    return "\n".join(f"- {ref.path}: {ref.description}" if ref.description else f"- {ref.path}" for ref in refs)
+```
+
+## `agentd/context/instructions.py`
+
+```python
+"""Project instruction loading for model-visible context."""
+
+from __future__ import annotations
+
+import subprocess
+from collections.abc import Sequence
+from pathlib import Path
+
+from agentd.context.types import ContextConfig, ProjectInstructions
+
+PROJECT_INSTRUCTION_FILE = "AGENTS.md"
+
+
+def load_project_instructions(workspace_root: Path, config: ContextConfig | None = None) -> ProjectInstructions:
+    config = config or ContextConfig()
+    paths = _instruction_paths(workspace_root)
+    chunks: list[str] = []
+    files: list[str] = []
+    remaining = max(config.project_instruction_max_chars, 0)
+    truncated = False
+
+    for path in paths:
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            text = path.read_text(errors="replace")
+        except OSError:
+            continue
+        chunk = f"## {path}\n\n{text.strip()}\n"
+        files.append(str(path))
+        if remaining <= 0:
+            truncated = True
+            continue
+        if len(chunk) > remaining:
+            chunks.append(chunk[:remaining].rstrip())
+            truncated = True
+            remaining = 0
+            continue
+        chunks.append(chunk.rstrip())
+        remaining -= len(chunk)
+
+    return ProjectInstructions(content="\n\n".join(chunks), files=tuple(files), truncated=truncated)
+
+
 def _instruction_paths(workspace_root: Path) -> list[Path]:
     root = workspace_root.expanduser().resolve()
     paths = [Path.home() / ".tinyagent" / PROJECT_INSTRUCTION_FILE]
@@ -1016,180 +704,75 @@ def _dedupe_paths(paths: Sequence[Path]) -> list[Path]:
         seen.add(resolved)
         output.append(resolved)
     return output
+```
+
+## `agentd/context/types.py`
+
+```python
+"""Context state and build result types."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from agentd.state import Message
 
 
-def _tool_steps_since_checkpoint(state: RunState) -> list[ToolStep]:
-    return state.tool_steps[state.context_checkpoint_tool_step_count :]
+@dataclass(frozen=True)
+class ContextConfig:
+    project_instruction_max_chars: int = 32 * 1024
+    max_recent_tool_tokens: int = 12_000
+    compact_after_tool_steps: int = 16
+    model_context_window: int = 128_000
+    compact_at_tokens: int = 96_000
+    reserve_output_tokens: int = 8_000
+    shell: str | None = None
+
+    @property
+    def effective_compact_at_tokens(self) -> int:
+        return min(self.compact_at_tokens, max(1, self.model_context_window - self.reserve_output_tokens))
 
 
-def _select_recent_tool_indexes(steps: Sequence[ToolStep], rendered: Sequence[str], config: ContextConfig) -> list[int]:
-    mandatory = {
-        len(steps) - 1,
-        _latest_index(steps, lambda step: not step.result.ok),
-        _latest_index(steps, _is_diff_or_status_step),
-        _latest_index(steps, lambda step: step.call.name == "apply_patch"),
-        _latest_index(steps, _is_test_step),
-    }
-    selected = {index for index in mandatory if index is not None and index >= 0}
-    token_count = sum(estimate_tokens(rendered[index]) for index in selected)
-    budget = max(config.max_recent_tool_tokens, 0)
-
-    for index in range(len(steps) - 1, -1, -1):
-        if index in selected:
-            continue
-        next_tokens = estimate_tokens(rendered[index])
-        if token_count + next_tokens <= budget:
-            selected.add(index)
-            token_count += next_tokens
-    return sorted(selected)
+@dataclass(frozen=True)
+class ArtifactRef:
+    path: str
+    description: str = ""
 
 
-def _latest_index(steps: Sequence[ToolStep], predicate: Any) -> int | None:
-    for index in range(len(steps) - 1, -1, -1):
-        if predicate(steps[index]):
-            return index
-    return None
+@dataclass
+class ContextState:
+    objective: str = ""
+    constraints: list[str] = field(default_factory=list)
+    files_seen: dict[str, str] = field(default_factory=dict)
+    files_changed: dict[str, str] = field(default_factory=dict)
+    commands_run: list[str] = field(default_factory=list)
+    tests_run: list[str] = field(default_factory=list)
+    known_facts: list[str] = field(default_factory=list)
+    open_issues: list[str] = field(default_factory=list)
+    next_steps: list[str] = field(default_factory=list)
+    artifacts: list[ArtifactRef] = field(default_factory=list)
+    compaction_count: int = 0
 
 
-def _render_tool_step(step: ToolStep, state: RunState) -> str:
-    call = step.call
-    result = step.result
-    limit = state.budgets.max_command_output_chars_visible
-    output = result.output[:limit]
-    suffix = "\n[truncated]" if len(result.output) > limit else ""
-    return "\n".join(
-        [
-            f"Tool: {call.name}",
-            f"Call ID: {call.id}",
-            f"Args: {_small_json(call.args)}",
-            f"OK: {result.ok}",
-            f"Data: {_small_json(result.data)}",
-            "Output:",
-            f"{output}{suffix}",
-        ]
-    )
+@dataclass(frozen=True)
+class ProjectInstructions:
+    content: str = ""
+    files: tuple[str, ...] = ()
+    truncated: bool = False
+
+    @property
+    def chars(self) -> int:
+        return len(self.content)
 
 
-def _collect_event_context(state: RunState, context_state: ContextState) -> None:
-    commands: list[str] = []
-    tests: list[str] = []
-    for event in state.events:
-        data = event.data
-        if event.type == "file.read":
-            path = str(data.get("path", ""))
-            if path:
-                context_state.files_seen[path] = f"read {data.get('line_count', 0)} line(s)"
-        elif event.type == "search.completed":
-            path = str(data.get("path", "."))
-            query = str(data.get("query", ""))
-            context_state.files_seen[path] = f"searched for {query!r}"
-        elif event.type == "patch.applied":
-            for path in data.get("paths", []):
-                context_state.files_changed[str(path)] = "changed by apply_patch"
-        elif event.type == "command.completed":
-            command = str(data.get("cmd", ""))
-            if not command:
-                continue
-            outcome = _command_outcome(data)
-            commands.append(f"{command} -> {outcome}")
-            if _is_test_command_text(command):
-                tests.append(f"{command} -> {outcome}")
-    context_state.commands_run = _dedupe_preserve_order(commands)[-20:]
-    context_state.tests_run = _dedupe_preserve_order(tests)[-10:]
-
-
-def _collect_tool_context(state: RunState, context_state: ContextState) -> None:
-    issues: list[str] = []
-    for step in state.tool_steps:
-        if step.call.name == "apply_patch":
-            for path in step.result.data.get("paths", []):
-                context_state.files_changed[str(path)] = "changed by apply_patch" if step.result.ok else "attempted apply_patch"
-        if not step.result.ok:
-            issues.append(f"{step.call.name} {step.call.id}: {_first_line(step.result.output)}")
-    context_state.open_issues = issues[-8:]
-
-
-def _command_outcome(data: dict[str, Any]) -> str:
-    if data.get("timeout"):
-        return "timed out"
-    if data.get("ok"):
-        return "ok"
-    return f"exit {data.get('returncode')}"
-
-
-def _is_diff_or_status_step(step: ToolStep) -> bool:
-    if step.call.name != "shell":
-        return False
-    cmd = str(step.call.args.get("cmd", "")).lower()
-    return any(pattern in cmd for pattern in ("git status", "git diff", "git show", "git log"))
-
-
-def _is_test_step(step: ToolStep) -> bool:
-    return step.call.name == "shell" and _is_test_command_text(str(step.call.args.get("cmd", "")))
-
-
-def _is_test_command_text(command: str) -> bool:
-    return bool(
-        re.search(
-            r"(^|[;&|]\s*)((uv\s+run\s+)?pytest|python\s+-m\s+pytest|python\s+-m\s+unittest|npm\s+test|pnpm\s+test|yarn\s+test|cargo\s+test|go\s+test)\b",
-            command,
-        )
-    )
-
-
-def _artifact_description(step: ToolStep) -> str:
-    if step.call.name == "shell":
-        cmd = str(step.call.args.get("cmd", ""))
-        return f"shell output for {cmd[:120]}"
-    if step.call.name == "apply_patch":
-        paths = step.result.data.get("paths", [])
-        return f"apply_patch output for {', '.join(str(path) for path in paths)}"
-    return f"{step.call.name} output"
-
-
-def _small_json(value: object, *, max_chars: int = 2_000) -> str:
-    encoded = json.dumps(json_safe(value), sort_keys=True)
-    if len(encoded) <= max_chars:
-        return encoded
-    return json.dumps({"_truncated": True, "json_chars": len(encoded), "preview": encoded[:max_chars]}, sort_keys=True)
-
-
-def _first_line(text: str) -> str:
-    line = text.strip().splitlines()[0] if text.strip() else ""
-    return line[:240]
-
-
-def _dedupe_preserve_order(values: Sequence[str]) -> list[str]:
-    output: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        if value in seen:
-            continue
-        seen.add(value)
-        output.append(value)
-    return output
-
-
-def _list_block(values: Sequence[str]) -> str:
-    if not values:
-        return "- None recorded."
-    return "\n".join(f"- {value}" for value in values)
-
-
-def _dict_block(values: dict[str, str]) -> str:
-    if not values:
-        return "- None recorded."
-    return "\n".join(f"- {path}: {description}" for path, description in sorted(values.items()))
-
-
-def _artifact_block(refs: Sequence[ArtifactRef]) -> str:
-    if not refs:
-        return "- None recorded."
-    return "\n".join(f"- {ref.path}: {ref.description}" if ref.description else f"- {ref.path}" for ref in refs)
-
-
-def _tool_dict(tool: Tool) -> dict[str, Any]:
-    return {"name": tool.name, "schema": dict(tool.schema)}
+@dataclass(frozen=True)
+class BuiltContext:
+    messages: list[Message]
+    token_estimate: int
+    static_context_chars: int
+    tool_context_chars: int
+    project_instruction_chars: int
+    artifacts: list[ArtifactRef] = field(default_factory=list)
 ```
 
 ## `agentd/contracts.py`
@@ -3221,7 +2804,588 @@ class RunState:
         self.final_output = final_output or self.final_output
 ```
 
-## `agentd/tool_core.py`
+## `agentd/tools/__init__.py`
+
+```python
+"""Tool collection exports."""
+
+from __future__ import annotations
+
+from agentd.contracts import Tool
+from agentd.tools.builtins.patch import ApplyPatchTool, apply_openai_patch, patch_paths
+from agentd.tools.builtins.shell import ShellTool, shell_preflight
+from agentd.tools.core import (
+    SAFE_ENV_KEYS,
+    ToolError,
+    combined_output,
+    error_result,
+    is_relative_to,
+    relative_workspace_path,
+    resolve_workspace_path,
+    safe_artifact_name,
+    tool_env,
+    visible_output,
+    write_tool_output_artifact,
+)
+from agentd.tools.repo import (
+    EXCLUDED_SEARCH_DIRS,
+    MAX_READ_FILE_BYTES,
+    ListFilesTool,
+    ReadFileTool,
+    SearchRepoTool,
+    repo_inspect_tools,
+)
+
+
+def builtin_tools() -> list[Tool]:
+    return [ShellTool(), ApplyPatchTool()]
+
+
+def all_tools() -> list[Tool]:
+    return [*builtin_tools(), *repo_inspect_tools()]
+
+
+def default_tools() -> list[Tool]:
+    return all_tools()
+
+
+__all__ = [
+    "EXCLUDED_SEARCH_DIRS",
+    "MAX_READ_FILE_BYTES",
+    "SAFE_ENV_KEYS",
+    "ApplyPatchTool",
+    "ListFilesTool",
+    "ReadFileTool",
+    "SearchRepoTool",
+    "ShellTool",
+    "ToolError",
+    "all_tools",
+    "apply_openai_patch",
+    "builtin_tools",
+    "combined_output",
+    "default_tools",
+    "error_result",
+    "is_relative_to",
+    "patch_paths",
+    "relative_workspace_path",
+    "repo_inspect_tools",
+    "resolve_workspace_path",
+    "safe_artifact_name",
+    "shell_preflight",
+    "tool_env",
+    "visible_output",
+    "write_tool_output_artifact",
+]
+```
+
+## `agentd/tools/builtins/__init__.py`
+
+```python
+"""Builtin tinyagent tools."""
+
+from agentd.tools.builtins.patch import ApplyPatchTool, apply_openai_patch, patch_paths
+from agentd.tools.builtins.shell import ShellTool, shell_preflight
+
+__all__ = ["ApplyPatchTool", "ShellTool", "apply_openai_patch", "patch_paths", "shell_preflight"]
+```
+
+## `agentd/tools/builtins/patch.py`
+
+```python
+"""Builtin OpenAI-style patch tool."""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+from agentd.state import RunState, ToolCall, ToolResult
+from agentd.tools.core import (
+    ToolError,
+    error_result,
+    relative_workspace_path,
+    resolve_workspace_path,
+    visible_output,
+    write_tool_output_artifact,
+)
+
+
+class ApplyPatchTool:
+    name = "apply_patch"
+    schema = {
+        "name": "apply_patch",
+        "description": "Apply a patch inside the workspace.",
+        "parameters": {
+            "type": "object",
+            "properties": {"patch": {"type": "string"}},
+            "required": ["patch"],
+        },
+    }
+
+    def __init__(self, *, allow_run_artifacts: bool = False) -> None:
+        self.allow_run_artifacts = allow_run_artifacts
+
+    def run(self, call: ToolCall, state: RunState) -> ToolResult:
+        patch = str(call.args.get("patch", ""))
+        if not patch:
+            return ToolResult(tool_name=self.name, call_id=call.id, output="patch is required", ok=False)
+        try:
+            touched = [
+                relative_workspace_path(state, resolve_workspace_path(state, path, allow_run_artifacts=self.allow_run_artifacts))
+                for path in patch_paths(patch)
+            ]
+        except Exception as exc:
+            return error_result(self.name, call, exc)
+        if not touched:
+            return ToolResult(tool_name=self.name, call_id=call.id, output="patch did not declare any file paths", ok=False)
+
+        try:
+            output = apply_openai_patch(state.workspace.root, patch)
+            ok = True
+        except Exception as exc:
+            output = str(exc)
+            ok = False
+        artifact = write_tool_output_artifact(state, call, "patch-output", output, kind="patch_output")
+        state.emit(
+            "patch.applied",
+            {
+                "paths": touched,
+                "ok": ok,
+                "output_chars": len(output),
+            },
+        )
+        return ToolResult(
+            tool_name=self.name,
+            call_id=call.id,
+            output=visible_output(output, state),
+            ok=ok,
+            data={"paths": touched, "output_artifact": artifact, "output_chars": len(output)},
+        )
+
+
+@dataclass(frozen=True)
+class PatchOperation:
+    action: str
+    path: str
+    lines: tuple[str, ...]
+    move_to: str | None = None
+
+
+@dataclass(frozen=True)
+class _PatchSnapshot:
+    existed: bool
+    data: bytes | None = None
+
+
+def apply_openai_patch(root: Path, patch: str) -> str:
+    operations = _parse_openai_patch(patch)
+    _deny_symlink_patch_paths(root, operations)
+    touched_paths = _patch_touched_paths(root, operations)
+    snapshots = _snapshot_patch_paths(touched_paths)
+    existing_dirs = _existing_parent_dirs(root, touched_paths)
+    changed: list[str] = []
+    try:
+        for operation in operations:
+            match operation.action:
+                case "add":
+                    _apply_add(root, operation)
+                    changed.append(f"A {operation.path}")
+                case "delete":
+                    _apply_delete(root, operation)
+                    changed.append(f"D {operation.path}")
+                case "update":
+                    _apply_update(root, operation)
+                    changed.append(f"M {operation.path}" if operation.move_to is None else f"R {operation.path} -> {operation.move_to}")
+                case _:
+                    raise ToolError(f"Unsupported patch operation: {operation.action}")
+    except Exception:
+        _restore_patch_snapshot(snapshots)
+        _prune_new_empty_dirs(root, touched_paths, existing_dirs)
+        raise
+    return "Applied patch.\n" + "\n".join(changed) + ("\n" if changed else "")
+
+
+def _parse_openai_patch(patch: str) -> list[PatchOperation]:
+    lines = patch.splitlines()
+    if not lines or lines[0] != "*** Begin Patch":
+        raise ToolError("patch must start with *** Begin Patch")
+    if lines[-1] != "*** End Patch":
+        raise ToolError("patch must end with *** End Patch")
+
+    operations: list[PatchOperation] = []
+    index = 1
+    while index < len(lines) - 1:
+        line = lines[index]
+        match = re.match(r"^\*\*\* (Add|Delete|Update) File: (.+)$", line)
+        if not match:
+            raise ToolError(f"Expected file operation, got: {line}")
+        operation = match.group(1).lower()
+        path = match.group(2)
+        index += 1
+        move_to: str | None = None
+        if operation == "update" and index < len(lines) - 1:
+            move_match = re.match(r"^\*\*\* Move to: (.+)$", lines[index])
+            if move_match:
+                move_to = move_match.group(1)
+                index += 1
+        body: list[str] = []
+        while index < len(lines) - 1 and not lines[index].startswith("*** "):
+            body.append(lines[index])
+            index += 1
+        operations.append(PatchOperation(action=operation, path=path, lines=tuple(body), move_to=move_to))
+    return operations
+
+
+def _patch_touched_paths(root: Path, operations: list[PatchOperation]) -> list[Path]:
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    for operation in operations:
+        for path in (operation.path, operation.move_to):
+            if path is None:
+                continue
+            resolved = _patch_path(root, path)
+            if resolved not in seen:
+                seen.add(resolved)
+                paths.append(resolved)
+    return paths
+
+
+def _snapshot_patch_paths(paths: list[Path]) -> dict[Path, _PatchSnapshot]:
+    snapshots: dict[Path, _PatchSnapshot] = {}
+    for path in paths:
+        if not path.exists():
+            snapshots[path] = _PatchSnapshot(existed=False)
+            continue
+        if not path.is_file():
+            raise ToolError(f"Patch path is not a regular file: {path}")
+        snapshots[path] = _PatchSnapshot(existed=True, data=path.read_bytes())
+    return snapshots
+
+
+def _restore_patch_snapshot(snapshots: dict[Path, _PatchSnapshot]) -> None:
+    for path, snapshot in snapshots.items():
+        if snapshot.existed:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(snapshot.data or b"")
+        elif path.exists():
+            if path.is_file() or path.is_symlink():
+                path.unlink()
+            else:
+                raise ToolError(f"Cannot roll back non-file patch path: {path}")
+
+
+def _existing_parent_dirs(root: Path, paths: list[Path]) -> set[Path]:
+    root = root.resolve()
+    dirs = set(_parent_dirs(root, paths))
+    return {path for path in dirs if path.exists()}
+
+
+def _prune_new_empty_dirs(root: Path, paths: list[Path], existing_dirs: set[Path]) -> None:
+    for path in sorted(_parent_dirs(root.resolve(), paths), key=lambda item: len(item.parts), reverse=True):
+        if path in existing_dirs:
+            continue
+        try:
+            path.rmdir()
+        except OSError:
+            continue
+
+
+def _parent_dirs(root: Path, paths: list[Path]) -> set[Path]:
+    dirs: set[Path] = set()
+    for path in paths:
+        parent = path.parent.resolve()
+        while parent != root:
+            try:
+                parent.relative_to(root)
+            except ValueError:
+                break
+            dirs.add(parent)
+            parent = parent.parent
+    return dirs
+
+
+def _patch_path(root: Path, path: str) -> Path:
+    root = root.resolve()
+    candidate = Path(path).expanduser()
+    resolved = candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ToolError(f"Path is outside workspace: {path}") from exc
+    return resolved
+
+
+def _raw_patch_path(root: Path, path: str) -> Path:
+    candidate = Path(path).expanduser()
+    return candidate if candidate.is_absolute() else root / candidate
+
+
+def _deny_symlink_patch_paths(root: Path, operations: list[PatchOperation]) -> None:
+    for operation in operations:
+        for path in (operation.path, operation.move_to):
+            if path is not None and _raw_patch_path(root, path).is_symlink():
+                raise ToolError(f"Cannot patch symlink path: {path}")
+
+
+def _apply_add(root: Path, operation: PatchOperation) -> None:
+    path = _patch_path(root, operation.path)
+    if path.exists():
+        raise ToolError(f"Cannot add existing file: {operation.path}")
+    content = []
+    for line in operation.lines:
+        if not line.startswith("+"):
+            raise ToolError(f"Add file lines must start with '+': {operation.path}")
+        content.append(line[1:])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_join_patch_lines(content, trailing_newline=bool(content)))
+
+
+def _apply_delete(root: Path, operation: PatchOperation) -> None:
+    path = _patch_path(root, operation.path)
+    if not path.exists():
+        raise ToolError(f"Cannot delete missing file: {operation.path}")
+    path.unlink()
+
+
+def _apply_update(root: Path, operation: PatchOperation) -> None:
+    source = _patch_path(root, operation.path)
+    if not source.exists():
+        raise ToolError(f"Cannot update missing file: {operation.path}")
+    original_text = source.read_text(errors="replace")
+    original_lines = original_text.splitlines()
+    updated_lines = _apply_hunks(original_lines, operation.lines)
+    target = _patch_path(root, operation.move_to or operation.path)
+    if operation.move_to is not None and target.exists() and target.resolve() != source.resolve():
+        raise ToolError(f"Cannot move over existing file: {operation.move_to}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(_join_patch_lines(updated_lines, trailing_newline=original_text.endswith("\n")))
+    if operation.move_to is not None and target.resolve() != source.resolve():
+        source.unlink()
+
+
+def _apply_hunks(original_lines: list[str], patch_lines: tuple[str, ...]) -> list[str]:
+    if not patch_lines:
+        return original_lines
+    output = list(original_lines)
+    cursor = 0
+    for hunk in _split_hunks(patch_lines):
+        old_lines = [line[1:] for line in hunk if line and line[0] in {" ", "-"}]
+        new_lines = [line[1:] for line in hunk if line and line[0] in {" ", "+"}]
+        position = _find_subsequence(output, old_lines, start=cursor)
+        if position is None:
+            raise ToolError("Patch hunk did not match file content.")
+        output[position : position + len(old_lines)] = new_lines
+        cursor = position + len(new_lines)
+    return output
+
+
+def _split_hunks(lines: tuple[str, ...]) -> list[list[str]]:
+    hunks: list[list[str]] = []
+    current: list[str] = []
+    for line in lines:
+        if line.startswith("@@"):
+            if current:
+                hunks.append(current)
+            current = []
+            continue
+        if line.startswith("\\ No newline"):
+            continue
+        if not line or line[0] not in {" ", "-", "+"}:
+            raise ToolError(f"Invalid patch hunk line: {line}")
+        current.append(line)
+    if current:
+        hunks.append(current)
+    return hunks
+
+
+def _find_subsequence(lines: list[str], needle: list[str], *, start: int) -> int | None:
+    if not needle:
+        return start
+    stop = len(lines) - len(needle) + 1
+    for index in range(start, max(stop, start)):
+        if lines[index : index + len(needle)] == needle:
+            return index
+    return None
+
+
+def _join_patch_lines(lines: list[str], *, trailing_newline: bool) -> str:
+    text = "\n".join(lines)
+    if trailing_newline:
+        return text + "\n"
+    return text
+
+
+def patch_paths(patch: str) -> list[str]:
+    paths: list[str] = []
+    for line in patch.splitlines():
+        match = re.match(r"^\*\*\* (?:Update|Add|Delete) File: (.+)$", line)
+        if match:
+            paths.append(match.group(1))
+            continue
+        match = re.match(r"^\*\*\* Move to: (.+)$", line)
+        if match:
+            paths.append(match.group(1))
+    return paths
+```
+
+## `agentd/tools/builtins/shell.py`
+
+```python
+"""Builtin shell tool."""
+
+from __future__ import annotations
+
+import os
+import shutil
+import signal
+import subprocess
+from typing import Any
+
+from agentd.state import RunState, ToolCall, ToolResult
+from agentd.tools.core import combined_output, error_result, tool_env, visible_output, write_tool_output_artifact
+
+SHELL_PREFLIGHT_COMMANDS = ("rg", "git", "python3", "python", "sed")
+
+
+class ShellTool:
+    name = "shell"
+    schema = {
+        "name": "shell",
+        "description": "Run a shell command with cwd set to the workspace root.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "cmd": {"type": "string"},
+                "timeout_seconds": {"type": "integer", "minimum": 1},
+            },
+            "required": ["cmd"],
+        },
+    }
+
+    def run(self, call: ToolCall, state: RunState) -> ToolResult:
+        cmd = str(call.args.get("cmd", ""))
+        if not cmd:
+            return ToolResult(tool_name=self.name, call_id=call.id, output="cmd is required", ok=False)
+        try:
+            requested_timeout = int(call.args.get("timeout_seconds", state.budgets.max_shell_timeout_seconds))
+        except ValueError as exc:
+            return error_result(self.name, call, exc)
+        timeout = min(max(requested_timeout, 1), state.budgets.max_shell_timeout_seconds)
+        state.emit(
+            "command.started",
+            {
+                "tool_call_id": call.id,
+                "cmd": cmd,
+                "cwd": str(state.workspace.root),
+                "timeout_seconds": timeout,
+                "env": "sanitized",
+            },
+        )
+        try:
+            process = subprocess.Popen(
+                cmd,
+                cwd=state.workspace.root,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=tool_env(state),
+                start_new_session=True,
+            )
+        except OSError as exc:
+            return error_result(self.name, call, exc)
+
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = _terminate_process_group(process)
+            output = combined_output(stdout, stderr) or f"Command timed out after {timeout}s."
+            artifact = write_tool_output_artifact(state, call, "command-output", output, kind="command_output")
+            state.emit(
+                "command.completed",
+                {
+                    "tool_call_id": call.id,
+                    "cmd": cmd,
+                    "ok": False,
+                    "timeout": True,
+                    "returncode": process.returncode,
+                    "output_artifact": artifact,
+                    "output_chars": len(output),
+                },
+            )
+            return ToolResult(
+                tool_name=self.name,
+                call_id=call.id,
+                output=visible_output(output, state),
+                ok=False,
+                data={
+                    "cmd": cmd,
+                    "timeout": True,
+                    "returncode": process.returncode,
+                    "output_artifact": artifact,
+                    "output_chars": len(output),
+                },
+            )
+
+        output = combined_output(stdout, stderr) or f"Command exited {process.returncode}."
+        artifact = write_tool_output_artifact(state, call, "command-output", output, kind="command_output")
+        state.emit(
+            "command.completed",
+            {
+                "tool_call_id": call.id,
+                "cmd": cmd,
+                "ok": process.returncode == 0,
+                "timeout": False,
+                "returncode": process.returncode,
+                "stdout_chars": len(stdout),
+                "stderr_chars": len(stderr),
+                "output_artifact": artifact,
+                "output_chars": len(output),
+            },
+        )
+        return ToolResult(
+            tool_name=self.name,
+            call_id=call.id,
+            output=visible_output(output, state),
+            ok=process.returncode == 0,
+            data={
+                "cmd": cmd,
+                "returncode": process.returncode,
+                "output_artifact": artifact,
+                "output_chars": len(output),
+            },
+        )
+
+
+def shell_preflight() -> dict[str, Any]:
+    paths = {name: shutil.which(name) for name in SHELL_PREFLIGHT_COMMANDS}
+    return {
+        "commands": {name: path is not None for name, path in paths.items()},
+        "python_available": paths["python3"] is not None or paths["python"] is not None,
+    }
+
+
+def _terminate_process_group(process: subprocess.Popen[str]) -> tuple[str, str]:
+    _signal_process_group(process, signal.SIGTERM)
+    try:
+        stdout, stderr = process.communicate(timeout=1)
+    except subprocess.TimeoutExpired:
+        _signal_process_group(process, signal.SIGKILL)
+        stdout, stderr = process.communicate()
+    return stdout or "", stderr or ""
+
+
+def _signal_process_group(process: subprocess.Popen[str], sig: signal.Signals) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, sig)
+    except ProcessLookupError:
+        return
+```
+
+## `agentd/tools/core.py`
 
 ```python
 """Shared helpers for local tools."""
@@ -3314,81 +3478,7 @@ def is_relative_to(path: Path, root: Path) -> bool:
     return True
 ```
 
-## `agentd/tools.py`
-
-```python
-"""Tool collection exports."""
-
-from __future__ import annotations
-
-from agentd.builtins.patch import ApplyPatchTool, apply_openai_patch, patch_paths
-from agentd.builtins.shell import ShellTool, shell_preflight
-from agentd.contracts import Tool
-from agentd.tool_core import (
-    SAFE_ENV_KEYS,
-    ToolError,
-    combined_output,
-    error_result,
-    is_relative_to,
-    relative_workspace_path,
-    resolve_workspace_path,
-    safe_artifact_name,
-    tool_env,
-    visible_output,
-    write_tool_output_artifact,
-)
-from agentd.tools_repo import (
-    EXCLUDED_SEARCH_DIRS,
-    MAX_READ_FILE_BYTES,
-    ListFilesTool,
-    ReadFileTool,
-    SearchRepoTool,
-    repo_inspect_tools,
-)
-
-
-def builtin_tools() -> list[Tool]:
-    return [ShellTool(), ApplyPatchTool()]
-
-
-def all_tools() -> list[Tool]:
-    return [*builtin_tools(), *repo_inspect_tools()]
-
-
-def default_tools() -> list[Tool]:
-    return all_tools()
-
-
-__all__ = [
-    "EXCLUDED_SEARCH_DIRS",
-    "MAX_READ_FILE_BYTES",
-    "SAFE_ENV_KEYS",
-    "ApplyPatchTool",
-    "ListFilesTool",
-    "ReadFileTool",
-    "SearchRepoTool",
-    "ShellTool",
-    "ToolError",
-    "all_tools",
-    "apply_openai_patch",
-    "builtin_tools",
-    "combined_output",
-    "default_tools",
-    "error_result",
-    "is_relative_to",
-    "patch_paths",
-    "relative_workspace_path",
-    "repo_inspect_tools",
-    "resolve_workspace_path",
-    "safe_artifact_name",
-    "shell_preflight",
-    "tool_env",
-    "visible_output",
-    "write_tool_output_artifact",
-]
-```
-
-## `agentd/tools_repo.py`
+## `agentd/tools/repo.py`
 
 ```python
 """Optional repo inspection tools."""
@@ -3404,7 +3494,7 @@ from pathlib import Path
 
 from agentd.contracts import Tool
 from agentd.state import RunState, ToolCall, ToolResult
-from agentd.tool_core import (
+from agentd.tools.core import (
     error_result,
     is_relative_to,
     relative_workspace_path,

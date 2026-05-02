@@ -11,7 +11,7 @@ from pathlib import Path
 
 from agentd.contracts import Tool
 from agentd.state import RunState, ToolCall, ToolResult
-from agentd.tool_core import (
+from agentd.tools.core import (
     error_result,
     is_relative_to,
     relative_workspace_path,
