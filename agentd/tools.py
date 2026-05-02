@@ -24,7 +24,6 @@ from agentd.tools_repo import (
     ListFilesTool,
     ReadFileTool,
     SearchRepoTool,
-    _run_rg_limited,
     repo_inspect_tools,
 )
 
@@ -51,12 +50,6 @@ __all__ = [
     "SearchRepoTool",
     "ShellTool",
     "ToolError",
-    "_combined_output",
-    "_error_result",
-    "_is_relative_to",
-    "_run_rg_limited",
-    "_safe_artifact_name",
-    "_visible_output",
     "all_tools",
     "apply_openai_patch",
     "builtin_tools",
@@ -74,9 +67,3 @@ __all__ = [
     "visible_output",
     "write_tool_output_artifact",
 ]
-
-_combined_output = combined_output
-_error_result = error_result
-_is_relative_to = is_relative_to
-_safe_artifact_name = safe_artifact_name
-_visible_output = visible_output

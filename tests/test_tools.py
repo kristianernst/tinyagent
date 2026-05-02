@@ -23,13 +23,13 @@ from agentd.tools import (
     ReadFileTool,
     SearchRepoTool,
     ShellTool,
-    _run_rg_limited,
     all_tools,
     apply_openai_patch,
     builtin_tools,
     default_tools,
     repo_inspect_tools,
 )
+from agentd.tools_repo import _run_rg_limited
 
 
 def test_list_and_search_exclude_tinyagent_outputs(tmp_path) -> None:
@@ -48,7 +48,7 @@ def test_list_and_search_exclude_tinyagent_outputs(tmp_path) -> None:
     assert searched.ok is True
     assert "hello.txt" in searched.output
     assert ".tinyagent" not in searched.output
-    assert [event.type for event in state.events] == ["FilesListed", "ArtifactWritten", "SearchCompleted"]
+    assert [event.type for event in state.events] == ["files.listed", "artifact.created", "search.completed"]
 
 
 def test_read_file_and_apply_patch_protect_current_run_artifacts(tmp_path) -> None:
@@ -292,7 +292,7 @@ def test_shell_timeout_terminates_process_group_children(tmp_path) -> None:
     assert result.data["timeout"] is True
     assert (tmp_path / "child.started").exists()
     assert not (tmp_path / "child.done").exists()
-    command_finished = next(event for event in state.events if event.type == "CommandFinished")
+    command_finished = next(event for event in state.events if event.type == "command.completed")
     assert command_finished.data["timeout"] is True
     assert command_finished.data["output_artifact"] == result.data["output_artifact"]
 
@@ -572,7 +572,7 @@ def test_apex_profile_blocks_registered_but_hidden_tools(tmp_path, tool_name, ar
     state = kernel.run(f"try hidden {tool_name}", workspace=tmp_path, run_id=f"run_hidden_{tool_name}")
 
     assert state.failed is False
-    assert state.summary == "done"
+    assert state.final_output == "done"
     assert state.turn_count == 2
     result = state.tool_results[0]
     assert result.tool_name == tool_name
@@ -580,7 +580,7 @@ def test_apex_profile_blocks_registered_but_hidden_tools(tmp_path, tool_name, ar
     assert result.output == f"Tool is not visible for this profile: {tool_name}"
     assert result.data == {"blocked": True, "error_type": "ToolNotVisible", "visible_tools": ["apply_patch", "shell"]}
     hidden_events = [event for event in state.events if event.data.get("tool_call_id") == hidden_call.id]
-    assert [event.type for event in hidden_events] == ["ToolCallRequested", "ToolCallFinished"]
+    assert [event.type for event in hidden_events] == ["tool.call.started", "tool.args.completed", "tool.execution.failed"]
 
 
 def test_shell_preflight_records_expected_interface_in_events_and_metrics(tmp_path) -> None:
@@ -594,7 +594,7 @@ def test_shell_preflight_records_expected_interface_in_events_and_metrics(tmp_pa
 
     state = kernel.run("preflight", workspace=tmp_path, run_id="run_preflight")
 
-    preflight = next(event for event in state.events if event.type == "ShellPreflight")
+    preflight = next(event for event in state.events if event.type == "shell.preflight.completed")
     assert set(preflight.data["commands"]) == {"rg", "git", "python3", "python", "sed"}
     assert isinstance(preflight.data["python_available"], bool)
     metrics = json.loads((state.output_dir / "metrics.json").read_text())
@@ -646,18 +646,18 @@ def test_golden_trace_calc_pytest_patch_loop_records_required_artifacts(tmp_path
     assert state.failed is False
     assert (tmp_path / "calc.py").read_text() == "def add(a, b):\n    return a + b\n"
     assert (state.output_dir / "events.jsonl").exists()
-    assert (state.output_dir / "summary.md").exists()
+    assert (state.output_dir / "final.md").exists()
     assert (state.output_dir / "metrics.json").exists()
     assert (state.output_dir / "final.diff").read_text() == state.final_diff
     assert "-    return a - b" in state.final_diff
     assert "+    return a + b" in state.final_diff
 
-    context_built = next(event for event in state.events if event.type == "ContextBuilt")
+    context_built = next(event for event in state.events if event.type == "context.built")
     assert isinstance(context_built.data["token_estimate"], int)
     assert context_built.data["token_estimate"] > 0
 
-    model_request = next(event for event in state.events if event.type == "ModelRequest")
-    model_response = next(event for event in state.events if event.type == "ModelResponse")
+    model_request = next(event for event in state.events if event.type == "model.request.started")
+    model_response = next(event for event in state.events if event.type == "model.completed")
     assert (state.output_dir / model_request.data["context_artifact"]).exists()
     assert (state.output_dir / model_request.data["logical_request_artifact"]).exists()
     assert (state.output_dir / model_response.data["response_artifact"]).exists()
@@ -665,21 +665,21 @@ def test_golden_trace_calc_pytest_patch_loop_records_required_artifacts(tmp_path
     sed_requested = next(
         event
         for event in state.events
-        if event.type == "ToolCallRequested" and event.data["tool"] == "shell" and event.data["args"]["cmd"].startswith("sed ")
+        if event.type == "tool.args.completed" and event.data["tool"] == "shell" and event.data["args"]["cmd"].startswith("sed ")
     )
     assert sed_requested.data["args_preview"] == sed_requested.data["args"]
 
-    command_finished = [event for event in state.events if event.type == "CommandFinished"]
+    command_finished = [event for event in state.events if event.type == "command.completed"]
     assert command_finished
     assert all((state.output_dir / event.data["output_artifact"]).exists() for event in command_finished)
-    assert any(event.type == "PatchApplied" and event.data["paths"] == ["calc.py"] for event in state.events)
-    assert any(event.type == "DiffSnapshot" and event.data["available"] is True for event in state.events)
+    assert any(event.type == "patch.applied" and event.data["paths"] == ["calc.py"] for event in state.events)
+    assert any(event.type == "diff.finalized" and event.data["available"] is True for event in state.events)
 
     (tmp_path / "calc.py").write_text("def add(a, b):\n    return a - b\n")
     replay = replay_run(state.output_dir)
 
     assert "Tinyagent Replay" in replay
-    assert "CommandFinished" in replay
+    assert "command.completed" in replay
     assert (tmp_path / "calc.py").read_text() == "def add(a, b):\n    return a - b\n"
 
 
@@ -716,16 +716,16 @@ def test_fake_provider_trace_shells_patches_answers_with_content_and_captures_di
     state = kernel.run("read, patch, shell, answer", workspace=tmp_path, run_id="run_trace")
 
     assert state.failed is False
-    assert state.summary == "done"
+    assert state.final_output == "done"
     assert (tmp_path / "hello.txt").read_text() == "hello tinyagent\n"
     assert "-hello" in state.final_diff
     assert "+hello tinyagent" in state.final_diff
     assert (state.output_dir / "final.diff").read_text() == state.final_diff
     event_types = [event.type for event in state.events]
-    assert "PatchApplied" in event_types
-    assert "CommandStarted" in event_types
-    assert "CommandFinished" in event_types
-    assert event_types[-1] == "DiffSnapshot"
+    assert "patch.applied" in event_types
+    assert "command.started" in event_types
+    assert "command.completed" in event_types
+    assert event_types[-2:] == ["diff.finalized", "run.completed"]
     patch_result = next(result for result in state.tool_results if result.tool_name == "apply_patch")
     shell_result = [result for result in state.tool_results if result.tool_name == "shell"][-1]
     assert (state.output_dir / patch_result.data["output_artifact"]).exists()
@@ -773,9 +773,9 @@ def test_golden_trace_covers_context_artifacts_tool_args_shell_artifact_and_untr
     assert "created.txt" in state.final_diff
     assert "+new file" in state.final_diff
 
-    model_requests = [event for event in state.events if event.type == "ModelRequest"]
+    model_requests = [event for event in state.events if event.type == "model.request.started"]
     model_request = model_requests[0]
-    model_response = next(event for event in state.events if event.type == "ModelResponse")
+    model_response = next(event for event in state.events if event.type == "model.completed")
     assert (state.output_dir / model_request.data["context_artifact"]).exists()
     assert (state.output_dir / model_request.data["logical_request_artifact"]).exists()
     assert (state.output_dir / model_response.data["response_artifact"]).exists()
@@ -789,7 +789,7 @@ def test_golden_trace_covers_context_artifacts_tool_args_shell_artifact_and_untr
     shell_requested = [
         event
         for event in state.events
-        if event.type == "ToolCallRequested" and event.data["tool"] == "shell" and event.data["tool_call_id"] == shell_call.id
+        if event.type == "tool.args.completed" and event.data["tool"] == "shell" and event.data["tool_call_id"] == shell_call.id
     ][0]
     assert shell_requested.data["args"] == {"cmd": shell_call.args["cmd"]}
     shell_result = next(result for result in state.tool_results if result.tool_name == "shell" and result.call_id == shell_call.id)

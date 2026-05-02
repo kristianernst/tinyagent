@@ -58,7 +58,7 @@ artifacts/model-request-logical-0001.json
 artifacts/model-request-http-0001.json
 artifacts/model-response-0001.json
 artifacts/command-output-*.txt
-summary.md
+final.md
 metrics.json
 final.diff
 ```

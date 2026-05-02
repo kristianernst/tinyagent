@@ -22,7 +22,7 @@ def write_run_outputs(state: RunState) -> None:
     (state.output_dir / "events.jsonl").write_text(
         "".join(json.dumps(event.to_json_dict(), sort_keys=True) + "\n" for event in state.events),
     )
-    (state.output_dir / "summary.md").write_text(_summary_text(state))
+    (state.output_dir / "final.md").write_text(_final_text(state))
     (state.output_dir / "metrics.json").write_text(json.dumps(_metrics(state), indent=2, sort_keys=True) + "\n")
     (state.output_dir / "final.diff").write_text(state.final_diff)
 
@@ -39,8 +39,8 @@ def capture_final_diff(state: RunState) -> None:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         state.final_diff = ""
-        state.add_event(
-            "DiffSnapshot",
+        state.emit(
+            "diff.finalized",
             {
                 "available": False,
                 "reason": f"git unavailable: {exc}",
@@ -51,8 +51,8 @@ def capture_final_diff(state: RunState) -> None:
         return
     if result.returncode != 0:
         state.final_diff = ""
-        state.add_event(
-            "DiffSnapshot",
+        state.emit(
+            "diff.finalized",
             {
                 "available": False,
                 "reason": "workspace is not a git worktree",
@@ -73,8 +73,8 @@ def capture_final_diff(state: RunState) -> None:
         untracked = _untracked_files(state)
     except (OSError, subprocess.TimeoutExpired) as exc:
         state.final_diff = ""
-        state.add_event(
-            "DiffSnapshot",
+        state.emit(
+            "diff.finalized",
             {
                 "available": False,
                 "reason": f"git diff failed: {exc}",
@@ -85,8 +85,8 @@ def capture_final_diff(state: RunState) -> None:
         return
     untracked_diff = "".join(_new_file_diff(root, path) for path in untracked)
     state.final_diff = _join_diff_parts(diff.stdout, untracked_diff) if diff.returncode == 0 else ""
-    state.add_event(
-        "DiffSnapshot",
+    state.emit(
+        "diff.finalized",
         {
             "available": diff.returncode == 0,
             "reason": "" if diff.returncode == 0 else (diff.stderr.strip() or "git diff failed"),
@@ -119,8 +119,8 @@ def write_text_artifact(state: RunState, name: str, content: str, *, kind: str) 
     artifact_path = state.output_dir / relative_path
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     artifact_path.write_text(content)
-    state.add_event(
-        "ArtifactWritten",
+    state.emit(
+        "artifact.created",
         {
             "kind": kind,
             "path": relative_path.as_posix(),
@@ -199,22 +199,24 @@ def write_model_response_artifact(
     )
 
 
-def _summary_text(state: RunState) -> str:
-    if state.failed:
-        return f"# Run failed\n\n{state.failure_reason or 'Unknown failure'}\n"
-    return f"# Run finished\n\n{state.summary or 'No summary produced.'}\n"
+def _final_text(state: RunState) -> str:
+    return f"# Final output\n\n{state.final_output or 'No final output produced.'}\n"
 
 
 def _metrics(state: RunState) -> dict[str, Any]:
     return {
         "run_id": state.run_id,
-        "status": "failed" if state.failed else "finished",
+        "status": "failed" if state.failed else "completed",
         "failure_reason": state.failure_reason,
+        "final_output_chars": len(state.final_output),
+        "final_output_path": "final.md",
         "task": state.task,
         "workspace_root": str(state.workspace.root),
         "output_dir": str(state.output_dir),
         "turn_count": state.turn_count,
         "tool_call_count": state.tool_call_count,
+        "event_count": state.seq,
+        "durable_event_count": len(state.events),
         "duration_seconds": state.elapsed_seconds(),
         "budgets": asdict(state.budgets),
         "final_diff_available": bool(state.final_diff),

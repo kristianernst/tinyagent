@@ -38,8 +38,8 @@ class ShellTool:
         except ValueError as exc:
             return error_result(self.name, call, exc)
         timeout = min(max(requested_timeout, 1), state.budgets.max_shell_timeout_seconds)
-        state.add_event(
-            "CommandStarted",
+        state.emit(
+            "command.started",
             {
                 "tool_call_id": call.id,
                 "cmd": cmd,
@@ -68,8 +68,8 @@ class ShellTool:
             stdout, stderr = _terminate_process_group(process)
             output = combined_output(stdout, stderr) or f"Command timed out after {timeout}s."
             artifact = write_tool_output_artifact(state, call, "command-output", output, kind="command_output")
-            state.add_event(
-                "CommandFinished",
+            state.emit(
+                "command.completed",
                 {
                     "tool_call_id": call.id,
                     "cmd": cmd,
@@ -96,8 +96,8 @@ class ShellTool:
 
         output = combined_output(stdout, stderr) or f"Command exited {process.returncode}."
         artifact = write_tool_output_artifact(state, call, "command-output", output, kind="command_output")
-        state.add_event(
-            "CommandFinished",
+        state.emit(
+            "command.completed",
             {
                 "tool_call_id": call.id,
                 "cmd": cmd,

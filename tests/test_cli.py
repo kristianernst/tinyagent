@@ -51,8 +51,33 @@ def test_agentctl_run_fake_and_replay(tmp_path, capsys) -> None:
 
     assert replay_code == 0
     assert "Tinyagent Replay" in replayed.out
-    assert "RunStarted" in replayed.out
-    assert "RunFinished" in replayed.out
+    assert "run.started" in replayed.out
+    assert "run.completed" in replayed.out
+
+
+def test_agentctl_run_fake_streams_text(tmp_path, capsys) -> None:
+    (tmp_path / "hello.txt").write_text("hello\n")
+
+    exit_code = main(
+        [
+            "run",
+            "read hello.txt and answer",
+            "--provider",
+            "fake",
+            "--workspace",
+            str(tmp_path),
+            "--run-id",
+            "run_stream_cli",
+            "--stream",
+            "text",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "Fake run finished after reading hello.txt." in captured.out
+    assert "run_id: run_stream_cli" in captured.out
+    assert captured.out.count("Fake run finished after reading hello.txt.") == 1
 
 
 def test_agentctl_run_openai_compatible_missing_env_fails_cleanly(tmp_path, capsys, monkeypatch) -> None:

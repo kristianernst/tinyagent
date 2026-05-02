@@ -6,5 +6,6 @@ Project documentation starts here.
   the installed/active/visible/allowed/traced invariant.
 - `STREAMING_BASELINE_DISCOVERY.md`: 20+ system comparison for streaming,
   tracing, tool loops, and eval discipline before implementation.
+- `STREAMIN_CONTRACTS.md`: binding internal item/event and streaming contract.
 - `PHILOSOPHY.md`: Tinyagent design pressure and acceptance bar.
 - `MERGE.md`: checklist for reviewing foundation changes.

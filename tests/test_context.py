@@ -150,11 +150,11 @@ def test_kernel_compacts_at_turn_boundary_and_uses_checkpoint(tmp_path, monkeypa
     assert "## Commands Run" in checkpoint
     assert "printf 'test output\\n'" in checkpoint
     assert "command-output" in checkpoint
-    assert [event.type for event in state.events if event.type.startswith("Compaction")] == [
-        "CompactionStarted",
-        "CompactionFinished",
+    assert [event.type for event in state.events if event.type in {"compaction.started", "checkpoint.completed"}] == [
+        "compaction.started",
+        "checkpoint.completed",
     ]
-    context_built = [event for event in state.events if event.type == "ContextBuilt"][-1]
+    context_built = [event for event in state.events if event.type == "context.built"][-1]
     assert context_built.data["token_estimate"] == state.context_token_estimate
     assert context_built.data["checkpoint_artifact"] == state.context_checkpoint_artifact
 

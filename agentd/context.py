@@ -415,18 +415,18 @@ def _collect_event_context(state: RunState, context_state: ContextState) -> None
     tests: list[str] = []
     for event in state.events:
         data = event.data
-        if event.type == "FileRead":
+        if event.type == "file.read":
             path = str(data.get("path", ""))
             if path:
                 context_state.files_seen[path] = f"read {data.get('line_count', 0)} line(s)"
-        elif event.type == "SearchCompleted":
+        elif event.type == "search.completed":
             path = str(data.get("path", "."))
             query = str(data.get("query", ""))
             context_state.files_seen[path] = f"searched for {query!r}"
-        elif event.type == "PatchApplied":
+        elif event.type == "patch.applied":
             for path in data.get("paths", []):
                 context_state.files_changed[str(path)] = "changed by apply_patch"
-        elif event.type == "CommandFinished":
+        elif event.type == "command.completed":
             command = str(data.get("cmd", ""))
             if not command:
                 continue
