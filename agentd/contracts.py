@@ -6,7 +6,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, Protocol
 
 from agentd.model_stream import ModelDelta
-from agentd.state import Message, ModelResponse, PolicyDecision, RunState, ToolCall, ToolResult
+from agentd.state import ApprovalRequest, ApprovalResolution, Message, ModelResponse, PolicyDecision, RunState, ToolCall, ToolResult
 
 
 class Tool(Protocol):
@@ -48,6 +48,10 @@ class Profile(Protocol):
 
 class PolicyEngine(Protocol):
     def evaluate(self, call: ToolCall, state: RunState) -> PolicyDecision: ...
+
+
+class ApprovalHandler(Protocol):
+    def resolve(self, request: ApprovalRequest, state: RunState) -> ApprovalResolution: ...
 
 
 class Executor(Protocol):

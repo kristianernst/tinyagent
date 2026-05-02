@@ -61,6 +61,7 @@ class RunRecord:
     final_diff_available: bool = False
     duration_seconds: float = 0.0
     turn_count: int = 0
+    model_call_count: int = 0
     tool_call_count: int = 0
     event_count: int = 0
     artifact_count: int = 0
@@ -104,6 +105,7 @@ def load_run_record(run_path: Path) -> RunRecord:
         final_diff_available=final_diff_available,
         duration_seconds=float(metrics.get("duration_seconds") or 0.0),
         turn_count=int(metrics.get("turn_count") or 0),
+        model_call_count=int(metrics.get("model_call_count") or len(model_calls)),
         tool_call_count=int(metrics.get("tool_call_count") or len(tool_calls)),
         event_count=int(metrics.get("event_count") or (events[-1].seq if events else 0)),
         artifact_count=sum(1 for event in events if event.type == "artifact.created"),
@@ -125,6 +127,7 @@ def render_run_inspection(record: RunRecord) -> str:
         f"run_path: {record.run_path}",
         f"duration_seconds: {record.duration_seconds:.3f}",
         f"turns: {record.turn_count}",
+        f"model_calls: {record.model_call_count}",
         f"tool_calls: {record.tool_call_count}",
         f"commands: {record.command_count}",
         f"patches: {record.patch_count}",
@@ -170,17 +173,15 @@ def _model_calls(events: list[Event]) -> list[ModelCallRecord]:
     records: dict[int, dict[str, Any]] = {}
     for event in events:
         data = event.data
-        if event.type == "model.request.started":
-            turn = int(data.get("turn") or len(records) + 1)
+        if event.type == "model.call.started":
+            turn = int(data.get("model_call_index") or len(records) + 1)
             records.setdefault(turn, {}).update(
                 provider=str(data.get("provider") or ""),
                 request_artifact=str(data.get("logical_request_artifact") or ""),
             )
-        elif event.type == "model.stream.started":
-            turn = int(data.get("turn") or len(records) + 1)
-            records.setdefault(turn, {}).update(provider=str(data.get("provider") or ""), streamed=True)
-        elif event.type == "model.completed":
-            turn = int(data.get("turn") or len(records) + 1)
+            records.setdefault(turn, {}).update(streamed=bool(data.get("stream")))
+        elif event.type == "model.call.completed":
+            turn = int(data.get("model_call_index") or len(records) + 1)
             records.setdefault(turn, {}).update(
                 provider=str(data.get("provider") or ""),
                 streamed=bool(data.get("streamed")),
@@ -188,15 +189,15 @@ def _model_calls(events: list[Event]) -> list[ModelCallRecord]:
                 finish_reason=data.get("finish_reason"),
                 response_artifact=str(data.get("response_artifact") or ""),
             )
-        elif event.type == "model.failed":
-            turn = int(data.get("turn") or len(records) + 1)
+        elif event.type in {"model.call.failed", "model.timeout", "model.idle_timeout"}:
+            turn = int(data.get("model_call_index") or len(records) + 1)
             records.setdefault(turn, {}).update(
                 provider=str(data.get("provider") or ""),
                 failed=True,
                 failure_reason=str(data.get("reason") or ""),
             )
         elif event.type == "model.cancelled":
-            turn = int(data.get("turn") or len(records) + 1)
+            turn = int(data.get("model_call_index") or len(records) + 1)
             records.setdefault(turn, {}).update(
                 provider=str(data.get("provider") or ""),
                 cancelled=True,
@@ -212,7 +213,7 @@ def _tool_calls(events: list[Event]) -> list[ToolCallRecord]:
         tool_call_id = str(data.get("tool_call_id") or "")
         if not tool_call_id:
             continue
-        if event.type == "tool.call.started":
+        if event.type == "model.tool_call.assembly.completed":
             records.setdefault(tool_call_id, {}).update(tool=str(data.get("tool") or ""), tool_call_id=tool_call_id)
         elif event.type in {"tool.execution.completed", "tool.execution.failed", "tool.execution.cancelled"}:
             payload = data.get("data") if isinstance(data.get("data"), dict) else {}
@@ -237,10 +238,10 @@ def _commands(events: list[Event]) -> list[CommandRecord]:
             continue
         if event.type == "command.started":
             records.setdefault(tool_call_id, {}).update(cmd=str(data.get("cmd") or ""))
-        elif event.type == "command.completed":
+        elif event.type in {"command.completed", "command.failed", "command.timeout"}:
             records.setdefault(tool_call_id, {}).update(
                 ok=bool(data.get("ok")),
-                timeout=bool(data.get("timeout")),
+                timeout=bool(data.get("timeout")) or event.type == "command.timeout",
                 returncode=data.get("returncode"),
                 output_chars=int(data.get("output_chars") or 0),
                 output_artifact=str(data.get("output_artifact") or ""),

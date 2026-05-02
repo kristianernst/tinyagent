@@ -21,7 +21,7 @@ from agentd.providers.openai_compat import OpenAICompatibleProvider
 from agentd.replay import replay_run
 from agentd.run_control import CancelToken, RunCancelled
 from agentd.run_record import load_run_record, render_run_inspection
-from agentd.state import ModelResponse, ToolCall
+from agentd.state import ApprovalRequest, ApprovalResolution, ModelResponse, RunState, ToolCall
 from agentd.tools import default_tools
 
 
@@ -37,6 +37,9 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("task", help="Task for the agent.")
     run_parser.add_argument("--provider", choices=["fake", "openai-compatible"], default="fake")
     run_parser.add_argument("--workspace", default=".")
+    run_parser.add_argument("--workspace-mode", choices=["auto", "worktree", "current"], default="auto")
+    run_parser.add_argument("--approval-mode", choices=["never", "on-request", "yolo"], default="yolo")
+    run_parser.add_argument("--sandbox-mode", choices=["none"], default="none")
     run_parser.add_argument("--run-id")
     run_parser.add_argument("--output-dir", type=Path)
     run_parser.add_argument(
@@ -61,6 +64,9 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument("suite_path", type=Path, help="Directory containing eval cases.")
     eval_parser.add_argument("--provider", choices=["fake", "openai-compatible"], default="fake")
     eval_parser.add_argument("--output-dir", type=Path)
+    eval_parser.add_argument("--workspace-mode", choices=["auto", "worktree", "current"], default="current")
+    eval_parser.add_argument("--approval-mode", choices=["never", "on-request", "yolo"], default="yolo")
+    eval_parser.add_argument("--sandbox-mode", choices=["none"], default="none")
     eval_parser.add_argument(
         "--stream",
         choices=["off", "text", "jsonl"],
@@ -100,8 +106,12 @@ def main(argv: list[str] | None = None) -> int:
             profile=ApexCoderProfile(),
             tools=default_tools(),
             policy=default_policy(),
+            approval_handler=_CliApprovalHandler() if args.approval_mode == "on-request" else None,
             stream=args.stream != "off",
             event_sink=_stream_sink(args.stream, debug_level),
+            workspace_mode=args.workspace_mode,
+            approval_mode=args.approval_mode,
+            sandbox_mode=args.sandbox_mode,
         )
         cancel_token = CancelToken()
         try:
@@ -112,6 +122,9 @@ def main(argv: list[str] | None = None) -> int:
                     run_id=args.run_id,
                     output_dir=args.output_dir,
                     cancel_token=cancel_token,
+                    workspace_mode=args.workspace_mode,
+                    approval_mode=args.approval_mode,
+                    sandbox_mode=args.sandbox_mode,
                 )
         except RunCancelled:
             print("run cancelled: sigint")
@@ -163,6 +176,9 @@ def main(argv: list[str] | None = None) -> int:
                     stream=args.stream != "off",
                     event_sink=_stream_sink(args.stream, debug_level),
                     cancel_token=cancel_token,
+                    workspace_mode=args.workspace_mode,
+                    approval_mode=args.approval_mode,
+                    sandbox_mode=args.sandbox_mode,
                 )
         except RunCancelled:
             print("eval cancelled: sigint")
@@ -200,6 +216,21 @@ def _stream_sink(mode: str, debug_level: int):
     if mode == "jsonl":
         return JsonlStreamSink(sys.stdout, debug_level=debug_level)
     return None
+
+
+class _CliApprovalHandler:
+    def resolve(self, request: ApprovalRequest, state: RunState) -> ApprovalResolution:
+        del state
+        print(f"approval requested: {request.action_kind} {request.tool_name}", file=sys.stderr)
+        if request.command:
+            print(f"command: {request.command}", file=sys.stderr)
+        print(f"reason/risk: {request.risk}", file=sys.stderr)
+        raw = input("Approve? [y]es once, [r]un, [n]o: ").strip().lower()
+        if raw in {"y", "yes"}:
+            return ApprovalResolution(request.approval_id, "approved", scope="once", reason="cli_approved_once")
+        if raw in {"r", "run"}:
+            return ApprovalResolution(request.approval_id, "approved", scope="run", reason="cli_approved_run")
+        return ApprovalResolution(request.approval_id, "denied", reason="cli_denied")
 
 
 @contextmanager

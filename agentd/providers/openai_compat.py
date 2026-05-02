@@ -115,6 +115,8 @@ class OpenAICompatibleProvider:
             raise ProviderError(f"Model provider HTTP {exc.code}: {detail}") from exc
         except urllib.error.URLError as exc:
             raise ProviderError(f"Model provider request failed: {exc.reason}") from exc
+        except TimeoutError as exc:
+            raise ProviderError(f"Model provider request timeout: {exc}") from exc
         except json.JSONDecodeError as exc:
             raise ProviderError(f"Model provider returned invalid JSON: {exc}") from exc
 
@@ -150,6 +152,8 @@ class OpenAICompatibleProvider:
             raise ProviderError(f"Model provider HTTP {exc.code}: {detail}") from exc
         except urllib.error.URLError as exc:
             raise ProviderError(f"Model provider stream failed: {exc.reason}") from exc
+        except TimeoutError as exc:
+            raise ProviderError(f"Model provider stream idle timeout: {exc}") from exc
 
 
 def _chat_completions_url(base_url: str) -> str:

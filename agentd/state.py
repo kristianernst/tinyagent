@@ -6,11 +6,12 @@ import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
 from agentd.events import Event, EventDurability, EventSink, EventVisibility, utc_now
 from agentd.run_control import CancelToken, RunCancelled
+from agentd.workspace import Workspace, WorkspaceEnvelope
 
 if TYPE_CHECKING:
     from agentd.context import ContextState
@@ -27,32 +28,13 @@ class RunBudgets:
     max_turns: int = 30
     max_tool_calls: int = 100
     max_shell_timeout_seconds: int = 60
+    max_model_timeout_seconds: int = 180
+    max_model_idle_timeout_seconds: int = 60
     max_run_seconds: int = 600
     max_command_output_chars_visible: int = 12_000
 
     def to_json_dict(self) -> dict[str, int]:
         return asdict(self)
-
-
-@dataclass(frozen=True)
-class Workspace:
-    root: Path
-
-    def resolved_root(self) -> Path:
-        return self.root.expanduser().resolve()
-
-    def resolve_path(self, path: str | Path = ".") -> Path:
-        candidate = Path(path).expanduser()
-        if not candidate.is_absolute():
-            candidate = self.root / candidate
-        return candidate.resolve()
-
-    def contains(self, path: Path) -> bool:
-        try:
-            path.resolve().relative_to(self.root)
-        except ValueError:
-            return False
-        return True
 
 
 @dataclass(frozen=True)
@@ -97,19 +79,81 @@ class ModelResponse:
         self.tool_calls = tuple(self.tool_calls)
 
 
+ApprovalDecision = Literal["approved", "denied", "cancelled", "expired"]
+ApprovalMode = Literal["never", "on-request", "yolo"]
+ApprovalScope = Literal["once", "run"]
+PolicyDecisionKind = Literal["allow", "deny", "needs_approval"]
+StepKind = Literal["model_call", "tool_execution", "approval_wait", "artifact_finalization"]
+TerminalStatus = Literal["completed", "failed", "cancelled", "interrupted", "timed_out"]
+
+
+@dataclass(frozen=True)
+class ApprovalRequest:
+    approval_id: str
+    run_id: str
+    turn_id: str | None
+    step_id: str | None
+    action_kind: Literal["shell", "patch", "network", "workspace_escape", "dirty_mutation", "unknown"]
+    tool_name: str
+    cwd: str
+    args_preview: str
+    command: str | None
+    risk: Literal["low", "medium", "high"]
+    scope_options: tuple[ApprovalScope, ...] = ("once", "run")
+
+    def grant_key(self) -> str:
+        return f"{self.action_kind}:{self.tool_name}:{self.command or self.args_preview}"
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ApprovalResolution:
+    approval_id: str
+    decision: ApprovalDecision
+    scope: ApprovalScope | None = None
+    reason: str | None = None
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ApprovalGrant:
+    approval_id: str
+    grant_key: str
+    scope: ApprovalScope
+    created_at: datetime = field(default_factory=utc_now)
+
+    def to_json_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["created_at"] = self.created_at.isoformat().replace("+00:00", "Z")
+        return data
+
+
 @dataclass(frozen=True)
 class PolicyDecision:
-    allowed: bool
+    kind: PolicyDecisionKind
     reason: str = ""
     redacted: bool = False
+    approval: ApprovalRequest | None = None
+
+    @property
+    def allowed(self) -> bool:
+        return self.kind == "allow"
 
     @classmethod
     def allow(cls, reason: str = "allowed") -> PolicyDecision:
-        return cls(allowed=True, reason=reason)
+        return cls(kind="allow", reason=reason)
 
     @classmethod
     def deny(cls, reason: str) -> PolicyDecision:
-        return cls(allowed=False, reason=reason)
+        return cls(kind="deny", reason=reason)
+
+    @classmethod
+    def needs_approval(cls, reason: str, approval: ApprovalRequest) -> PolicyDecision:
+        return cls(kind="needs_approval", reason=reason, approval=approval)
 
 
 @dataclass
@@ -124,6 +168,7 @@ class RunState:
     seq: int = 0
     tool_steps: list[ToolStep] = field(default_factory=list)
     turn_count: int = 0
+    model_call_count: int = 0
     tool_call_count: int = 0
     done: bool = False
     failed: bool = False
@@ -134,10 +179,18 @@ class RunState:
     cancel_requested_at: datetime | None = None
     cancel_signal_count: int = 0
     cancel_escalated: bool = False
-    current_step_kind: str | None = None
+    current_turn_id: str | None = None
+    current_step_kind: StepKind | None = None
     current_step_id: str | None = None
+    current_model_call_id: str | None = None
+    terminal_status: TerminalStatus | None = None
     final_output: str = ""
     final_diff: str = ""
+    workspace_envelope: WorkspaceEnvelope | None = None
+    approval_mode: ApprovalMode = "yolo"
+    pending_approvals: dict[str, ApprovalRequest] = field(default_factory=dict)
+    approval_grants: dict[str, ApprovalGrant] = field(default_factory=dict)
+    finalization_attempted: bool = False
     shell_preflight: dict[str, Any] = field(default_factory=dict)
     persist_events: bool = True
     stream_sink: EventSink | None = None
@@ -201,7 +254,7 @@ class RunState:
             visibility=visibility,
             durability=durability,
             artifact_refs=artifact_refs or [],
-            turn_id=turn_id,
+            turn_id=turn_id if turn_id is not None else self.current_turn_id,
             item_id=item_id,
             parent_item_id=parent_item_id,
             seq=self.seq + 1,
@@ -226,6 +279,7 @@ class RunState:
         self.done = True
         self.failed = True
         self.status = "failed"
+        self.terminal_status = "failed"
         self.failure_reason = reason
 
     def finish(self, final_output: str = "") -> None:
@@ -233,6 +287,7 @@ class RunState:
             return
         self.done = True
         self.status = "completed"
+        self.terminal_status = "completed"
         self.final_output = final_output or self.final_output
 
     def request_cancel(self, reason: str = "cancelled", *, source: str = "harness", escalate: bool = False) -> bool:
@@ -246,8 +301,21 @@ class RunState:
         self.done = True
         self.cancelled = True
         self.status = "cancelling"
+        self.terminal_status = "cancelled"
         self.cancel_reason = reason
         self.cancel_requested_at = utc_now()
+        if self.current_step_id:
+            self.emit(
+                "step.cancel.requested",
+                {
+                    "reason": reason,
+                    "source": source,
+                    "step_kind": self.current_step_kind,
+                    "step_id": self.current_step_id,
+                    "escalated": self.cancel_escalated,
+                },
+                visibility="user",
+            )
         self.emit(
             "run.cancel.requested",
             {
@@ -271,6 +339,69 @@ class RunState:
         if self.cancelled:
             raise RunCancelled(self.cancel_reason or "cancelled")
 
-    def set_current_step(self, kind: str | None, step_id: str | None) -> None:
+    def start_turn(self, turn_id: str) -> None:
+        self.current_turn_id = turn_id
+        self.turn_count += 1
+        self.emit("turn.started", {"turn_id": turn_id}, visibility="user", turn_id=turn_id)
+
+    def finish_turn(self) -> None:
+        if not self.current_turn_id:
+            return
+        event_type = "turn.interrupted" if self.cancelled else "turn.failed" if self.failed else "turn.completed"
+        if not any(event.type == event_type and event.turn_id == self.current_turn_id for event in self.events):
+            self.emit(
+                event_type,
+                {
+                    "turn_id": self.current_turn_id,
+                    "status": self.terminal_status or self.status,
+                    "model_call_count": self.model_call_count,
+                    "tool_call_count": self.tool_call_count,
+                },
+                visibility="user",
+                turn_id=self.current_turn_id,
+            )
+        self.current_turn_id = None
+
+    def start_step(
+        self,
+        kind: StepKind,
+        step_id: str,
+        *,
+        data: dict[str, Any] | None = None,
+        model_call_id: str | None = None,
+    ) -> None:
         self.current_step_kind = kind
         self.current_step_id = step_id
+        if model_call_id is not None:
+            self.current_model_call_id = model_call_id
+        payload = {"step_kind": kind, "step_id": step_id, **(data or {})}
+        if self.current_model_call_id:
+            payload.setdefault("model_call_id", self.current_model_call_id)
+        self.emit("step.started", payload)
+
+    def finish_step(
+        self,
+        status: Literal["completed", "failed", "cancelled", "timeout", "idle_timeout"],
+        *,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        if not self.current_step_id or not self.current_step_kind:
+            return
+        event_type = {
+            "completed": "step.completed",
+            "failed": "step.failed",
+            "cancelled": "step.cancelled",
+            "timeout": "step.timeout",
+            "idle_timeout": "step.idle_timeout",
+        }[status]
+        payload = {"step_kind": self.current_step_kind, "step_id": self.current_step_id, **(data or {})}
+        if self.current_model_call_id:
+            payload.setdefault("model_call_id", self.current_model_call_id)
+        self.emit(event_type, payload, visibility="user" if status != "completed" else "debug")
+        self.set_current_step(None, None)
+
+    def set_current_step(self, kind: StepKind | None, step_id: str | None) -> None:
+        self.current_step_kind = kind
+        self.current_step_id = step_id
+        if kind != "model_call":
+            self.current_model_call_id = None

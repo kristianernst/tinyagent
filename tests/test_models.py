@@ -388,7 +388,7 @@ def test_kernel_writes_exact_openai_compatible_payload_artifact(tmp_path) -> Non
 
     state = kernel.run("write payload artifact", workspace=tmp_path)
 
-    request = next(event for event in state.events if event.type == "model.request.started")
+    request = next(event for event in state.events if event.type == "model.call.started")
     assert request.data["logical_request_artifact"] == "artifacts/model-request-logical-0001.json"
     assert request.data["http_request_artifact"] == "artifacts/model-request-http-0001.json"
     payload = json.loads((state.output_dir / request.data["http_request_artifact"]).read_text())

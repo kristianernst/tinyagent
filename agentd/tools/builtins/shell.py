@@ -64,7 +64,6 @@ class ShellTool:
         except OSError as exc:
             return error_result(self.name, call, exc)
 
-        state.set_current_step("command", call.id)
         try:
             stdout, stderr = _communicate_with_cancel(process, state, timeout)
         except subprocess.TimeoutExpired:
@@ -72,7 +71,7 @@ class ShellTool:
             output = combined_output(stdout, stderr) or f"Command timed out after {timeout}s."
             artifact = write_tool_output_artifact(state, call, "command-output", output, kind="command_output")
             state.emit(
-                "command.completed",
+                "command.timeout",
                 {
                     "tool_call_id": call.id,
                     "cmd": cmd,
@@ -132,14 +131,11 @@ class ShellTool:
                     "output_chars": len(output),
                 },
             )
-        finally:
-            if state.current_step_kind == "command" and state.current_step_id == call.id:
-                state.set_current_step(None, None)
 
         output = combined_output(stdout, stderr) or f"Command exited {process.returncode}."
         artifact = write_tool_output_artifact(state, call, "command-output", output, kind="command_output")
         state.emit(
-            "command.completed",
+            "command.completed" if process.returncode == 0 else "command.failed",
             {
                 "tool_call_id": call.id,
                 "cmd": cmd,

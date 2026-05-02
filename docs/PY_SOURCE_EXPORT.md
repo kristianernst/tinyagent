@@ -17,10 +17,14 @@ from __future__ import annotations
 
 import argparse
 import re
+import signal
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from agentd import __version__
+from agentd.eval_runner import default_eval_output_dir, render_eval_report, run_eval_suite
 from agentd.events import ConsoleTextSink, JsonlStreamSink, debug_level_from_env
 from agentd.kernel import Kernel
 from agentd.models import FakeModelProvider, ProviderError
@@ -28,7 +32,9 @@ from agentd.policy import default_policy
 from agentd.profiles import ApexCoderProfile
 from agentd.providers.openai_compat import OpenAICompatibleProvider
 from agentd.replay import replay_run
-from agentd.state import ModelResponse, ToolCall
+from agentd.run_control import CancelToken, RunCancelled
+from agentd.run_record import load_run_record, render_run_inspection
+from agentd.state import ApprovalRequest, ApprovalResolution, ModelResponse, RunState, ToolCall
 from agentd.tools import default_tools
 
 
@@ -44,6 +50,9 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("task", help="Task for the agent.")
     run_parser.add_argument("--provider", choices=["fake", "openai-compatible"], default="fake")
     run_parser.add_argument("--workspace", default=".")
+    run_parser.add_argument("--workspace-mode", choices=["auto", "worktree", "current"], default="auto")
+    run_parser.add_argument("--approval-mode", choices=["never", "on-request", "yolo"], default="yolo")
+    run_parser.add_argument("--sandbox-mode", choices=["none"], default="none")
     run_parser.add_argument("--run-id")
     run_parser.add_argument("--output-dir", type=Path)
     run_parser.add_argument(
@@ -60,6 +69,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     replay_parser = subparsers.add_parser("replay", help="Replay a recorded agent run.")
     replay_parser.add_argument("run_path", type=Path, help="Run directory or events.jsonl path.")
+
+    inspect_parser = subparsers.add_parser("inspect", help="Inspect a recorded agent run.")
+    inspect_parser.add_argument("run_path", type=Path, help="Run directory or events.jsonl path.")
+
+    eval_parser = subparsers.add_parser("eval", help="Run a local eval suite.")
+    eval_parser.add_argument("suite_path", type=Path, help="Directory containing eval cases.")
+    eval_parser.add_argument("--provider", choices=["fake", "openai-compatible"], default="fake")
+    eval_parser.add_argument("--output-dir", type=Path)
+    eval_parser.add_argument("--workspace-mode", choices=["auto", "worktree", "current"], default="current")
+    eval_parser.add_argument("--approval-mode", choices=["never", "on-request", "yolo"], default="yolo")
+    eval_parser.add_argument("--sandbox-mode", choices=["none"], default="none")
+    eval_parser.add_argument(
+        "--stream",
+        choices=["off", "text", "jsonl"],
+        default="off",
+        help="Stream model progress live while preserving each run trace.",
+    )
+    eval_parser.add_argument(
+        "--debug",
+        type=int,
+        help="Live stream verbosity. Defaults to TINYAGENT_DEBUG or 0.",
+    )
 
     return parser
 
@@ -88,17 +119,41 @@ def main(argv: list[str] | None = None) -> int:
             profile=ApexCoderProfile(),
             tools=default_tools(),
             policy=default_policy(),
+            approval_handler=_CliApprovalHandler() if args.approval_mode == "on-request" else None,
             stream=args.stream != "off",
             event_sink=_stream_sink(args.stream, debug_level),
+            workspace_mode=args.workspace_mode,
+            approval_mode=args.approval_mode,
+            sandbox_mode=args.sandbox_mode,
         )
-        state = kernel.run(args.task, workspace=args.workspace, run_id=args.run_id, output_dir=args.output_dir)
+        cancel_token = CancelToken()
+        try:
+            with _sigint_cancel(cancel_token):
+                state = kernel.run(
+                    args.task,
+                    workspace=args.workspace,
+                    run_id=args.run_id,
+                    output_dir=args.output_dir,
+                    cancel_token=cancel_token,
+                    workspace_mode=args.workspace_mode,
+                    approval_mode=args.approval_mode,
+                    sandbox_mode=args.sandbox_mode,
+                )
+        except RunCancelled:
+            print("run cancelled: sigint")
+            return 130
         if args.stream == "jsonl":
+            if state.cancelled:
+                return 130
             return 1 if state.failed else 0
         if args.stream == "text" and state.final_output:
             print()
         print(f"run_id: {state.run_id}")
         print(f"output_dir: {state.output_dir}")
-        print(f"status: {'failed' if state.failed else 'completed'}")
+        print(f"status: {'cancelled' if state.cancelled else 'failed' if state.failed else 'completed'}")
+        if state.cancelled:
+            print(f"cancellation: {state.cancel_reason or 'cancelled'}")
+            return 130
         if state.failed:
             print(f"failure: {state.failure_reason}")
             return 1
@@ -109,6 +164,44 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "replay":
         print(replay_run(args.run_path), end="")
         return 0
+
+    if args.command == "inspect":
+        print(render_run_inspection(load_run_record(args.run_path)), end="")
+        return 0
+
+    if args.command == "eval":
+        try:
+            debug_level = _debug_level(args.debug)
+        except ValueError as exc:
+            print(f"debug error: {exc}")
+            return 2
+        output_dir = args.output_dir or default_eval_output_dir(args.suite_path)
+        cancel_token = CancelToken()
+        try:
+            with _sigint_cancel(cancel_token):
+                eval_run = run_eval_suite(
+                    args.suite_path,
+                    output_dir=output_dir,
+                    model_factory=lambda task: _model_for(args.provider, task),
+                    profile=ApexCoderProfile(),
+                    tools=default_tools(),
+                    policy=default_policy(),
+                    stream=args.stream != "off",
+                    event_sink=_stream_sink(args.stream, debug_level),
+                    cancel_token=cancel_token,
+                    workspace_mode=args.workspace_mode,
+                    approval_mode=args.approval_mode,
+                    sandbox_mode=args.sandbox_mode,
+                )
+        except RunCancelled:
+            print("eval cancelled: sigint")
+            return 130
+        except (OSError, ValueError, ProviderError) as exc:
+            print(f"eval error: {exc}")
+            return 1
+        report = render_eval_report(eval_run)
+        print(report, end="")
+        return 0 if all(result.success for result in eval_run.results) else 1
 
     parser.error(f"unknown command '{args.command}'")
     return 2
@@ -136,6 +229,38 @@ def _stream_sink(mode: str, debug_level: int):
     if mode == "jsonl":
         return JsonlStreamSink(sys.stdout, debug_level=debug_level)
     return None
+
+
+class _CliApprovalHandler:
+    def resolve(self, request: ApprovalRequest, state: RunState) -> ApprovalResolution:
+        del state
+        print(f"approval requested: {request.action_kind} {request.tool_name}", file=sys.stderr)
+        if request.command:
+            print(f"command: {request.command}", file=sys.stderr)
+        print(f"reason/risk: {request.risk}", file=sys.stderr)
+        raw = input("Approve? [y]es once, [r]un, [n]o: ").strip().lower()
+        if raw in {"y", "yes"}:
+            return ApprovalResolution(request.approval_id, "approved", scope="once", reason="cli_approved_once")
+        if raw in {"r", "run"}:
+            return ApprovalResolution(request.approval_id, "approved", scope="run", reason="cli_approved_run")
+        return ApprovalResolution(request.approval_id, "denied", reason="cli_denied")
+
+
+@contextmanager
+def _sigint_cancel(token: CancelToken) -> Iterator[None]:
+    previous = signal.getsignal(signal.SIGINT)
+
+    def handle_sigint(signum, frame):
+        del signum, frame
+        already_cancelled = token.cancelled
+        token.signal_count += 1
+        token.cancel("sigint", escalate=already_cancelled)
+
+    signal.signal(signal.SIGINT, handle_sigint)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
 
 
 def _fake_responses(task: str) -> list[ModelResponse]:
@@ -293,6 +418,7 @@ def render_environment_context(state: RunState, config: ContextConfig | None = N
     shell = config.shell or os.environ.get("SHELL") or "/bin/sh"
     preflight = state.shell_preflight or {}
     commands = preflight.get("commands") if isinstance(preflight.get("commands"), dict) else {}
+    envelope = state.workspace_envelope
     command_lines = [
         f"    {name}: {bool(commands.get(name, False))}" for name in sorted(set(DEFAULT_SHELL_PREFLIGHT_COMMANDS) | set(commands))
     ]
@@ -304,7 +430,11 @@ def render_environment_context(state: RunState, config: ContextConfig | None = N
             "  shell_preflight:",
             *command_lines,
             f"    python_available: {bool(preflight.get('python_available', False))}",
-            "  sandbox_mode: none",
+            f"  workspace_mode: {envelope.mode if envelope else 'current'}",
+            f"  workspace_effective_mode: {envelope.effective_mode if envelope else 'current'}",
+            f"  approval_mode: {state.approval_mode}",
+            f"  sandbox_mode: {envelope.sandbox_mode if envelope else 'none'}",
+            f"  sandbox_enforced: {bool(envelope.sandbox_enforced) if envelope else False}",
             "  shell_env: sanitized",
             f"  writable_root: {state.workspace.root}",
             "</environment_context>",
@@ -557,7 +687,7 @@ def _collect_event_context(state: RunState, context_state: ContextState) -> None
         elif event.type == "patch.applied":
             for path in data.get("paths", []):
                 context_state.files_changed[str(path)] = "changed by apply_patch"
-        elif event.type == "command.completed":
+        elif event.type in {"command.completed", "command.failed", "command.timeout"}:
             command = str(data.get("cmd", ""))
             if not command:
                 continue
@@ -805,7 +935,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, Protocol
 
 from agentd.model_stream import ModelDelta
-from agentd.state import Message, ModelResponse, PolicyDecision, RunState, ToolCall, ToolResult
+from agentd.state import ApprovalRequest, ApprovalResolution, Message, ModelResponse, PolicyDecision, RunState, ToolCall, ToolResult
 
 
 class Tool(Protocol):
@@ -849,6 +979,10 @@ class PolicyEngine(Protocol):
     def evaluate(self, call: ToolCall, state: RunState) -> PolicyDecision: ...
 
 
+class ApprovalHandler(Protocol):
+    def resolve(self, request: ApprovalRequest, state: RunState) -> ApprovalResolution: ...
+
+
 class Executor(Protocol):
     def run_tool(self, tool: Tool, call: ToolCall, state: RunState) -> ToolResult: ...
 
@@ -856,6 +990,330 @@ class Executor(Protocol):
 class LocalExecutor:
     def run_tool(self, tool: Tool, call: ToolCall, state: RunState) -> ToolResult:
         return tool.run(call, state)
+```
+
+## `agentd/eval_runner.py`
+
+```python
+"""Tiny local eval runner for harness debugging."""
+
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from agentd.contracts import ModelProvider, PolicyEngine, Profile, Tool
+from agentd.events import EventSink
+from agentd.kernel import Kernel
+from agentd.run_control import CancelToken
+from agentd.run_record import RunRecord, load_run_record
+from agentd.state import ApprovalMode
+from agentd.workspace import SandboxMode, WorkspaceMode
+
+ModelFactory = Callable[[str], ModelProvider]
+
+
+@dataclass(frozen=True)
+class EvalCase:
+    id: str
+    task: str
+    validation_command: str = ""
+    timeout_seconds: int = 60
+    setup_git: bool = True
+
+
+@dataclass(frozen=True)
+class EvalResult:
+    case_id: str
+    run_id: str
+    status: str
+    success: bool
+    validation_ok: bool
+    validation_exit_code: int | None
+    run_path: str
+    workspace_path: str
+    duration_seconds: float
+    turn_count: int
+    tool_call_count: int
+    command_count: int
+    patch_count: int
+    final_diff_chars: int
+    failure_reason: str = ""
+    validation_output_path: str = ""
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class EvalRun:
+    suite_path: Path
+    output_dir: Path
+    results: list[EvalResult]
+
+
+def run_eval_suite(
+    suite_path: Path,
+    *,
+    output_dir: Path,
+    model_factory: ModelFactory,
+    profile: Profile,
+    tools: list[Tool],
+    policy: PolicyEngine,
+    stream: bool = False,
+    event_sink: EventSink | None = None,
+    cancel_token: CancelToken | None = None,
+    workspace_mode: WorkspaceMode = "current",
+    approval_mode: ApprovalMode = "yolo",
+    sandbox_mode: SandboxMode = "none",
+) -> EvalRun:
+    suite_path = suite_path.expanduser().resolve()
+    output_dir = output_dir.expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    workspaces_dir = output_dir / "workspaces"
+    runs_dir = output_dir / "runs"
+    validation_dir = output_dir / "validation"
+    for path in (workspaces_dir, runs_dir, validation_dir):
+        path.mkdir(parents=True, exist_ok=True)
+
+    results: list[EvalResult] = []
+    for case in load_eval_cases(suite_path):
+        if cancel_token is not None and cancel_token.cancelled:
+            break
+        result = _run_case(
+            case,
+            suite_path=suite_path,
+            workspace_dir=workspaces_dir / case.id,
+            run_dir=runs_dir / case.id,
+            validation_dir=validation_dir,
+            model_factory=model_factory,
+            profile=profile,
+            tools=tools,
+            policy=policy,
+            stream=stream,
+            event_sink=event_sink,
+            cancel_token=cancel_token,
+            workspace_mode=workspace_mode,
+            approval_mode=approval_mode,
+            sandbox_mode=sandbox_mode,
+        )
+        results.append(result)
+        if result.status == "cancelled":
+            break
+    _write_results(output_dir, suite_path=suite_path, results=results)
+    return EvalRun(suite_path=suite_path, output_dir=output_dir, results=results)
+
+
+def load_eval_cases(suite_path: Path) -> list[EvalCase]:
+    cases: list[EvalCase] = []
+    for case_dir in sorted(path for path in suite_path.iterdir() if path.is_dir()):
+        spec_path = case_dir / "task.json"
+        if not spec_path.exists():
+            continue
+        spec = json.loads(spec_path.read_text())
+        case_id = str(spec.get("id") or case_dir.name)
+        task = str(spec["task"])
+        cases.append(
+            EvalCase(
+                id=case_id,
+                task=task,
+                validation_command=str(spec.get("validation_command") or ""),
+                timeout_seconds=int(spec.get("timeout_seconds") or 60),
+                setup_git=bool(spec.get("setup_git", True)),
+            )
+        )
+    if not cases:
+        raise ValueError(f"No eval cases found in {suite_path}")
+    return cases
+
+
+def render_eval_report(eval_run: EvalRun) -> str:
+    total = len(eval_run.results)
+    passed = sum(1 for result in eval_run.results if result.success)
+    lines = [
+        "# Tinyagent Eval Report",
+        "",
+        f"suite: {eval_run.suite_path}",
+        f"output_dir: {eval_run.output_dir}",
+        f"cases: {total}",
+        f"successes: {passed}",
+        "",
+        "| Case | Success | Run | Validation | Turns | Tools | Commands | Patch | Diff chars |",
+        "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for result in eval_run.results:
+        lines.append(
+            "| "
+            f"{result.case_id} | {str(result.success).lower()} | {result.status} | "
+            f"{str(result.validation_ok).lower()} | {result.turn_count} | {result.tool_call_count} | "
+            f"{result.command_count} | {result.patch_count} | {result.final_diff_chars} |"
+        )
+    failures = [result for result in eval_run.results if not result.success]
+    if failures:
+        lines.extend(["", "## Failures"])
+        for result in failures:
+            reason = result.failure_reason or f"validation exit {result.validation_exit_code}"
+            lines.append(f"- {result.case_id}: {reason}")
+    return "\n".join(lines) + "\n"
+
+
+def default_eval_output_dir(suite_path: Path) -> Path:
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    return Path(".tinyagent") / "evals" / f"{suite_path.name}-{timestamp}"
+
+
+def _run_case(
+    case: EvalCase,
+    *,
+    suite_path: Path,
+    workspace_dir: Path,
+    run_dir: Path,
+    validation_dir: Path,
+    model_factory: ModelFactory,
+    profile: Profile,
+    tools: list[Tool],
+    policy: PolicyEngine,
+    stream: bool,
+    event_sink: EventSink | None,
+    cancel_token: CancelToken | None,
+    workspace_mode: WorkspaceMode,
+    approval_mode: ApprovalMode,
+    sandbox_mode: SandboxMode,
+) -> EvalResult:
+    case_dir = suite_path / case.id
+    _prepare_workspace(case_dir, workspace_dir, setup_git=case.setup_git)
+    kernel = Kernel(
+        model=model_factory(case.task),
+        profile=profile,
+        tools=tools,
+        policy=policy,
+        stream=stream,
+        event_sink=event_sink,
+        workspace_mode=workspace_mode,
+        approval_mode=approval_mode,
+        sandbox_mode=sandbox_mode,
+    )
+    kernel.run(
+        case.task,
+        workspace=workspace_dir,
+        run_id=case.id,
+        output_dir=run_dir,
+        cancel_token=cancel_token,
+        workspace_mode=workspace_mode,
+        approval_mode=approval_mode,
+        sandbox_mode=sandbox_mode,
+    )
+    record = load_run_record(run_dir)
+    validation_exit_code = None
+    validation_ok = True
+    validation_output_path = ""
+    if case.validation_command and record.status == "completed":
+        validation_exit_code, validation_output_path = _run_validation(case, workspace_dir, validation_dir)
+        validation_ok = validation_exit_code == 0
+    elif case.validation_command:
+        validation_ok = False
+    success = record.status == "completed" and validation_ok
+    return _result_from_record(
+        case,
+        record,
+        workspace_dir=workspace_dir,
+        success=success,
+        validation_ok=validation_ok,
+        validation_exit_code=validation_exit_code,
+        validation_output_path=validation_output_path,
+    )
+
+
+def _prepare_workspace(case_dir: Path, workspace_dir: Path, *, setup_git: bool) -> None:
+    if workspace_dir.exists():
+        shutil.rmtree(workspace_dir)
+    files_dir = case_dir / "files"
+    if files_dir.exists():
+        shutil.copytree(files_dir, workspace_dir)
+    else:
+        workspace_dir.mkdir(parents=True)
+    if setup_git:
+        subprocess.run(["git", "init"], cwd=workspace_dir, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "add", "."], cwd=workspace_dir, check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "-c", "user.email=tinyagent@example.test", "-c", "user.name=tinyagent", "commit", "-m", "init"],
+            cwd=workspace_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+
+def _run_validation(case: EvalCase, workspace_dir: Path, validation_dir: Path) -> tuple[int, str]:
+    output_path = validation_dir / f"{case.id}.txt"
+    try:
+        result = subprocess.run(
+            case.validation_command,
+            cwd=workspace_dir,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=case.timeout_seconds,
+            check=False,
+        )
+        output = _combined_output(result.stdout, result.stderr) or f"validation exited {result.returncode}\n"
+        output_path.write_text(output)
+        return result.returncode, output_path.relative_to(validation_dir.parent).as_posix()
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+        output_path.write_text(_combined_output(stdout, stderr) or f"validation timed out after {case.timeout_seconds}s\n")
+        return 124, output_path.relative_to(validation_dir.parent).as_posix()
+
+
+def _result_from_record(
+    case: EvalCase,
+    record: RunRecord,
+    *,
+    workspace_dir: Path,
+    success: bool,
+    validation_ok: bool,
+    validation_exit_code: int | None,
+    validation_output_path: str,
+) -> EvalResult:
+    return EvalResult(
+        case_id=case.id,
+        run_id=record.run_id,
+        status=record.status,
+        success=success,
+        validation_ok=validation_ok,
+        validation_exit_code=validation_exit_code,
+        run_path=record.run_path,
+        workspace_path=str(workspace_dir),
+        duration_seconds=record.duration_seconds,
+        turn_count=record.turn_count,
+        tool_call_count=record.tool_call_count,
+        command_count=record.command_count,
+        patch_count=record.patch_count,
+        final_diff_chars=record.final_diff_chars,
+        failure_reason=record.failure_reason,
+        validation_output_path=validation_output_path,
+    )
+
+
+def _write_results(output_dir: Path, *, suite_path: Path, results: list[EvalResult]) -> None:
+    (output_dir / "results.jsonl").write_text(
+        "".join(json.dumps(result.to_json_dict(), sort_keys=True) + "\n" for result in results)
+    )
+    eval_run = EvalRun(suite_path=suite_path, output_dir=output_dir, results=results)
+    (output_dir / "report.md").write_text(render_eval_report(eval_run))
+
+
+def _combined_output(stdout: str, stderr: str) -> str:
+    if stdout and stderr:
+        return f"{stdout}\n{stderr}"
+    return stdout or stderr
 ```
 
 ## `agentd/events.py`
@@ -882,78 +1340,158 @@ DURABLE_EVENT_TYPES = frozenset(
         "run.started",
         "run.completed",
         "run.failed",
+        "run.cancel.requested",
+        "run.cancelled",
+        "run.timed_out",
+        "turn.started",
+        "turn.completed",
+        "turn.interrupted",
+        "turn.failed",
+        "step.started",
+        "step.completed",
+        "step.failed",
+        "step.cancel.requested",
+        "step.cancelled",
+        "step.timeout",
+        "step.idle_timeout",
+        "workspace.opened",
+        "workspace.boundary",
+        "workspace.dirty.detected",
+        "workspace.mutation.planned",
+        "workspace.mutation.started",
+        "workspace.mutation.completed",
+        "workspace.escape.detected",
+        "worktree.created",
         "context.built",
         "compaction.started",
         "checkpoint.completed",
-        "model.request.started",
-        "model.stream.started",
-        "model.completed",
-        "model.failed",
+        "model.call.started",
+        "model.call.completed",
+        "model.call.failed",
+        "model.message.completed",
+        "model.tool_call.assembly.started",
+        "model.tool_call.assembly.completed",
+        "model.tool_call.assembly.failed",
+        "model.reasoning.completed",
+        "model.timeout",
+        "model.idle_timeout",
+        "model.cancelled",
         "model.usage",
-        "message.completed",
-        "tool.call.started",
-        "tool.args.completed",
-        "tool.policy.evaluated",
+        "policy.evaluated",
+        "approval.requested",
+        "approval.resolved",
+        "approval.expired",
         "tool.execution.started",
+        "tool.execution.output.snapshot",
         "tool.execution.completed",
         "tool.execution.failed",
+        "tool.execution.cancelled",
+        "tool.execution.blocked",
         "shell.preflight.completed",
         "files.listed",
         "file.read",
         "search.completed",
         "command.started",
         "command.completed",
+        "command.failed",
+        "command.cancelled",
+        "command.timeout",
         "patch.applied",
         "diff.finalized",
         "artifact.created",
+        "artifact.finalization.started",
+        "artifact.materialized",
+        "artifact.finalization.completed",
+        "artifact.finalization.failed",
     }
 )
 
 LIVE_ONLY_EVENT_TYPES = frozenset(
     {
         "model.text.delta",
-        "reasoning.summary.delta",
-        "reasoning.visible.delta",
+        "model.reasoning.delta",
         "reasoning.encrypted",
-        "tool.args.delta",
+        "model.tool_call.args.delta",
+        "tool.execution.output.delta",
+        "command.output.delta",
     }
 )
 
 EVENT_TYPES = DURABLE_EVENT_TYPES | LIVE_ONLY_EVENT_TYPES
 
 EVENT_DEBUG_LEVELS = {
-    **dict.fromkeys(
-        ("run.started", "run.completed", "run.failed", "message.completed", "model.text.delta", "model.failed"),
-        0,
-    ),
-    **dict.fromkeys(
-        ("model.request.started", "model.stream.started", "model.completed", "model.usage", "diff.finalized", "reasoning.summary.delta"),
-        1,
-    ),
-    **dict.fromkeys(
-        (
-            "context.built",
-            "compaction.started",
-            "checkpoint.completed",
-            "tool.call.started",
-            "tool.args.completed",
-            "tool.policy.evaluated",
-            "tool.execution.started",
-            "tool.execution.completed",
-            "tool.execution.failed",
-            "shell.preflight.completed",
-            "files.listed",
-            "file.read",
-            "search.completed",
-            "command.started",
-            "command.completed",
-            "patch.applied",
-            "artifact.created",
-            "tool.args.delta",
-        ),
-        2,
-    ),
-    **dict.fromkeys(("reasoning.visible.delta", "reasoning.encrypted"), 4),
+    "run.started": 0,
+    "run.completed": 0,
+    "run.failed": 0,
+    "run.cancel.requested": 0,
+    "run.cancelled": 0,
+    "run.timed_out": 0,
+    "turn.started": 1,
+    "turn.completed": 1,
+    "turn.interrupted": 1,
+    "turn.failed": 1,
+    "step.started": 2,
+    "step.completed": 2,
+    "step.failed": 2,
+    "step.cancel.requested": 1,
+    "step.cancelled": 1,
+    "step.timeout": 1,
+    "step.idle_timeout": 1,
+    "workspace.opened": 1,
+    "workspace.boundary": 1,
+    "workspace.dirty.detected": 1,
+    "workspace.mutation.planned": 2,
+    "workspace.mutation.started": 2,
+    "workspace.mutation.completed": 2,
+    "workspace.escape.detected": 0,
+    "worktree.created": 1,
+    "model.message.completed": 0,
+    "model.text.delta": 0,
+    "model.call.failed": 0,
+    "model.call.started": 1,
+    "model.call.completed": 1,
+    "model.cancelled": 1,
+    "model.timeout": 1,
+    "model.idle_timeout": 1,
+    "model.usage": 1,
+    "model.tool_call.assembly.started": 2,
+    "model.tool_call.assembly.completed": 2,
+    "model.tool_call.assembly.failed": 1,
+    "model.tool_call.args.delta": 2,
+    "model.reasoning.delta": 1,
+    "model.reasoning.completed": 1,
+    "diff.finalized": 1,
+    "context.built": 2,
+    "compaction.started": 2,
+    "checkpoint.completed": 2,
+    "policy.evaluated": 2,
+    "approval.requested": 1,
+    "approval.resolved": 1,
+    "approval.expired": 1,
+    "tool.execution.started": 2,
+    "tool.execution.output.delta": 2,
+    "tool.execution.output.snapshot": 2,
+    "tool.execution.completed": 2,
+    "tool.execution.failed": 2,
+    "tool.execution.cancelled": 2,
+    "tool.execution.blocked": 1,
+    "shell.preflight.completed": 2,
+    "files.listed": 2,
+    "file.read": 2,
+    "search.completed": 2,
+    "command.started": 2,
+    "command.output.delta": 3,
+    "command.completed": 2,
+    "command.failed": 2,
+    "command.cancelled": 2,
+    "command.timeout": 2,
+    "patch.applied": 2,
+    "artifact.created": 2,
+    "artifact.finalization.started": 2,
+    "artifact.materialized": 2,
+    "artifact.finalization.completed": 2,
+    "artifact.finalization.failed": 1,
+    "reasoning.encrypted": 4,
 }
 
 VISIBILITY_DEBUG_LEVELS = {
@@ -981,7 +1519,10 @@ def debug_level_from_env(env: dict[str, str] | None = None) -> int:
 
 
 def event_debug_level(event: Event) -> int:
-    return EVENT_DEBUG_LEVELS.get(event.type, VISIBILITY_DEBUG_LEVELS.get(event.visibility, 1))
+    level = EVENT_DEBUG_LEVELS.get(event.type, 1)
+    if event.visibility == "internal":
+        return max(level, VISIBILITY_DEBUG_LEVELS["internal"])
+    return level
 
 
 def json_safe(value: Any) -> Any:
@@ -1136,9 +1677,10 @@ from collections.abc import Iterable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from agentd.context import BuiltContext, estimate_messages_tokens, estimate_tools_tokens, message_text
-from agentd.contracts import Executor, LocalExecutor, ModelProvider, PolicyEngine, Profile, Tool
+from agentd.contracts import ApprovalHandler, Executor, LocalExecutor, ModelProvider, PolicyEngine, Profile, Tool
 from agentd.events import EventSink, json_safe
 from agentd.model_stream import complete_model_call
 from agentd.output import (
@@ -1148,8 +1690,22 @@ from agentd.output import (
     write_model_response_artifact,
     write_run_outputs,
 )
-from agentd.state import Message, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, ToolStep, Workspace
+from agentd.run_control import CancelToken, RunCancelled
+from agentd.state import (
+    ApprovalGrant,
+    ApprovalMode,
+    ApprovalRequest,
+    ApprovalResolution,
+    Message,
+    PolicyDecision,
+    RunBudgets,
+    RunState,
+    ToolCall,
+    ToolResult,
+    ToolStep,
+)
 from agentd.tools.builtins.shell import shell_preflight
+from agentd.workspace import SandboxMode, WorkspaceMode, prepare_workspace
 
 MAX_EVENT_DATA_CHARS = 4_000
 
@@ -1164,19 +1720,27 @@ class Kernel:
         profile: Profile,
         tools: Iterable[Tool],
         policy: PolicyEngine,
+        approval_handler: ApprovalHandler | None = None,
         executor: Executor | None = None,
         budgets: RunBudgets | None = None,
         stream: bool = False,
         event_sink: EventSink | None = None,
+        approval_mode: ApprovalMode = "yolo",
+        workspace_mode: WorkspaceMode = "auto",
+        sandbox_mode: SandboxMode = "none",
     ) -> None:
         self.model = model
         self.profile = profile
         self.tools = {tool.name: tool for tool in tools}
         self.policy = policy
+        self.approval_handler = approval_handler
         self.executor = executor or LocalExecutor()
         self.budgets = budgets or RunBudgets()
         self.stream = stream
         self.event_sink = event_sink
+        self.approval_mode = approval_mode
+        self.workspace_mode = workspace_mode
+        self.sandbox_mode = sandbox_mode
 
     def run(
         self,
@@ -1187,14 +1751,30 @@ class Kernel:
         output_dir: Path | None = None,
         stream: bool | None = None,
         event_sink: EventSink | None = None,
+        cancel_token: CancelToken | None = None,
+        workspace_mode: WorkspaceMode | None = None,
+        approval_mode: ApprovalMode | None = None,
+        sandbox_mode: SandboxMode | None = None,
     ) -> RunState:
+        resolved_run_id = run_id or f"run_{uuid4().hex}"
+        prepared_workspace = prepare_workspace(
+            Path(workspace),
+            mode=workspace_mode or self.workspace_mode,
+            run_id=resolved_run_id,
+            sandbox_mode=sandbox_mode or self.sandbox_mode,
+        )
         state = RunState.create(
             task,
-            Workspace(Path(workspace)),
+            prepared_workspace.workspace,
             budgets=self.budgets,
-            run_id=run_id,
+            run_id=resolved_run_id,
             output_dir=output_dir,
         )
+        state.workspace_envelope = prepared_workspace.envelope
+        state.approval_mode = approval_mode or self.approval_mode
+        state.status = "running"
+        if cancel_token is not None:
+            state.cancel_token = cancel_token
         use_stream = self.stream if stream is None else stream
         state.stream_sink = event_sink if event_sink is not None else self.event_sink
         state.emit(
@@ -1202,21 +1782,39 @@ class Kernel:
             {
                 "task": task,
                 "workspace_root": str(state.workspace.root),
+                "original_workspace_root": (
+                    str(state.workspace_envelope.original_root)
+                    if state.workspace_envelope
+                    else str(Path(workspace).expanduser().resolve())
+                ),
                 "budgets": state.budgets.to_json_dict(),
                 "stream": use_stream,
+                "workspace_mode": state.workspace_envelope.mode if state.workspace_envelope else (workspace_mode or self.workspace_mode),
+                "approval_mode": state.approval_mode,
+                "sandbox_mode": state.workspace_envelope.sandbox_mode if state.workspace_envelope else (sandbox_mode or self.sandbox_mode),
+                "sandbox_enforced": bool(state.workspace_envelope.sandbox_enforced) if state.workspace_envelope else False,
             },
         )
+        self._emit_workspace_boundary(state, prepared_workspace.worktree_created)
         if "shell" in self.tools:
             state.shell_preflight = shell_preflight()
             state.emit("shell.preflight.completed", state.shell_preflight)
 
         try:
+            state.raise_if_cancelled()
+            state.start_turn("turn-0001")
             self._run_loop(state, stream=use_stream)
+        except RunCancelled as exc:
+            state.request_cancel(
+                str(exc) or "cancelled",
+                source="sigint" if state.cancel_token.reason == "sigint" else "harness",
+                escalate=state.cancel_token.escalated,
+            )
         except Exception as exc:  # pragma: no cover - defensive boundary
             state.fail(f"Unhandled exception: {exc}")
         finally:
-            self._finalize_message(state)
-            capture_final_diff(state)
+            self._finalize_artifacts(state)
+            state.finish_turn()
             self._finalize_run(state)
             write_run_outputs(state)
 
@@ -1224,6 +1822,7 @@ class Kernel:
 
     def _run_loop(self, state: RunState, *, stream: bool) -> None:
         while not state.done:
+            state.raise_if_cancelled()
             if self._budget_exhausted(state):
                 return
             if not self.profile.should_continue(state):
@@ -1251,7 +1850,8 @@ class Kernel:
                     "checkpoint_artifact": state.context_checkpoint_artifact or None,
                 },
             )
-            model_call_index = state.turn_count + 1
+            model_call_index = state.model_call_count + 1
+            model_call_id = f"model-call-{model_call_index:04d}"
             context_artifact, request_artifact = write_model_request_artifacts(
                 state,
                 call_index=model_call_index,
@@ -1267,12 +1867,15 @@ class Kernel:
                 stream=stream,
             )
             state.emit(
-                "model.request.started",
+                "model.call.started",
                 {
                     "provider": self.model.name,
+                    "model_call_id": model_call_id,
+                    "model_call_index": model_call_index,
                     "base_url": _provider_base_url(self.model),
                     "message_count": len(messages),
                     "tool_count": len(visible_tools),
+                    "stream": stream,
                     "context_artifact": context_artifact,
                     "logical_request_artifact": request_artifact,
                     "http_request_artifact": http_request_artifact,
@@ -1280,6 +1883,12 @@ class Kernel:
             )
 
             try:
+                state.start_step(
+                    "model_call",
+                    model_call_id,
+                    model_call_id=model_call_id,
+                    data={"provider": self.model.name, "model_call_index": model_call_index},
+                )
                 response = complete_model_call(
                     self.model,
                     messages,
@@ -1288,21 +1897,60 @@ class Kernel:
                     call_index=model_call_index,
                     stream=stream,
                 )
+            except RunCancelled:
+                state.emit(
+                    "model.cancelled",
+                    {
+                        "provider": self.model.name,
+                        "model_call_id": model_call_id,
+                        "model_call_index": model_call_index,
+                        "reason": state.cancel_reason or state.cancel_token.reason or "cancelled",
+                    },
+                    visibility="user",
+                )
+                state.finish_step("cancelled", data={"reason": state.cancel_reason or "cancelled"})
+                raise
             except Exception as exc:
-                state.emit("model.failed", {"provider": self.model.name, "reason": str(exc), "turn": model_call_index})
+                event_type = _model_error_event_type(exc)
+                state.emit(
+                    event_type,
+                    {
+                        "provider": self.model.name,
+                        "reason": str(exc),
+                        "model_call_id": model_call_id,
+                        "model_call_index": model_call_index,
+                    },
+                    visibility="user",
+                )
+                step_status = (
+                    "idle_timeout"
+                    if event_type == "model.idle_timeout"
+                    else "timeout"
+                    if event_type == "model.timeout"
+                    else "failed"
+                )
+                state.finish_step(step_status)
                 state.fail(f"Model provider error: {exc}")
                 return
-            state.turn_count += 1
+            state.model_call_count += 1
+            self._record_model_tool_calls(
+                state,
+                response,
+                provider=self.model.name,
+                model_call_id=model_call_id,
+                model_call_index=model_call_index,
+            )
             response_artifact = write_model_response_artifact(
                 state,
                 call_index=model_call_index,
                 response=response,
             )
             state.emit(
-                "model.completed",
+                "model.call.completed",
                 {
                     "provider": self.model.name,
-                    "turn": model_call_index,
+                    "model_call_id": model_call_id,
+                    "model_call_index": model_call_index,
                     "content_length": len(response.content),
                     "tool_call_count": len(response.tool_calls),
                     "finish_reason": response.finish_reason,
@@ -1310,6 +1958,7 @@ class Kernel:
                     "streamed": bool(response.raw.get("streamed")),
                 },
             )
+            state.finish_step("completed", data={"provider": self.model.name})
 
             if not response.tool_calls:
                 if response.content:
@@ -1319,6 +1968,7 @@ class Kernel:
                 return
 
             for call in response.tool_calls:
+                state.raise_if_cancelled()
                 if self._tool_budget_exhausted(state):
                     return
                 self._dispatch_tool_call(state, call, visible_tool_names=visible_tool_names)
@@ -1330,17 +1980,7 @@ class Kernel:
                 return
 
     def _dispatch_tool_call(self, state: RunState, call: ToolCall, *, visible_tool_names: frozenset[str]) -> None:
-        args_preview = _small_event_data(call.args)
-        state.emit("tool.call.started", {"tool_call_id": call.id, "tool": call.name})
-        state.emit(
-            "tool.args.completed",
-            {
-                "tool_call_id": call.id,
-                "tool": call.name,
-                "args": args_preview,
-                "args_preview": args_preview,
-            },
-        )
+        state.raise_if_cancelled()
         state.tool_call_count += 1
 
         tool = self.tools.get(call.name)
@@ -1354,6 +1994,7 @@ class Kernel:
             )
             self._append_tool_step(state, call, result)
             self._record_tool_result(state, call, result)
+            self._record_tool_blocked(state, call, result.output)
             return
 
         if call.name not in visible_tool_names:
@@ -1366,6 +2007,7 @@ class Kernel:
             )
             self._append_tool_step(state, call, result)
             self._record_tool_result(state, call, result)
+            self._record_tool_blocked(state, call, result.output)
             return
 
         try:
@@ -1382,10 +2024,15 @@ class Kernel:
             )
             self._append_tool_step(state, call, result)
             self._record_tool_result(state, call, result)
+            self._record_tool_blocked(state, call, result.output)
             state.fail(decision.reason)
             return
 
         self._record_policy_decision(state, call, decision)
+        if decision.kind == "needs_approval":
+            decision = self._resolve_approval(state, call, decision)
+            if decision.kind == "deny":
+                self._record_policy_decision(state, call, decision)
         if not decision.allowed:
             result = ToolResult(
                 tool_name=call.name,
@@ -1396,11 +2043,29 @@ class Kernel:
             )
             self._append_tool_step(state, call, result)
             self._record_tool_result(state, call, result)
+            self._record_tool_blocked(state, call, result.output)
             return
 
-        state.emit("tool.execution.started", {"tool_call_id": call.id, "tool": call.name})
+        tool_execution_id = f"tool-exec-{call.id}"
+        self._record_mutation_event(state, "workspace.mutation.planned", call)
+        self._record_mutation_event(state, "workspace.mutation.started", call)
+        state.emit("tool.execution.started", {"tool_call_id": call.id, "tool_execution_id": tool_execution_id, "tool": call.name})
+        state.start_step("tool_execution", tool_execution_id, data={"tool_call_id": call.id, "tool": call.name})
         try:
             result = self.executor.run_tool(tool, call, state)
+        except RunCancelled as exc:
+            state.request_cancel(
+                str(exc) or "cancelled",
+                source="sigint" if state.cancel_token.reason == "sigint" else "harness",
+                escalate=state.cancel_token.escalated,
+            )
+            result = ToolResult(
+                tool_name=call.name,
+                call_id=call.id,
+                output=state.cancel_reason or "cancelled",
+                ok=False,
+                data={"cancelled": True, "reason": state.cancel_reason or "cancelled"},
+            )
         except Exception as exc:
             result = ToolResult(
                 tool_name=call.name,
@@ -1419,11 +2084,44 @@ class Kernel:
             )
         self._append_tool_step(state, call, result)
         self._record_tool_result(state, call, result)
+        if result.data.get("cancelled"):
+            state.finish_step("cancelled", data={"reason": result.data.get("reason") or "cancelled"})
+        elif result.ok:
+            state.finish_step("completed", data={"tool_call_id": call.id, "tool": call.name})
+        else:
+            state.finish_step("failed", data={"tool_call_id": call.id, "tool": call.name})
+        self._record_mutation_event(state, "workspace.mutation.completed", call, ok=result.ok)
+        if result.data.get("cancelled"):
+            state.request_cancel(str(result.data.get("reason") or state.cancel_reason or "cancelled"))
 
     def _record_tool_result(self, state: RunState, call: ToolCall, result: ToolResult) -> None:
+        if result.data.get("cancelled"):
+            state.emit(
+                "tool.execution.cancelled",
+                {
+                    "tool_call_id": call.id,
+                    "tool": call.name,
+                    "reason": result.data.get("reason") or state.cancel_reason or "cancelled",
+                    "output": result.output[: state.budgets.max_command_output_chars_visible],
+                    "output_chars": _output_chars(result),
+                    "data": _small_event_data(result.data),
+                },
+                visibility="user",
+            )
+            return
         output_limit = state.budgets.max_command_output_chars_visible
         output = result.output[:output_limit]
         output_chars = _output_chars(result)
+        if result.data.get("output_artifact"):
+            state.emit(
+                "tool.execution.output.snapshot",
+                {
+                    "tool_call_id": call.id,
+                    "tool": call.name,
+                    "output_chars": output_chars,
+                    "output_artifact": result.data.get("output_artifact"),
+                },
+            )
         state.emit(
             "tool.execution.completed" if result.ok else "tool.execution.failed",
             {
@@ -1442,22 +2140,150 @@ class Kernel:
         state.tool_steps.append(ToolStep(call=call, result=result))
 
     def _record_policy_decision(self, state: RunState, call: ToolCall, decision: PolicyDecision) -> None:
+        approval_id = decision.approval.approval_id if decision.approval else None
         state.emit(
-            "tool.policy.evaluated",
+            "policy.evaluated",
             {
                 "tool_call_id": call.id,
                 "tool": call.name,
+                "kind": decision.kind,
                 "allowed": decision.allowed,
                 "reason": decision.reason,
                 "redacted": decision.redacted,
+                "approval_id": approval_id,
             },
         )
+
+    def _record_tool_blocked(self, state: RunState, call: ToolCall, reason: str) -> None:
+        state.emit(
+            "tool.execution.blocked",
+            {
+                "tool_call_id": call.id,
+                "tool": call.name,
+                "reason": reason,
+            },
+            visibility="user",
+        )
+
+    def _resolve_approval(self, state: RunState, call: ToolCall, decision: PolicyDecision) -> PolicyDecision:
+        approval = decision.approval
+        if approval is None:
+            return PolicyDecision.deny(decision.reason or "approval request missing")
+
+        grant = state.approval_grants.get(approval.grant_key())
+        if grant is not None:
+            state.emit(
+                "approval.resolved",
+                {
+                    "approval_id": approval.approval_id,
+                    "decision": "approved",
+                    "scope": grant.scope,
+                    "reason": "approval_grant",
+                },
+                visibility="user",
+            )
+            return PolicyDecision.allow("approved by run-scoped grant")
+
+        state.pending_approvals[approval.approval_id] = approval
+        state.emit("approval.requested", approval.to_json_dict(), visibility="user")
+
+        if state.approval_mode == "never":
+            resolution = ApprovalResolution(
+                approval_id=approval.approval_id,
+                decision="denied",
+                reason="approval_mode_never",
+            )
+        elif state.approval_mode == "yolo":
+            resolution = _yolo_resolution(approval)
+        elif self.approval_handler is not None:
+            state.start_step("approval_wait", f"approval-{approval.approval_id}", data={"approval_id": approval.approval_id})
+            try:
+                resolution = self.approval_handler.resolve(approval, state)
+            except RunCancelled:
+                state.finish_step("cancelled", data={"approval_id": approval.approval_id})
+                raise
+            except Exception as exc:
+                resolution = ApprovalResolution(
+                    approval_id=approval.approval_id,
+                    decision="denied",
+                    reason=f"approval handler error: {exc}",
+                )
+            else:
+                state.finish_step("completed", data={"approval_id": approval.approval_id, "decision": resolution.decision})
+        else:
+            resolution = ApprovalResolution(
+                approval_id=approval.approval_id,
+                decision="denied",
+                reason="approval_handler_unavailable",
+            )
+
+        state.pending_approvals.pop(approval.approval_id, None)
+        state.emit("approval.resolved", resolution.to_json_dict(), visibility="user")
+        if resolution.decision == "approved":
+            if resolution.scope == "run":
+                state.approval_grants[approval.grant_key()] = ApprovalGrant(
+                    approval_id=approval.approval_id,
+                    grant_key=approval.grant_key(),
+                    scope="run",
+                )
+            return PolicyDecision.allow(resolution.reason or "approved")
+        return PolicyDecision.deny(resolution.reason or f"approval {resolution.decision}")
+
+    def _record_model_tool_calls(
+        self,
+        state: RunState,
+        response,
+        *,
+        provider: str,
+        model_call_id: str,
+        model_call_index: int,
+    ) -> None:
+        for call in response.tool_calls:
+            already = any(
+                event.type == "model.tool_call.assembly.completed" and event.data.get("tool_call_id") == call.id
+                for event in state.events
+            )
+            if already:
+                continue
+            state.emit(
+                "model.tool_call.assembly.started",
+                {
+                    "provider": provider,
+                    "model_call_id": model_call_id,
+                    "model_call_index": model_call_index,
+                    "tool_call_id": call.id,
+                    "tool": call.name,
+                },
+            )
+            state.emit(
+                "model.tool_call.assembly.completed",
+                {
+                    "provider": provider,
+                    "model_call_id": model_call_id,
+                    "model_call_index": model_call_index,
+                    "tool_call_id": call.id,
+                    "tool": call.name,
+                    "args": _small_event_data(call.args),
+                },
+            )
+
+    def _record_mutation_event(self, state: RunState, event_type: str, call: ToolCall, *, ok: bool | None = None) -> None:
+        if call.name not in {"apply_patch", "shell"}:
+            return
+        data: dict[str, Any] = {
+            "tool_call_id": call.id,
+            "tool": call.name,
+            "workspace_root": str(state.workspace.root),
+        }
+        if ok is not None:
+            data["ok"] = ok
+        state.emit(event_type, data)
 
     def _budget_exhausted(self, state: RunState) -> bool:
         if state.elapsed_seconds() > state.budgets.max_run_seconds:
             state.fail("Run exceeded max_run_seconds budget.")
             return True
-        if state.turn_count >= state.budgets.max_turns:
+        if state.model_call_count >= state.budgets.max_turns:
             state.fail("Run exceeded max_turns budget.")
             return True
         if state.tool_call_count >= state.budgets.max_tool_calls:
@@ -1488,15 +2314,43 @@ class Kernel:
             return None
         return write_model_http_request_artifact(state, call_index=call_index, payload=payload)
 
+    def _emit_workspace_boundary(self, state: RunState, worktree_created: bool) -> None:
+        envelope = state.workspace_envelope
+        if envelope is None:
+            return
+        state.emit(
+            "workspace.opened",
+            {
+                "root": str(envelope.root),
+                "original_root": str(envelope.original_root),
+                "mode": envelope.mode,
+                "effective_mode": envelope.effective_mode,
+            },
+        )
+        dirty = envelope.dirty_state_before
+        if dirty.is_git_repo and not dirty.clean:
+            state.emit("workspace.dirty.detected", dirty.to_json_dict(), visibility="user")
+        if worktree_created:
+            state.emit(
+                "worktree.created",
+                {
+                    "path": str(envelope.worktree_path),
+                    "git_head": envelope.git_head_before,
+                    "original_root": str(envelope.original_root),
+                },
+                visibility="user",
+            )
+        state.emit("workspace.boundary", envelope.to_json_dict(), visibility="user")
+
     def _finalize_message(self, state: RunState) -> None:
-        if not state.done and not state.failed:
+        if not state.done and not state.failed and not state.cancelled:
             state.finish("Run finished without explicit final output.")
         if not state.final_output:
             return
-        if any(event.type == "message.completed" for event in state.events):
+        if any(event.type == "model.message.completed" and event.data.get("output_path") == "final.md" for event in state.events):
             return
         state.emit(
-            "message.completed",
+            "model.message.completed",
             {
                 "role": "assistant",
                 "content_chars": len(state.final_output),
@@ -1505,19 +2359,51 @@ class Kernel:
             visibility="user",
         )
 
+    def _finalize_artifacts(self, state: RunState) -> None:
+        state.finalization_attempted = True
+        state.start_step("artifact_finalization", "artifact-finalization-0001")
+        state.emit("artifact.finalization.started", {"output_dir": str(state.output_dir)})
+        try:
+            self._finalize_message(state)
+            capture_final_diff(state)
+            for path in ("final.md", "metrics.json", "final.diff"):
+                state.emit("artifact.materialized", {"path": path, "kind": "run_output"})
+            state.emit("artifact.finalization.completed", {"output_dir": str(state.output_dir)})
+            state.finish_step("completed")
+        except Exception as exc:  # pragma: no cover - defensive finalization boundary
+            state.emit("artifact.finalization.failed", {"reason": str(exc)}, visibility="user")
+            state.finish_step("failed", data={"reason": str(exc)})
+            if not state.failed and not state.cancelled:
+                state.fail(f"artifact finalization failed: {exc}")
+
     def _finalize_run(self, state: RunState) -> None:
-        event_type = "run.failed" if state.failed else "run.completed"
+        event_type = "run.cancelled" if state.cancelled else "run.failed" if state.failed else "run.completed"
         if any(event.type == event_type for event in state.events):
             return
         data = {
-            "status": "failed" if state.failed else "completed",
+            "status": "cancelled" if state.cancelled else "failed" if state.failed else "completed",
             "turn_count": state.turn_count,
+            "model_call_count": state.model_call_count,
             "tool_call_count": state.tool_call_count,
             "final_output_chars": len(state.final_output),
             "duration_seconds": state.elapsed_seconds(),
+            "workspace_mode": state.workspace_envelope.mode if state.workspace_envelope else None,
+            "workspace_effective_mode": state.workspace_envelope.effective_mode if state.workspace_envelope else None,
+            "approval_mode": state.approval_mode,
+            "sandbox_mode": state.workspace_envelope.sandbox_mode if state.workspace_envelope else "none",
+            "sandbox_enforced": state.workspace_envelope.sandbox_enforced if state.workspace_envelope else False,
+            "finalization_attempted": state.finalization_attempted,
         }
+        if state.cancelled:
+            data["reason"] = state.cancel_reason or "cancelled"
+            data["current_step_kind"] = state.current_step_kind
+            data["current_step_id"] = state.current_step_id
+            data["escalated"] = state.cancel_escalated
+            data["signal_count"] = max(state.cancel_signal_count, state.cancel_token.signal_count)
         if state.failed:
             data["reason"] = state.failure_reason or "Unknown failure"
+        if state.cancelled:
+            state.status = "cancelled"
         state.emit(event_type, data)
 
     def _build_context(self, state: RunState, visible_tools: list[Tool]) -> BuiltContext:
@@ -1576,6 +2462,30 @@ def _small_event_data(data: dict[str, Any]) -> dict[str, Any]:
 def _output_chars(result: ToolResult) -> int:
     value = result.data.get("output_chars")
     return value if isinstance(value, int) else len(result.output)
+
+
+def _yolo_resolution(approval: ApprovalRequest) -> ApprovalResolution:
+    if approval.action_kind in {"network", "workspace_escape"}:
+        return ApprovalResolution(
+            approval_id=approval.approval_id,
+            decision="denied",
+            reason=f"approval-mode=yolo does not allow {approval.action_kind}",
+        )
+    return ApprovalResolution(
+        approval_id=approval.approval_id,
+        decision="approved",
+        scope="once",
+        reason="approval_mode_yolo_in_workspace",
+    )
+
+
+def _model_error_event_type(exc: Exception) -> str:
+    text = str(exc).lower()
+    if "idle" in text and "timeout" in text:
+        return "model.idle_timeout"
+    if "timed out" in text or "timeout" in text:
+        return "model.timeout"
+    return "model.call.failed"
 
 
 def _provider_base_url(model: ModelProvider) -> str | None:
@@ -1723,19 +2633,48 @@ def complete_model_call(
     stream: bool,
     call_index: int,
 ) -> ModelResponse:
+    state.raise_if_cancelled()
     if not stream:
-        return model.complete(messages, tools, state)
+        response = model.complete(messages, tools, state)
+        state.raise_if_cancelled()
+        return response
     stream_method = getattr(model, "stream", None)
     if not callable(stream_method):
-        return model.complete(messages, tools, state)
+        response = model.complete(messages, tools, state)
+        state.raise_if_cancelled()
+        return response
 
-    state.emit("model.stream.started", {"provider": model.name, "turn": call_index})
     assembler = ModelResponseAssembler(provider=model.name)
     trace = _StreamTraceState()
     for delta in stream_method(messages, tools, state):
-        _record_model_delta(state, model.name, trace.normalize(delta))
-        assembler.accept(delta)
-    return assembler.response()
+        state.raise_if_cancelled()
+        normalized = trace.normalize(delta)
+        _record_model_delta(state, model.name, normalized)
+        assembler.accept(normalized)
+        state.raise_if_cancelled()
+    if trace.reasoning_seen:
+        state.emit("model.reasoning.completed", {"provider": model.name, "model_call_index": call_index})
+    try:
+        response = assembler.response()
+    except Exception as exc:
+        state.emit(
+            "model.tool_call.assembly.failed",
+            {"provider": model.name, "model_call_index": call_index, "reason": str(exc)},
+            visibility="user",
+        )
+        raise
+    for call in response.tool_calls:
+        state.emit(
+            "model.tool_call.assembly.completed",
+            {
+                "provider": model.name,
+                "model_call_index": call_index,
+                "tool_call_id": call.id,
+                "tool": call.name,
+                "args": call.args,
+            },
+        )
+    return response
 
 
 def assemble_model_deltas(provider: str, deltas: Iterable[ModelDelta]) -> ModelResponse:
@@ -1827,18 +2766,31 @@ def _record_model_delta(state: RunState, provider: str, delta: ModelDelta) -> No
                 item_id=delta.item_id,
             )
         case "reasoning_summary_delta":
+            data = {
+                "chars": len(delta.delta),
+                "item_id": delta.item_id,
+            }
+            provider_field = delta.data.get("provider_field")
+            if isinstance(provider_field, str) and provider_field:
+                data["provider_field"] = provider_field
             safe_to_display = delta.data.get("safe_to_display", True)
+            if safe_to_display:
+                data["delta"] = delta.delta
             state.emit(
-                "reasoning.summary.delta",
-                _reasoning_event_data(delta, include_delta=safe_to_display),
+                "model.reasoning.delta",
+                data,
                 visibility="user" if safe_to_display else "debug",
                 durability="ephemeral",
                 item_id=delta.item_id,
             )
         case "reasoning_visible_delta":
+            data = {"delta": delta.delta, "chars": len(delta.delta), "item_id": delta.item_id}
+            provider_field = delta.data.get("provider_field")
+            if isinstance(provider_field, str) and provider_field:
+                data["provider_field"] = provider_field
             state.emit(
-                "reasoning.visible.delta",
-                _reasoning_event_data(delta, include_delta=True),
+                "model.reasoning.delta",
+                data,
                 visibility="internal",
                 durability="ephemeral",
                 item_id=delta.item_id,
@@ -1852,10 +2804,18 @@ def _record_model_delta(state: RunState, provider: str, delta: ModelDelta) -> No
                 item_id=delta.item_id,
             )
         case "tool_call_started":
-            return
+            if delta.data.get("_first_seen"):
+                state.emit(
+                    "model.tool_call.assembly.started",
+                    {
+                        "tool_call_id": delta.tool_call_id,
+                        "tool": delta.data.get("name"),
+                        "provider_tool_call_id": delta.data.get("id"),
+                    },
+                )
         case "tool_call_args_delta":
             state.emit(
-                "tool.args.delta",
+                "model.tool_call.args.delta",
                 {
                     "tool_call_id": delta.tool_call_id,
                     "tool": delta.data.get("name"),
@@ -1868,16 +2828,6 @@ def _record_model_delta(state: RunState, provider: str, delta: ModelDelta) -> No
             state.emit("model.usage", {"provider": provider, **delta.data})
         case _:
             return
-
-
-def _reasoning_event_data(delta: ModelDelta, *, include_delta: bool) -> dict[str, Any]:
-    data = {"chars": len(delta.delta), "item_id": delta.item_id}
-    if include_delta:
-        data["delta"] = delta.delta
-    provider_field = delta.data.get("provider_field")
-    if isinstance(provider_field, str) and provider_field:
-        data["provider_field"] = provider_field
-    return data
 
 
 def _parse_chat_tool_call_delta(call: dict[str, Any]) -> Iterator[ModelDelta]:
@@ -1929,12 +2879,19 @@ class _StreamTraceState:
     def __init__(self) -> None:
         self.tool_call_ids: dict[str, str] = {}
         self.tool_names: dict[str, str] = {}
+        self.started_keys: set[str] = set()
+        self.reasoning_seen = False
 
     def normalize(self, delta: ModelDelta) -> ModelDelta:
+        if delta.kind in {"reasoning_summary_delta", "reasoning_visible_delta", "reasoning_encrypted"}:
+            self.reasoning_seen = True
         if not delta.kind.startswith("tool_call_"):
             return delta
 
         key = _stream_tool_key(delta)
+        first_seen = key not in self.started_keys and delta.kind == "tool_call_started"
+        if first_seen:
+            self.started_keys.add(key)
         provider_id = _provider_tool_call_id(delta)
         if provider_id:
             self.tool_call_ids[key] = provider_id
@@ -1949,6 +2906,8 @@ class _StreamTraceState:
             data["id"] = resolved_id
         if resolved_name and not data.get("name"):
             data["name"] = resolved_name
+        if first_seen:
+            data["_first_seen"] = True
         return replace(delta, tool_call_id=resolved_id, data=data)
 
 
@@ -2051,11 +3010,27 @@ def capture_final_diff(state: RunState) -> None:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         state.final_diff = ""
-        _emit_diff_finalized(state, available=False, reason=f"git unavailable: {exc}")
+        state.emit(
+            "diff.finalized",
+            {
+                "available": False,
+                "reason": f"git unavailable: {exc}",
+                "path": "final.diff",
+                "chars": 0,
+            },
+        )
         return
     if result.returncode != 0:
         state.final_diff = ""
-        _emit_diff_finalized(state, available=False, reason="workspace is not a git worktree")
+        state.emit(
+            "diff.finalized",
+            {
+                "available": False,
+                "reason": "workspace is not a git worktree",
+                "path": "final.diff",
+                "chars": 0,
+            },
+        )
         return
 
     try:
@@ -2069,15 +3044,27 @@ def capture_final_diff(state: RunState) -> None:
         untracked = _untracked_files(state)
     except (OSError, subprocess.TimeoutExpired) as exc:
         state.final_diff = ""
-        _emit_diff_finalized(state, available=False, reason=f"git diff failed: {exc}")
+        state.emit(
+            "diff.finalized",
+            {
+                "available": False,
+                "reason": f"git diff failed: {exc}",
+                "path": "final.diff",
+                "chars": 0,
+            },
+        )
         return
     untracked_diff = "".join(_new_file_diff(root, path) for path in untracked)
     state.final_diff = _join_diff_parts(diff.stdout, untracked_diff) if diff.returncode == 0 else ""
-    _emit_diff_finalized(
-        state,
-        available=diff.returncode == 0,
-        reason="" if diff.returncode == 0 else (diff.stderr.strip() or "git diff failed"),
-        untracked_file_count=len(untracked),
+    state.emit(
+        "diff.finalized",
+        {
+            "available": diff.returncode == 0,
+            "reason": "" if diff.returncode == 0 else (diff.stderr.strip() or "git diff failed"),
+            "path": "final.diff",
+            "chars": len(state.final_diff),
+            "untracked_file_count": len(untracked),
+        },
     )
 
 
@@ -2096,24 +3083,6 @@ def _git_has_head(root: Path) -> bool:
         check=False,
     )
     return result.returncode == 0
-
-
-def _emit_diff_finalized(
-    state: RunState,
-    *,
-    available: bool,
-    reason: str,
-    untracked_file_count: int | None = None,
-) -> None:
-    data: dict[str, Any] = {
-        "available": available,
-        "reason": reason,
-        "path": "final.diff",
-        "chars": len(state.final_diff),
-    }
-    if untracked_file_count is not None:
-        data["untracked_file_count"] = untracked_file_count
-    state.emit("diff.finalized", data)
 
 
 def write_text_artifact(state: RunState, name: str, content: str, *, kind: str) -> str:
@@ -2206,16 +3175,24 @@ def _final_text(state: RunState) -> str:
 
 
 def _metrics(state: RunState) -> dict[str, Any]:
+    envelope = state.workspace_envelope
     return {
         "run_id": state.run_id,
-        "status": "failed" if state.failed else "completed",
+        "status": "cancelled" if state.cancelled else "failed" if state.failed else "completed",
+        "terminal_status": state.terminal_status,
         "failure_reason": state.failure_reason,
+        "cancel_reason": state.cancel_reason,
+        "cancel_requested": state.cancelled,
+        "cancel_signal_count": max(state.cancel_signal_count, state.cancel_token.signal_count),
+        "cancel_escalated": state.cancel_escalated,
         "final_output_chars": len(state.final_output),
         "final_output_path": "final.md",
         "task": state.task,
         "workspace_root": str(state.workspace.root),
+        "original_workspace_root": str(envelope.original_root) if envelope else str(state.workspace.root),
         "output_dir": str(state.output_dir),
         "turn_count": state.turn_count,
+        "model_call_count": state.model_call_count,
         "tool_call_count": state.tool_call_count,
         "event_count": state.seq,
         "durable_event_count": len(state.events),
@@ -2229,7 +3206,15 @@ def _metrics(state: RunState) -> dict[str, Any]:
         "shell_env": "sanitized",
         "shell_process_group": "posix",
         "shell_preflight": state.shell_preflight,
-        "sandbox_mode": "none",
+        "workspace_mode": envelope.mode if envelope else "current",
+        "workspace_effective_mode": envelope.effective_mode if envelope else "current",
+        "workspace_allowed_roots": [str(root) for root in envelope.allowed_roots] if envelope else [str(state.workspace.root)],
+        "approval_mode": state.approval_mode,
+        "sandbox_mode": envelope.sandbox_mode if envelope else "none",
+        "sandbox_enforced": envelope.sandbox_enforced if envelope else False,
+        "finalization_attempted": state.finalization_attempted,
+        "pending_approval_count": len(state.pending_approvals),
+        "approval_grant_count": len(state.approval_grants),
     }
 
 
@@ -2251,17 +3236,19 @@ def _new_file_diff(root: Path, relative_path: str) -> str:
     path = root / relative_path
     if path.is_symlink():
         return ""
-    header = f"diff --git a/{relative_path} b/{relative_path}\nnew file mode 100644\nindex 0000000..0000000\n"
-    binary_diff = f"{header}Binary files /dev/null and b/{relative_path} differ\n"
     try:
         file_size = path.stat().st_size
-        if file_size > MAX_UNTRACKED_DIFF_BYTES:
-            return binary_diff
+    except OSError:
+        return ""
+    header = f"diff --git a/{relative_path} b/{relative_path}\nnew file mode 100644\nindex 0000000..0000000\n"
+    if file_size > MAX_UNTRACKED_DIFF_BYTES:
+        return f"{header}Binary files /dev/null and b/{relative_path} differ\n"
+    try:
         raw = path.read_bytes()
     except OSError:
         return ""
     if b"\0" in raw:
-        return binary_diff
+        return f"{header}Binary files /dev/null and b/{relative_path} differ\n"
     text = raw.decode(errors="replace")
     lines = text.splitlines()
     body_lines = difflib.unified_diff([], lines, fromfile="/dev/null", tofile=f"b/{relative_path}", lineterm="")
@@ -2329,9 +3316,10 @@ def _tool_call_dict(call: Any) -> dict[str, Any]:
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from agentd.contracts import PolicyEngine
-from agentd.state import PolicyDecision, RunState, ToolCall
+from agentd.state import ApprovalRequest, PolicyDecision, RunState, ToolCall
 from agentd.tools import patch_paths, resolve_workspace_path
 
 
@@ -2356,7 +3344,7 @@ class LocalPolicy:
                 case "apply_patch":
                     return self._evaluate_patch(call, state)
                 case "shell":
-                    return self._evaluate_shell(call)
+                    return self._evaluate_shell(call, state)
         except Exception as exc:
             return PolicyDecision.deny(str(exc))
         return PolicyDecision.deny(f"Unknown tool for policy: {call.name}")
@@ -2368,9 +3356,14 @@ class LocalPolicy:
             return PolicyDecision.deny("Patch did not declare any file paths.")
         for path in paths:
             resolve_workspace_path(state, path, allow_run_artifacts=self.allow_run_artifacts)
+        if _dirty_current_workspace(state):
+            return PolicyDecision.needs_approval(
+                "patch would mutate a dirty current workspace",
+                _approval_request(call, state, action_kind="dirty_mutation", risk="medium"),
+            )
         return PolicyDecision.allow("patch paths are inside workspace")
 
-    def _evaluate_shell(self, call: ToolCall) -> PolicyDecision:
+    def _evaluate_shell(self, call: ToolCall, state: RunState) -> PolicyDecision:
         cmd = str(call.args.get("cmd", ""))
         if not cmd:
             return PolicyDecision.deny("Shell command is required.")
@@ -2378,6 +3371,24 @@ class LocalPolicy:
         for pattern, reason in RISKY_SHELL_PATTERNS:
             if re.search(pattern, lower):
                 return PolicyDecision.deny(reason)
+        redirect_escape = _outside_redirect_target(cmd, state)
+        if redirect_escape:
+            return PolicyDecision.needs_approval(
+                f"shell redirects outside workspace envelope: {redirect_escape}",
+                _approval_request(
+                    call,
+                    state,
+                    action_kind="workspace_escape",
+                    risk="high",
+                    args_preview=cmd,
+                    command=cmd,
+                ),
+            )
+        if _NETWORK_SHELL_PATTERN.search(lower):
+            return PolicyDecision.needs_approval(
+                "network-looking shell command requires approval",
+                _approval_request(call, state, action_kind="network", risk="high", args_preview=cmd, command=cmd),
+            )
         return PolicyDecision.allow("shell command passed local denylist")
 
 
@@ -2390,6 +3401,58 @@ RISKY_SHELL_PATTERNS = (
     (r"\bshutdown\b|\breboot\b", "machine power commands are denied by default."),
     (r":\(\)\s*\{\s*:\|:", "fork-bomb-like shell functions are denied by default."),
 )
+
+_NETWORK_SHELL_PATTERN = re.compile(r"\b(curl|wget|ssh|scp|sftp|rsync|nc|ncat|telnet)\b")
+_REDIRECT_PATTERN = re.compile(r"(?:^|[\s;&|])(?:>|>>|<)\s*(?P<path>[^()\s;&|]+)")
+
+
+def _dirty_current_workspace(state: RunState) -> bool:
+    envelope = state.workspace_envelope
+    if envelope is None or envelope.effective_mode != "current":
+        return False
+    dirty = envelope.dirty_state_before
+    return dirty.is_git_repo and not dirty.clean
+
+
+def _outside_redirect_target(cmd: str, state: RunState) -> str:
+    for match in _REDIRECT_PATTERN.finditer(cmd):
+        raw = match.group("path").strip("'\"")
+        if not raw or raw.startswith("&"):
+            continue
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            continue
+        envelope = state.workspace_envelope
+        if envelope is not None:
+            if not envelope.contains(path):
+                return raw
+        elif not state.workspace.contains(path):
+            return raw
+    return ""
+
+
+def _approval_request(
+    call: ToolCall,
+    state: RunState,
+    *,
+    action_kind: str,
+    risk: str,
+    args_preview: str | None = None,
+    command: str | None = None,
+) -> ApprovalRequest:
+    preview = args_preview if args_preview is not None else str(call.args)
+    return ApprovalRequest(
+        approval_id=f"approval_{call.id}",
+        run_id=state.run_id,
+        turn_id=state.current_turn_id,
+        step_id=state.current_step_id,
+        action_kind=action_kind,  # type: ignore[arg-type]
+        tool_name=call.name,
+        cwd=str(state.workspace.root),
+        args_preview=preview[:1000],
+        command=command,
+        risk=risk,  # type: ignore[arg-type]
+    )
 
 
 def default_policy() -> PolicyEngine:
@@ -2599,6 +3662,8 @@ class OpenAICompatibleProvider:
             raise ProviderError(f"Model provider HTTP {exc.code}: {detail}") from exc
         except urllib.error.URLError as exc:
             raise ProviderError(f"Model provider request failed: {exc.reason}") from exc
+        except TimeoutError as exc:
+            raise ProviderError(f"Model provider request timeout: {exc}") from exc
         except json.JSONDecodeError as exc:
             raise ProviderError(f"Model provider returned invalid JSON: {exc}") from exc
 
@@ -2634,6 +3699,8 @@ class OpenAICompatibleProvider:
             raise ProviderError(f"Model provider HTTP {exc.code}: {detail}") from exc
         except urllib.error.URLError as exc:
             raise ProviderError(f"Model provider stream failed: {exc.reason}") from exc
+        except TimeoutError as exc:
+            raise ProviderError(f"Model provider stream idle timeout: {exc}") from exc
 
 
 def _chat_completions_url(base_url: str) -> str:
@@ -2710,9 +3777,31 @@ def _event_detail(event: Event) -> str:
             return f"turns={data.get('turn_count')} tools={data.get('tool_call_count')}"
         case "run.failed":
             return str(data.get("reason", ""))
-        case "message.completed":
+        case "run.cancel.requested":
+            return f"{data.get('reason', '')} current={data.get('current_step_kind') or ''}:{data.get('current_step_id') or ''}".strip()
+        case "run.cancelled":
+            return f"{data.get('reason', '')} turns={data.get('turn_count')} tools={data.get('tool_call_count')}".strip()
+        case "turn.started" | "turn.completed" | "turn.interrupted" | "turn.failed":
+            return f"{data.get('turn_id', event.turn_id or '')} status={data.get('status', '')}".strip()
+        case (
+            "step.started"
+            | "step.completed"
+            | "step.failed"
+            | "step.cancel.requested"
+            | "step.cancelled"
+            | "step.timeout"
+            | "step.idle_timeout"
+        ):
+            return f"{data.get('step_kind')} {data.get('step_id')} {data.get('reason', '')}".strip()
+        case "workspace.boundary":
+            return f"mode={data.get('mode')} effective={data.get('effective_mode')} root={data.get('root')}"
+        case "workspace.dirty.detected":
+            return f"dirty files={len(data.get('status_short') or [])}"
+        case "worktree.created":
+            return str(data.get("path") or "")
+        case "model.message.completed":
             return f"{data.get('role', 'assistant')} {data.get('content_chars')} chars {data.get('output_path', '')}".strip()
-        case "model.request.started":
+        case "model.call.started":
             artifacts = [
                 data.get("context_artifact"),
                 data.get("logical_request_artifact"),
@@ -2723,29 +3812,381 @@ def _event_detail(event: Event) -> str:
                 f"provider={data.get('provider')} messages={data.get('message_count')} "
                 f"tools={data.get('tool_count')} {artifact_text}"
             ).strip()
-        case "model.stream.started":
-            return f"provider={data.get('provider')} turn={data.get('turn')}"
-        case "model.completed":
+        case "model.call.completed":
             return (
-                f"provider={data.get('provider')} turn={data.get('turn')} "
+                f"provider={data.get('provider')} model_call={data.get('model_call_index')} "
                 f"tool_calls={data.get('tool_call_count')} finish_reason={data.get('finish_reason')} "
                 f"{data.get('response_artifact') or ''}"
             )
-        case "model.failed":
+        case "model.call.failed" | "model.timeout" | "model.idle_timeout":
             return f"provider={data.get('provider')} {data.get('reason', '')}"
+        case "model.cancelled":
+            return f"provider={data.get('provider')} model_call={data.get('model_call_index')} {data.get('reason', '')}".strip()
         case "model.usage":
             total = data.get("total_tokens")
             return f"provider={data.get('provider')} total_tokens={total}" if total is not None else f"provider={data.get('provider')}"
-        case "tool.call.started" | "tool.args.completed" | "tool.execution.started" | "tool.execution.completed" | "tool.execution.failed":
+        case "model.tool_call.assembly.started" | "model.tool_call.assembly.completed" | "model.tool_call.assembly.failed":
+            return f"{data.get('tool')} {data.get('tool_call_id')} {data.get('reason', '')}".strip()
+        case (
+            "tool.execution.started"
+            | "tool.execution.completed"
+            | "tool.execution.failed"
+            | "tool.execution.cancelled"
+            | "tool.execution.blocked"
+        ):
             artifact = ""
             if isinstance(data.get("data"), dict):
                 artifact = str(data["data"].get("output_artifact") or "")
             return f"{data.get('tool')} {data.get('tool_call_id')} {artifact}".strip()
-        case "tool.policy.evaluated":
-            return f"{data.get('tool')} allowed={data.get('allowed')} {data.get('reason', '')}"
+        case "command.cancelled":
+            return f"{data.get('cmd')} returncode={data.get('returncode')} {data.get('output_artifact') or ''}".strip()
+        case "policy.evaluated":
+            return f"{data.get('tool')} kind={data.get('kind')} {data.get('reason', '')}"
+        case "approval.requested" | "approval.resolved" | "approval.expired":
+            return f"{data.get('approval_id')} {data.get('decision', '')} {data.get('reason', '')}".strip()
         case "diff.finalized":
             return f"available={data.get('available')} chars={data.get('chars')}"
+        case "artifact.materialized":
+            return str(data.get("path") or "")
     return ""
+```
+
+## `agentd/run_control.py`
+
+```python
+"""Small cancellation primitives for the local harness."""
+
+from __future__ import annotations
+
+import threading
+from dataclasses import dataclass
+
+
+class RunCancelled(RuntimeError):
+    """Raised at harness boundaries when a run has been cancelled."""
+
+
+@dataclass
+class CancelToken:
+    reason: str | None = None
+    escalated: bool = False
+    signal_count: int = 0
+
+    def __post_init__(self) -> None:
+        self._event = threading.Event()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._event.is_set()
+
+    def cancel(self, reason: str = "cancelled", *, escalate: bool = False) -> None:
+        self.reason = reason
+        self.escalated = self.escalated or escalate
+        self._event.set()
+
+    def raise_if_cancelled(self) -> None:
+        if self.cancelled:
+            raise RunCancelled(self.reason or "cancelled")
+```
+
+## `agentd/run_record.py`
+
+```python
+"""Structured summaries for recorded tinyagent runs."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
+
+from agentd.events import Event
+from agentd.replay import load_run_events
+
+
+@dataclass(frozen=True)
+class ModelCallRecord:
+    provider: str = ""
+    turn: int = 0
+    streamed: bool = False
+    tool_call_count: int = 0
+    finish_reason: str | None = None
+    request_artifact: str = ""
+    response_artifact: str = ""
+    failed: bool = False
+    cancelled: bool = False
+    failure_reason: str = ""
+
+
+@dataclass(frozen=True)
+class ToolCallRecord:
+    tool: str = ""
+    tool_call_id: str = ""
+    ok: bool | None = None
+    blocked: bool = False
+    cancelled: bool = False
+    output_chars: int = 0
+    output_artifact: str = ""
+
+
+@dataclass(frozen=True)
+class CommandRecord:
+    cmd: str = ""
+    ok: bool | None = None
+    timeout: bool = False
+    cancelled: bool = False
+    returncode: int | None = None
+    output_chars: int = 0
+    output_artifact: str = ""
+
+
+@dataclass(frozen=True)
+class RunRecord:
+    run_path: str
+    run_id: str = ""
+    task: str = ""
+    status: str = "unknown"
+    failure_reason: str = ""
+    final_output_path: str = "final.md"
+    final_output_chars: int = 0
+    final_diff_path: str = "final.diff"
+    final_diff_chars: int = 0
+    final_diff_available: bool = False
+    duration_seconds: float = 0.0
+    turn_count: int = 0
+    model_call_count: int = 0
+    tool_call_count: int = 0
+    event_count: int = 0
+    artifact_count: int = 0
+    command_count: int = 0
+    patch_count: int = 0
+    model_calls: list[ModelCallRecord] = field(default_factory=list)
+    tool_calls: list[ToolCallRecord] = field(default_factory=list)
+    commands: list[CommandRecord] = field(default_factory=list)
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def load_run_record(run_path: Path) -> RunRecord:
+    root = run_path if run_path.name != "events.jsonl" else run_path.parent
+    events = load_run_events(run_path)
+    metrics = _read_json(root / "metrics.json")
+    final_diff = _read_text(root / "final.diff")
+    started = _first_event(events, "run.started")
+    task = str(started.data.get("task") or "") if started else ""
+    run_id = str(metrics.get("run_id") or (events[0].run_id if events else ""))
+    status = str(metrics.get("status") or _status_from_events(events))
+    failure_reason = str(metrics.get("failure_reason") or _failure_from_events(events) or "")
+
+    model_calls = _model_calls(events)
+    tool_calls = _tool_calls(events)
+    commands = _commands(events)
+    diff_event = _last_event(events, "diff.finalized")
+    final_diff_chars = int(diff_event.data.get("chars", len(final_diff))) if diff_event else len(final_diff)
+    final_diff_available = bool(diff_event.data.get("available")) if diff_event else bool(final_diff)
+
+    return RunRecord(
+        run_path=str(root),
+        run_id=run_id,
+        task=str(metrics.get("task") or task),
+        status=status,
+        failure_reason=failure_reason,
+        final_output_path=str(metrics.get("final_output_path") or "final.md"),
+        final_output_chars=int(metrics.get("final_output_chars") or 0),
+        final_diff_chars=final_diff_chars,
+        final_diff_available=final_diff_available,
+        duration_seconds=float(metrics.get("duration_seconds") or 0.0),
+        turn_count=int(metrics.get("turn_count") or 0),
+        model_call_count=int(metrics.get("model_call_count") or len(model_calls)),
+        tool_call_count=int(metrics.get("tool_call_count") or len(tool_calls)),
+        event_count=int(metrics.get("event_count") or (events[-1].seq if events else 0)),
+        artifact_count=sum(1 for event in events if event.type == "artifact.created"),
+        command_count=len(commands),
+        patch_count=sum(1 for event in events if event.type == "patch.applied"),
+        model_calls=model_calls,
+        tool_calls=tool_calls,
+        commands=commands,
+    )
+
+
+def render_run_inspection(record: RunRecord) -> str:
+    lines = [
+        "# Tinyagent Run Inspect",
+        "",
+        f"run_id: {record.run_id}",
+        f"status: {record.status}",
+        f"task: {record.task}",
+        f"run_path: {record.run_path}",
+        f"duration_seconds: {record.duration_seconds:.3f}",
+        f"turns: {record.turn_count}",
+        f"model_calls: {record.model_call_count}",
+        f"tool_calls: {record.tool_call_count}",
+        f"commands: {record.command_count}",
+        f"patches: {record.patch_count}",
+        f"events: {record.event_count}",
+        f"artifacts: {record.artifact_count}",
+        f"final_output: {record.final_output_path} ({record.final_output_chars} chars)",
+        f"final_diff: {record.final_diff_path} ({record.final_diff_chars} chars, available={record.final_diff_available})",
+    ]
+    if record.failure_reason:
+        lines.append(f"failure: {record.failure_reason}")
+    lines.extend(["", "## Model Calls"])
+    if record.model_calls:
+        for call in record.model_calls:
+            status = "cancelled" if call.cancelled else "failed" if call.failed else "completed"
+            lines.append(
+                f"- turn={call.turn} provider={call.provider} status={status} streamed={call.streamed} "
+                f"tools={call.tool_call_count} finish={call.finish_reason or ''} {call.response_artifact}".strip()
+            )
+    else:
+        lines.append("- none")
+    lines.extend(["", "## Tools"])
+    if record.tool_calls:
+        for call in record.tool_calls:
+            lines.append(
+                f"- {call.tool} {call.tool_call_id} ok={call.ok} blocked={call.blocked} cancelled={call.cancelled} "
+                f"output_chars={call.output_chars} {call.output_artifact}".strip()
+            )
+    else:
+        lines.append("- none")
+    lines.extend(["", "## Commands"])
+    if record.commands:
+        for command in record.commands:
+            lines.append(
+                f"- ok={command.ok} timeout={command.timeout} cancelled={command.cancelled} returncode={command.returncode} "
+                f"output_chars={command.output_chars} cmd={command.cmd!r} {command.output_artifact}".strip()
+            )
+    else:
+        lines.append("- none")
+    return "\n".join(lines) + "\n"
+
+
+def _model_calls(events: list[Event]) -> list[ModelCallRecord]:
+    records: dict[int, dict[str, Any]] = {}
+    for event in events:
+        data = event.data
+        if event.type == "model.call.started":
+            turn = int(data.get("model_call_index") or len(records) + 1)
+            records.setdefault(turn, {}).update(
+                provider=str(data.get("provider") or ""),
+                request_artifact=str(data.get("logical_request_artifact") or ""),
+            )
+            records.setdefault(turn, {}).update(streamed=bool(data.get("stream")))
+        elif event.type == "model.call.completed":
+            turn = int(data.get("model_call_index") or len(records) + 1)
+            records.setdefault(turn, {}).update(
+                provider=str(data.get("provider") or ""),
+                streamed=bool(data.get("streamed")),
+                tool_call_count=int(data.get("tool_call_count") or 0),
+                finish_reason=data.get("finish_reason"),
+                response_artifact=str(data.get("response_artifact") or ""),
+            )
+        elif event.type in {"model.call.failed", "model.timeout", "model.idle_timeout"}:
+            turn = int(data.get("model_call_index") or len(records) + 1)
+            records.setdefault(turn, {}).update(
+                provider=str(data.get("provider") or ""),
+                failed=True,
+                failure_reason=str(data.get("reason") or ""),
+            )
+        elif event.type == "model.cancelled":
+            turn = int(data.get("model_call_index") or len(records) + 1)
+            records.setdefault(turn, {}).update(
+                provider=str(data.get("provider") or ""),
+                cancelled=True,
+                failure_reason=str(data.get("reason") or ""),
+            )
+    return [ModelCallRecord(turn=turn, **values) for turn, values in sorted(records.items())]
+
+
+def _tool_calls(events: list[Event]) -> list[ToolCallRecord]:
+    records: dict[str, dict[str, Any]] = {}
+    for event in events:
+        data = event.data
+        tool_call_id = str(data.get("tool_call_id") or "")
+        if not tool_call_id:
+            continue
+        if event.type == "model.tool_call.assembly.completed":
+            records.setdefault(tool_call_id, {}).update(tool=str(data.get("tool") or ""), tool_call_id=tool_call_id)
+        elif event.type in {"tool.execution.completed", "tool.execution.failed", "tool.execution.cancelled"}:
+            payload = data.get("data") if isinstance(data.get("data"), dict) else {}
+            records.setdefault(tool_call_id, {}).update(
+                tool=str(data.get("tool") or ""),
+                tool_call_id=tool_call_id,
+                ok=bool(data.get("ok")),
+                blocked=bool(data.get("blocked")),
+                cancelled=event.type == "tool.execution.cancelled",
+                output_chars=int(data.get("output_chars") or 0),
+                output_artifact=str(payload.get("output_artifact") or ""),
+            )
+    return [ToolCallRecord(**record) for record in records.values()]
+
+
+def _commands(events: list[Event]) -> list[CommandRecord]:
+    records: dict[str, dict[str, Any]] = {}
+    for event in events:
+        data = event.data
+        tool_call_id = str(data.get("tool_call_id") or "")
+        if not tool_call_id:
+            continue
+        if event.type == "command.started":
+            records.setdefault(tool_call_id, {}).update(cmd=str(data.get("cmd") or ""))
+        elif event.type in {"command.completed", "command.failed", "command.timeout"}:
+            records.setdefault(tool_call_id, {}).update(
+                ok=bool(data.get("ok")),
+                timeout=bool(data.get("timeout")) or event.type == "command.timeout",
+                returncode=data.get("returncode"),
+                output_chars=int(data.get("output_chars") or 0),
+                output_artifact=str(data.get("output_artifact") or ""),
+            )
+        elif event.type == "command.cancelled":
+            records.setdefault(tool_call_id, {}).update(
+                ok=False,
+                cancelled=True,
+                returncode=data.get("returncode"),
+                output_chars=int(data.get("output_chars") or 0),
+                output_artifact=str(data.get("output_artifact") or ""),
+            )
+    return [CommandRecord(**record) for record in records.values()]
+
+
+def _first_event(events: list[Event], event_type: str) -> Event | None:
+    return next((event for event in events if event.type == event_type), None)
+
+
+def _last_event(events: list[Event], event_type: str) -> Event | None:
+    return next((event for event in reversed(events) if event.type == event_type), None)
+
+
+def _status_from_events(events: list[Event]) -> str:
+    if any(event.type == "run.cancelled" for event in events):
+        return "cancelled"
+    if any(event.type == "run.failed" for event in events):
+        return "failed"
+    if any(event.type == "run.completed" for event in events):
+        return "completed"
+    return "unknown"
+
+
+def _failure_from_events(events: list[Event]) -> str:
+    failed = _last_event(events, "run.failed")
+    return str(failed.data.get("reason") or "") if failed else ""
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text()
+    except OSError:
+        return ""
 ```
 
 ## `agentd/state.py`
@@ -2759,10 +4200,12 @@ import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
 from agentd.events import Event, EventDurability, EventSink, EventVisibility, utc_now
+from agentd.run_control import CancelToken, RunCancelled
+from agentd.workspace import Workspace, WorkspaceEnvelope
 
 if TYPE_CHECKING:
     from agentd.context import ContextState
@@ -2779,32 +4222,13 @@ class RunBudgets:
     max_turns: int = 30
     max_tool_calls: int = 100
     max_shell_timeout_seconds: int = 60
+    max_model_timeout_seconds: int = 180
+    max_model_idle_timeout_seconds: int = 60
     max_run_seconds: int = 600
     max_command_output_chars_visible: int = 12_000
 
     def to_json_dict(self) -> dict[str, int]:
         return asdict(self)
-
-
-@dataclass(frozen=True)
-class Workspace:
-    root: Path
-
-    def resolved_root(self) -> Path:
-        return self.root.expanduser().resolve()
-
-    def resolve_path(self, path: str | Path = ".") -> Path:
-        candidate = Path(path).expanduser()
-        if not candidate.is_absolute():
-            candidate = self.root / candidate
-        return candidate.resolve()
-
-    def contains(self, path: Path) -> bool:
-        try:
-            path.resolve().relative_to(self.root)
-        except ValueError:
-            return False
-        return True
 
 
 @dataclass(frozen=True)
@@ -2849,19 +4273,81 @@ class ModelResponse:
         self.tool_calls = tuple(self.tool_calls)
 
 
+ApprovalDecision = Literal["approved", "denied", "cancelled", "expired"]
+ApprovalMode = Literal["never", "on-request", "yolo"]
+ApprovalScope = Literal["once", "run"]
+PolicyDecisionKind = Literal["allow", "deny", "needs_approval"]
+StepKind = Literal["model_call", "tool_execution", "approval_wait", "artifact_finalization"]
+TerminalStatus = Literal["completed", "failed", "cancelled", "interrupted", "timed_out"]
+
+
+@dataclass(frozen=True)
+class ApprovalRequest:
+    approval_id: str
+    run_id: str
+    turn_id: str | None
+    step_id: str | None
+    action_kind: Literal["shell", "patch", "network", "workspace_escape", "dirty_mutation", "unknown"]
+    tool_name: str
+    cwd: str
+    args_preview: str
+    command: str | None
+    risk: Literal["low", "medium", "high"]
+    scope_options: tuple[ApprovalScope, ...] = ("once", "run")
+
+    def grant_key(self) -> str:
+        return f"{self.action_kind}:{self.tool_name}:{self.command or self.args_preview}"
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ApprovalResolution:
+    approval_id: str
+    decision: ApprovalDecision
+    scope: ApprovalScope | None = None
+    reason: str | None = None
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ApprovalGrant:
+    approval_id: str
+    grant_key: str
+    scope: ApprovalScope
+    created_at: datetime = field(default_factory=utc_now)
+
+    def to_json_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["created_at"] = self.created_at.isoformat().replace("+00:00", "Z")
+        return data
+
+
 @dataclass(frozen=True)
 class PolicyDecision:
-    allowed: bool
+    kind: PolicyDecisionKind
     reason: str = ""
     redacted: bool = False
+    approval: ApprovalRequest | None = None
+
+    @property
+    def allowed(self) -> bool:
+        return self.kind == "allow"
 
     @classmethod
     def allow(cls, reason: str = "allowed") -> PolicyDecision:
-        return cls(allowed=True, reason=reason)
+        return cls(kind="allow", reason=reason)
 
     @classmethod
     def deny(cls, reason: str) -> PolicyDecision:
-        return cls(allowed=False, reason=reason)
+        return cls(kind="deny", reason=reason)
+
+    @classmethod
+    def needs_approval(cls, reason: str, approval: ApprovalRequest) -> PolicyDecision:
+        return cls(kind="needs_approval", reason=reason, approval=approval)
 
 
 @dataclass
@@ -2876,15 +4362,33 @@ class RunState:
     seq: int = 0
     tool_steps: list[ToolStep] = field(default_factory=list)
     turn_count: int = 0
+    model_call_count: int = 0
     tool_call_count: int = 0
     done: bool = False
     failed: bool = False
+    cancelled: bool = False
+    status: str = "new"
     failure_reason: str | None = None
+    cancel_reason: str | None = None
+    cancel_requested_at: datetime | None = None
+    cancel_signal_count: int = 0
+    cancel_escalated: bool = False
+    current_turn_id: str | None = None
+    current_step_kind: StepKind | None = None
+    current_step_id: str | None = None
+    current_model_call_id: str | None = None
+    terminal_status: TerminalStatus | None = None
     final_output: str = ""
     final_diff: str = ""
+    workspace_envelope: WorkspaceEnvelope | None = None
+    approval_mode: ApprovalMode = "yolo"
+    pending_approvals: dict[str, ApprovalRequest] = field(default_factory=dict)
+    approval_grants: dict[str, ApprovalGrant] = field(default_factory=dict)
+    finalization_attempted: bool = False
     shell_preflight: dict[str, Any] = field(default_factory=dict)
     persist_events: bool = True
     stream_sink: EventSink | None = None
+    cancel_token: CancelToken = field(default_factory=CancelToken, repr=False)
     context_state: ContextState = field(default_factory=_default_context_state)
     context_checkpoint: str = ""
     context_checkpoint_artifact: str = ""
@@ -2944,7 +4448,7 @@ class RunState:
             visibility=visibility,
             durability=durability,
             artifact_refs=artifact_refs or [],
-            turn_id=turn_id,
+            turn_id=turn_id if turn_id is not None else self.current_turn_id,
             item_id=item_id,
             parent_item_id=parent_item_id,
             seq=self.seq + 1,
@@ -2968,13 +4472,133 @@ class RunState:
             return
         self.done = True
         self.failed = True
+        self.status = "failed"
+        self.terminal_status = "failed"
         self.failure_reason = reason
 
     def finish(self, final_output: str = "") -> None:
         if self.done:
             return
         self.done = True
+        self.status = "completed"
+        self.terminal_status = "completed"
         self.final_output = final_output or self.final_output
+
+    def request_cancel(self, reason: str = "cancelled", *, source: str = "harness", escalate: bool = False) -> bool:
+        already_cancelled = self.cancelled
+        if source == "sigint":
+            self.cancel_signal_count = max(self.cancel_signal_count, self.cancel_token.signal_count or self.cancel_signal_count + 1)
+        self.cancel_token.cancel(reason, escalate=escalate)
+        self.cancel_escalated = self.cancel_escalated or escalate or self.cancel_token.escalated
+        if already_cancelled:
+            return False
+        self.done = True
+        self.cancelled = True
+        self.status = "cancelling"
+        self.terminal_status = "cancelled"
+        self.cancel_reason = reason
+        self.cancel_requested_at = utc_now()
+        if self.current_step_id:
+            self.emit(
+                "step.cancel.requested",
+                {
+                    "reason": reason,
+                    "source": source,
+                    "step_kind": self.current_step_kind,
+                    "step_id": self.current_step_id,
+                    "escalated": self.cancel_escalated,
+                },
+                visibility="user",
+            )
+        self.emit(
+            "run.cancel.requested",
+            {
+                "reason": reason,
+                "source": source,
+                "current_step_kind": self.current_step_kind,
+                "current_step_id": self.current_step_id,
+                "escalated": self.cancel_escalated,
+            },
+            visibility="user",
+        )
+        return True
+
+    def raise_if_cancelled(self) -> None:
+        if self.cancel_token.cancelled:
+            self.request_cancel(
+                self.cancel_token.reason or "cancelled",
+                source="sigint" if self.cancel_token.reason == "sigint" else "harness",
+                escalate=self.cancel_token.escalated,
+            )
+        if self.cancelled:
+            raise RunCancelled(self.cancel_reason or "cancelled")
+
+    def start_turn(self, turn_id: str) -> None:
+        self.current_turn_id = turn_id
+        self.turn_count += 1
+        self.emit("turn.started", {"turn_id": turn_id}, visibility="user", turn_id=turn_id)
+
+    def finish_turn(self) -> None:
+        if not self.current_turn_id:
+            return
+        event_type = "turn.interrupted" if self.cancelled else "turn.failed" if self.failed else "turn.completed"
+        if not any(event.type == event_type and event.turn_id == self.current_turn_id for event in self.events):
+            self.emit(
+                event_type,
+                {
+                    "turn_id": self.current_turn_id,
+                    "status": self.terminal_status or self.status,
+                    "model_call_count": self.model_call_count,
+                    "tool_call_count": self.tool_call_count,
+                },
+                visibility="user",
+                turn_id=self.current_turn_id,
+            )
+        self.current_turn_id = None
+
+    def start_step(
+        self,
+        kind: StepKind,
+        step_id: str,
+        *,
+        data: dict[str, Any] | None = None,
+        model_call_id: str | None = None,
+    ) -> None:
+        self.current_step_kind = kind
+        self.current_step_id = step_id
+        if model_call_id is not None:
+            self.current_model_call_id = model_call_id
+        payload = {"step_kind": kind, "step_id": step_id, **(data or {})}
+        if self.current_model_call_id:
+            payload.setdefault("model_call_id", self.current_model_call_id)
+        self.emit("step.started", payload)
+
+    def finish_step(
+        self,
+        status: Literal["completed", "failed", "cancelled", "timeout", "idle_timeout"],
+        *,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        if not self.current_step_id or not self.current_step_kind:
+            return
+        event_type = {
+            "completed": "step.completed",
+            "failed": "step.failed",
+            "cancelled": "step.cancelled",
+            "timeout": "step.timeout",
+            "idle_timeout": "step.idle_timeout",
+        }[status]
+        payload = {"step_kind": self.current_step_kind, "step_id": self.current_step_id, **(data or {})}
+        if self.current_model_call_id:
+            payload.setdefault("model_call_id", self.current_model_call_id)
+        self.emit(event_type, payload, visibility="user" if status != "completed" else "debug")
+        self.set_current_step(None, None)
+
+    def set_current_step(self, kind: StepKind | None, step_id: str | None) -> None:
+        self.current_step_kind = kind
+        self.current_step_id = step_id
+        if kind != "model_call":
+            self.current_model_call_id = None
 ```
 
 ## `agentd/tools/__init__.py`
@@ -3380,8 +5004,10 @@ import os
 import shutil
 import signal
 import subprocess
+import time
 from typing import Any
 
+from agentd.run_control import RunCancelled
 from agentd.state import RunState, ToolCall, ToolResult
 from agentd.tools.core import combined_output, error_result, tool_env, visible_output, write_tool_output_artifact
 
@@ -3437,13 +5063,13 @@ class ShellTool:
             return error_result(self.name, call, exc)
 
         try:
-            stdout, stderr = process.communicate(timeout=timeout)
+            stdout, stderr = _communicate_with_cancel(process, state, timeout)
         except subprocess.TimeoutExpired:
             stdout, stderr = _terminate_process_group(process)
             output = combined_output(stdout, stderr) or f"Command timed out after {timeout}s."
             artifact = write_tool_output_artifact(state, call, "command-output", output, kind="command_output")
             state.emit(
-                "command.completed",
+                "command.timeout",
                 {
                     "tool_call_id": call.id,
                     "cmd": cmd,
@@ -3467,11 +5093,47 @@ class ShellTool:
                     "output_chars": len(output),
                 },
             )
+        except RunCancelled:
+            state.request_cancel(
+                state.cancel_token.reason or "cancelled",
+                source="sigint" if state.cancel_token.reason == "sigint" else "harness",
+                escalate=state.cancel_token.escalated,
+            )
+            stdout, stderr = _terminate_process_group(process)
+            output = combined_output(stdout, stderr) or "Command cancelled."
+            artifact = write_tool_output_artifact(state, call, "command-output", output, kind="command_output")
+            state.emit(
+                "command.cancelled",
+                {
+                    "tool_call_id": call.id,
+                    "cmd": cmd,
+                    "reason": state.cancel_reason or "cancelled",
+                    "returncode": process.returncode,
+                    "output_artifact": artifact,
+                    "output_chars": len(output),
+                    "escalated": state.cancel_escalated,
+                },
+                visibility="user",
+            )
+            return ToolResult(
+                tool_name=self.name,
+                call_id=call.id,
+                output=visible_output(output, state),
+                ok=False,
+                data={
+                    "cmd": cmd,
+                    "cancelled": True,
+                    "reason": state.cancel_reason or "cancelled",
+                    "returncode": process.returncode,
+                    "output_artifact": artifact,
+                    "output_chars": len(output),
+                },
+            )
 
         output = combined_output(stdout, stderr) or f"Command exited {process.returncode}."
         artifact = write_tool_output_artifact(state, call, "command-output", output, kind="command_output")
         state.emit(
-            "command.completed",
+            "command.completed" if process.returncode == 0 else "command.failed",
             {
                 "tool_call_id": call.id,
                 "cmd": cmd,
@@ -3496,6 +5158,19 @@ class ShellTool:
                 "output_chars": len(output),
             },
         )
+
+
+def _communicate_with_cancel(process: subprocess.Popen[str], state: RunState, timeout: int) -> tuple[str, str]:
+    deadline = time.monotonic() + timeout
+    while True:
+        state.raise_if_cancelled()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(process.args, timeout)
+        try:
+            return process.communicate(timeout=min(0.1, remaining))
+        except subprocess.TimeoutExpired:
+            continue
 
 
 def shell_preflight() -> dict[str, Any]:
@@ -3985,4 +5660,196 @@ def _output_dir_inside_workspace(state: RunState) -> str | None:
         return state.output_dir.resolve().relative_to(state.workspace.root).as_posix()
     except ValueError:
         return None
+```
+
+## `agentd/workspace.py`
+
+```python
+"""Workspace boundary and worktree preparation."""
+
+from __future__ import annotations
+
+import subprocess
+import tempfile
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Literal
+
+WorkspaceMode = Literal["auto", "worktree", "current"]
+SandboxMode = Literal["none"]
+
+
+@dataclass(frozen=True)
+class Workspace:
+    root: Path
+
+    def resolved_root(self) -> Path:
+        return self.root.expanduser().resolve()
+
+    def resolve_path(self, path: str | Path = ".") -> Path:
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.root / candidate
+        return candidate.resolve()
+
+    def contains(self, path: Path) -> bool:
+        try:
+            path.resolve().relative_to(self.root)
+        except ValueError:
+            return False
+        return True
+
+
+@dataclass(frozen=True)
+class DirtyState:
+    is_git_repo: bool = False
+    has_head: bool = False
+    clean: bool = True
+    head: str | None = None
+    branch: str | None = None
+    status_short: tuple[str, ...] = ()
+
+    def to_json_dict(self) -> dict[str, object]:
+        data = asdict(self)
+        data["status_short"] = list(self.status_short)
+        return data
+
+
+@dataclass(frozen=True)
+class WorkspaceEnvelope:
+    root: Path
+    original_root: Path
+    mode: WorkspaceMode
+    effective_mode: Literal["worktree", "current"]
+    worktree_path: Path | None = None
+    git_head_before: str | None = None
+    dirty_state_before: DirtyState = field(default_factory=DirtyState)
+    allowed_roots: tuple[Path, ...] = ()
+    sandbox_mode: SandboxMode = "none"
+    sandbox_enforced: bool = False
+
+    def to_json_dict(self) -> dict[str, object]:
+        return {
+            "root": str(self.root),
+            "original_root": str(self.original_root),
+            "mode": self.mode,
+            "effective_mode": self.effective_mode,
+            "worktree_path": str(self.worktree_path) if self.worktree_path else None,
+            "git_head_before": self.git_head_before,
+            "dirty_state_before": self.dirty_state_before.to_json_dict(),
+            "allowed_roots": [str(root) for root in self.allowed_roots],
+            "sandbox_mode": self.sandbox_mode,
+            "sandbox_enforced": self.sandbox_enforced,
+        }
+
+    def contains(self, path: Path) -> bool:
+        resolved = path.expanduser().resolve()
+        for root in self.allowed_roots:
+            try:
+                resolved.relative_to(root)
+                return True
+            except ValueError:
+                continue
+        return False
+
+
+@dataclass(frozen=True)
+class PreparedWorkspace:
+    workspace: Workspace
+    envelope: WorkspaceEnvelope
+    worktree_created: bool = False
+
+
+def prepare_workspace(
+    root: Path,
+    *,
+    mode: WorkspaceMode,
+    run_id: str,
+    sandbox_mode: SandboxMode = "none",
+) -> PreparedWorkspace:
+    original_root = root.expanduser().resolve()
+    if not original_root.exists() or not original_root.is_dir():
+        raise ValueError(f"Workspace does not exist or is not a directory: {original_root}")
+
+    dirty = inspect_dirty_state(original_root)
+    effective_mode: Literal["worktree", "current"] = "current"
+    effective_root = original_root
+    worktree_path: Path | None = None
+    worktree_created = False
+
+    use_worktree = mode == "worktree" or (mode == "auto" and dirty.is_git_repo and dirty.has_head and dirty.clean)
+    if use_worktree:
+        if not dirty.is_git_repo or not dirty.has_head:
+            raise ValueError("workspace-mode=worktree requires a git workspace with HEAD")
+        if not dirty.clean:
+            raise ValueError("workspace-mode=worktree requires a clean git workspace")
+        worktree_path = _available_worktree_path(_worktree_path(original_root, run_id))
+        worktree_path.parent.mkdir(parents=True, exist_ok=True)
+        _run_git(original_root, ["worktree", "add", "--detach", str(worktree_path), "HEAD"], timeout=30)
+        effective_root = worktree_path.resolve()
+        effective_mode = "worktree"
+        worktree_created = True
+
+    envelope = WorkspaceEnvelope(
+        root=effective_root,
+        original_root=original_root,
+        mode=mode,
+        effective_mode=effective_mode,
+        worktree_path=worktree_path,
+        git_head_before=dirty.head,
+        dirty_state_before=dirty,
+        allowed_roots=(effective_root,),
+        sandbox_mode=sandbox_mode,
+        sandbox_enforced=False,
+    )
+    return PreparedWorkspace(workspace=Workspace(effective_root), envelope=envelope, worktree_created=worktree_created)
+
+
+def inspect_dirty_state(root: Path) -> DirtyState:
+    inside = _git(root, ["rev-parse", "--is-inside-work-tree"])
+    if inside.returncode != 0 or inside.stdout.strip() != "true":
+        return DirtyState(is_git_repo=False, clean=True)
+
+    head_result = _git(root, ["rev-parse", "--verify", "HEAD"])
+    has_head = head_result.returncode == 0
+    head = head_result.stdout.strip() if has_head else None
+    branch_result = _git(root, ["branch", "--show-current"])
+    branch = branch_result.stdout.strip() or None if branch_result.returncode == 0 else None
+    status_result = _git(root, ["status", "--short"])
+    status = tuple(line for line in status_result.stdout.splitlines() if line) if status_result.returncode == 0 else ()
+    return DirtyState(
+        is_git_repo=True,
+        has_head=has_head,
+        clean=not status,
+        head=head,
+        branch=branch,
+        status_short=status,
+    )
+
+
+def _worktree_path(root: Path, run_id: str) -> Path:
+    safe_repo = "".join(char if char.isalnum() or char in "._-" else "-" for char in root.name)
+    safe_run = "".join(char if char.isalnum() or char in "._-" else "-" for char in run_id)
+    return Path(tempfile.gettempdir()) / "tinyagent-worktrees" / f"{safe_repo}-{safe_run}"
+
+
+def _available_worktree_path(base: Path) -> Path:
+    if not base.exists():
+        return base
+    for index in range(1, 1000):
+        candidate = base.with_name(f"{base.name}-{index}")
+        if not candidate.exists():
+            return candidate
+    raise ValueError(f"No available worktree path near {base}")
+
+
+def _git(root: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, timeout=10, check=False)
+
+
+def _run_git(root: Path, args: list[str], *, timeout: int) -> None:
+    result = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, timeout=timeout, check=False)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "git command failed"
+        raise ValueError(detail)
 ```
