@@ -1,0 +1,6 @@
+{
+  "id": "context-read",
+  "task": "Inspect hello.txt and return a short final answer.",
+  "validation_command": "python3 validate.py",
+  "timeout_seconds": 60
+}

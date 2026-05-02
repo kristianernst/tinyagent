@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from agentd import __version__
+from agentd.eval_runner import default_eval_output_dir, render_eval_report, run_eval_suite
 from agentd.events import ConsoleTextSink, JsonlStreamSink, debug_level_from_env
 from agentd.kernel import Kernel
 from agentd.models import FakeModelProvider, ProviderError
@@ -15,6 +16,7 @@ from agentd.policy import default_policy
 from agentd.profiles import ApexCoderProfile
 from agentd.providers.openai_compat import OpenAICompatibleProvider
 from agentd.replay import replay_run
+from agentd.run_record import load_run_record, render_run_inspection
 from agentd.state import ModelResponse, ToolCall
 from agentd.tools import default_tools
 
@@ -47,6 +49,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     replay_parser = subparsers.add_parser("replay", help="Replay a recorded agent run.")
     replay_parser.add_argument("run_path", type=Path, help="Run directory or events.jsonl path.")
+
+    inspect_parser = subparsers.add_parser("inspect", help="Inspect a recorded agent run.")
+    inspect_parser.add_argument("run_path", type=Path, help="Run directory or events.jsonl path.")
+
+    eval_parser = subparsers.add_parser("eval", help="Run a local eval suite.")
+    eval_parser.add_argument("suite_path", type=Path, help="Directory containing eval cases.")
+    eval_parser.add_argument("--provider", choices=["fake", "openai-compatible"], default="fake")
+    eval_parser.add_argument("--output-dir", type=Path)
+    eval_parser.add_argument(
+        "--stream",
+        choices=["off", "text", "jsonl"],
+        default="off",
+        help="Stream model progress live while preserving each run trace.",
+    )
+    eval_parser.add_argument(
+        "--debug",
+        type=int,
+        help="Live stream verbosity. Defaults to TINYAGENT_DEBUG or 0.",
+    )
 
     return parser
 
@@ -96,6 +117,35 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "replay":
         print(replay_run(args.run_path), end="")
         return 0
+
+    if args.command == "inspect":
+        print(render_run_inspection(load_run_record(args.run_path)), end="")
+        return 0
+
+    if args.command == "eval":
+        try:
+            debug_level = _debug_level(args.debug)
+        except ValueError as exc:
+            print(f"debug error: {exc}")
+            return 2
+        output_dir = args.output_dir or default_eval_output_dir(args.suite_path)
+        try:
+            eval_run = run_eval_suite(
+                args.suite_path,
+                output_dir=output_dir,
+                model_factory=lambda task: _model_for(args.provider, task),
+                profile=ApexCoderProfile(),
+                tools=default_tools(),
+                policy=default_policy(),
+                stream=args.stream != "off",
+                event_sink=_stream_sink(args.stream, debug_level),
+            )
+        except (OSError, ValueError, ProviderError) as exc:
+            print(f"eval error: {exc}")
+            return 1
+        report = render_eval_report(eval_run)
+        print(report, end="")
+        return 0 if all(result.success for result in eval_run.results) else 1
 
     parser.error(f"unknown command '{args.command}'")
     return 2
