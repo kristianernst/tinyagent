@@ -9,6 +9,8 @@ from agentd.state import Message, ModelResponse, PolicyDecision, RunState, ToolC
 
 
 class Tool(Protocol):
+    """ToolResult.data is small metadata only; large payloads should be artifacts."""
+
     name: str
     schema: Mapping[str, Any]
 
@@ -33,6 +35,8 @@ class Profile(Protocol):
     def should_continue(self, state: RunState) -> bool: ...
 
     def should_finish(self, state: RunState) -> bool: ...
+
+    def should_compact(self, state: RunState) -> bool: ...
 
     def compact(self, state: RunState) -> None: ...
 

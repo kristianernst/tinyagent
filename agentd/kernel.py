@@ -2,12 +2,26 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
+from agentd.context import BuiltContext, estimate_messages_tokens, estimate_tools_tokens, message_text
 from agentd.contracts import Executor, LocalExecutor, ModelProvider, PolicyEngine, Profile, Tool
-from agentd.output import write_model_request_artifacts, write_model_response_artifact, write_run_outputs
-from agentd.state import PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, Workspace
+from agentd.events import json_safe
+from agentd.output import (
+    capture_final_diff,
+    write_model_http_request_artifact,
+    write_model_request_artifacts,
+    write_model_response_artifact,
+    write_run_outputs,
+)
+from agentd.state import Message, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, ToolStep, Workspace
+from agentd.tools import shell_preflight
+
+MAX_EVENT_DATA_CHARS = 4_000
 
 
 class Kernel:
@@ -53,12 +67,16 @@ class Kernel:
                 "budgets": state.budgets.to_json_dict(),
             },
         )
+        if "shell" in self.tools:
+            state.shell_preflight = shell_preflight()
+            state.add_event("ShellPreflight", state.shell_preflight)
 
         try:
             self._run_loop(state)
         except Exception as exc:  # pragma: no cover - defensive boundary
             state.fail(f"Unhandled exception: {exc}")
         finally:
+            capture_final_diff(state)
             write_run_outputs(state)
 
         return state
@@ -71,13 +89,25 @@ class Kernel:
                 state.finish("Run finished by profile.")
                 return
 
-            messages = list(self.profile.build_messages(state))
             visible_tools = list(self.profile.visible_tools(state, self.tools))
+            visible_tool_names = frozenset(tool.name for tool in visible_tools)
+            built_context = self._build_context(state, visible_tools)
+            if self._should_compact(state):
+                self._compact(state)
+                built_context = self._build_context(state, visible_tools)
+            messages = built_context.messages
             state.add_event(
                 "ContextBuilt",
                 {
                     "message_count": len(messages),
                     "visible_tools": [tool.name for tool in visible_tools],
+                    "token_estimate": built_context.token_estimate,
+                    "static_context_chars": built_context.static_context_chars,
+                    "tool_context_chars": built_context.tool_context_chars,
+                    "project_instruction_chars": built_context.project_instruction_chars,
+                    "context_artifacts": [artifact.path for artifact in built_context.artifacts],
+                    "compaction_count": state.compaction_count,
+                    "checkpoint_artifact": state.context_checkpoint_artifact or None,
                 },
             )
             model_call_index = state.turn_count + 1
@@ -88,14 +118,22 @@ class Kernel:
                 messages=messages,
                 tools=visible_tools,
             )
+            http_request_artifact = self._write_provider_payload_artifact(
+                state,
+                call_index=model_call_index,
+                messages=messages,
+                tools=visible_tools,
+            )
             state.add_event(
                 "ModelRequest",
                 {
                     "provider": self.model.name,
+                    "base_url": _provider_base_url(self.model),
                     "message_count": len(messages),
                     "tool_count": len(visible_tools),
                     "context_artifact": context_artifact,
-                    "request_artifact": request_artifact,
+                    "logical_request_artifact": request_artifact,
+                    "http_request_artifact": http_request_artifact,
                 },
             )
 
@@ -130,7 +168,7 @@ class Kernel:
             for call in response.tool_calls:
                 if self._tool_budget_exhausted(state):
                     return
-                self._dispatch_tool_call(state, call)
+                self._dispatch_tool_call(state, call, visible_tool_names=visible_tool_names)
                 if state.done:
                     return
 
@@ -138,17 +176,43 @@ class Kernel:
                 state.finish(response.content or state.summary or "Run finished by profile.")
                 return
 
-            self.profile.compact(state)
-
-    def _dispatch_tool_call(self, state: RunState, call: ToolCall) -> None:
+    def _dispatch_tool_call(self, state: RunState, call: ToolCall, *, visible_tool_names: frozenset[str]) -> None:
+        args_preview = _small_event_data(call.args)
         state.add_event(
             "ToolCallRequested",
             {
                 "tool_call_id": call.id,
                 "tool": call.name,
+                "args": args_preview,
+                "args_preview": args_preview,
             },
         )
         state.tool_call_count += 1
+
+        tool = self.tools.get(call.name)
+        if tool is None:
+            result = ToolResult(
+                tool_name=call.name,
+                call_id=call.id,
+                output=f"Unknown tool requested: {call.name}",
+                ok=False,
+                data={"error_type": "UnknownTool", "available_tools": sorted(self.tools)},
+            )
+            self._append_tool_step(state, call, result)
+            self._record_tool_result(state, call, result)
+            return
+
+        if call.name not in visible_tool_names:
+            result = ToolResult(
+                tool_name=call.name,
+                call_id=call.id,
+                output=f"Tool is not visible for this profile: {call.name}",
+                ok=False,
+                data={"blocked": True, "error_type": "ToolNotVisible", "visible_tools": sorted(visible_tool_names)},
+            )
+            self._append_tool_step(state, call, result)
+            self._record_tool_result(state, call, result)
+            return
 
         try:
             decision = self.policy.evaluate(call, state)
@@ -162,7 +226,7 @@ class Kernel:
                 ok=False,
                 data={"blocked": True, "error_type": type(exc).__name__},
             )
-            state.tool_results.append(result)
+            self._append_tool_step(state, call, result)
             self._record_tool_result(state, call, result)
             state.fail(decision.reason)
             return
@@ -176,20 +240,7 @@ class Kernel:
                 ok=False,
                 data={"blocked": True},
             )
-            state.tool_results.append(result)
-            self._record_tool_result(state, call, result)
-            return
-
-        tool = self.tools.get(call.name)
-        if tool is None:
-            result = ToolResult(
-                tool_name=call.name,
-                call_id=call.id,
-                output=f"Unknown tool requested: {call.name}",
-                ok=False,
-                data={"error_type": "UnknownTool", "available_tools": sorted(self.tools)},
-            )
-            state.tool_results.append(result)
+            self._append_tool_step(state, call, result)
             self._record_tool_result(state, call, result)
             return
 
@@ -211,31 +262,30 @@ class Kernel:
                 call_id=call.id,
                 ok=result.ok,
                 data=result.data,
-                finish=result.finish,
             )
-        state.tool_results.append(result)
+        self._append_tool_step(state, call, result)
         self._record_tool_result(state, call, result)
-
-        if result.finish:
-            state.finish(result.output)
 
     def _record_tool_result(self, state: RunState, call: ToolCall, result: ToolResult) -> None:
         output_limit = state.budgets.max_command_output_chars_visible
         output = result.output[:output_limit]
+        output_chars = _output_chars(result)
         state.add_event(
             "ToolCallFinished",
             {
                 "tool_call_id": call.id,
                 "tool": call.name,
                 "ok": result.ok,
-                "finish": result.finish,
                 "blocked": bool(result.data.get("blocked")),
                 "output": output,
-                "output_chars": len(result.output),
-                "output_truncated": len(result.output) > output_limit,
-                "data": result.data,
+                "output_chars": output_chars,
+                "output_truncated": output_chars > len(output),
+                "data": _small_event_data(result.data),
             },
         )
+
+    def _append_tool_step(self, state: RunState, call: ToolCall, result: ToolResult) -> None:
+        state.tool_steps.append(ToolStep(call=call, result=result))
 
     def _record_policy_decision(self, state: RunState, call: ToolCall, decision: PolicyDecision) -> None:
         state.add_event(
@@ -266,3 +316,82 @@ class Kernel:
             state.fail("Run exceeded max_tool_calls budget.")
             return True
         return False
+
+    def _write_provider_payload_artifact(
+        self,
+        state: RunState,
+        *,
+        call_index: int,
+        messages: list[Message],
+        tools: list[Tool],
+    ) -> str | None:
+        build_payload = getattr(self.model, "build_payload", None)
+        if not callable(build_payload):
+            return None
+        payload = build_payload(messages, tools, state)
+        if not isinstance(payload, dict):
+            return None
+        return write_model_http_request_artifact(state, call_index=call_index, payload=payload)
+
+    def _build_context(self, state: RunState, visible_tools: list[Tool]) -> BuiltContext:
+        build_context = getattr(self.profile, "build_context", None)
+        if callable(build_context):
+            built_context = build_context(state)
+        else:
+            messages = list(self.profile.build_messages(state))
+            built_context = BuiltContext(
+                messages=messages,
+                token_estimate=estimate_messages_tokens(messages),
+                static_context_chars=sum(len(message_text(message)) for message in messages),
+                tool_context_chars=0,
+                project_instruction_chars=0,
+            )
+        token_estimate = built_context.token_estimate + estimate_tools_tokens(visible_tools)
+        state.context_token_estimate = token_estimate
+        return replace(built_context, token_estimate=token_estimate)
+
+    def _should_compact(self, state: RunState) -> bool:
+        should_compact = getattr(self.profile, "should_compact", None)
+        return callable(should_compact) and bool(should_compact(state))
+
+    def _compact(self, state: RunState) -> None:
+        state.add_event(
+            "CompactionStarted",
+            {
+                "profile": self.profile.name,
+                "token_estimate": state.context_token_estimate,
+                "tool_step_count": len(state.tool_steps),
+            },
+        )
+        self.profile.compact(state)
+        state.add_event(
+            "CompactionFinished",
+            {
+                "profile": self.profile.name,
+                "compaction_count": state.compaction_count,
+                "checkpoint_artifact": state.context_checkpoint_artifact or None,
+            },
+        )
+
+
+def _small_event_data(data: dict[str, Any]) -> dict[str, Any]:
+    safe = json_safe(data)
+    encoded = json.dumps(safe, sort_keys=True)
+    if len(encoded) <= MAX_EVENT_DATA_CHARS:
+        return safe
+    return {
+        "_truncated": True,
+        "json_chars": len(encoded),
+        "preview": encoded[:MAX_EVENT_DATA_CHARS],
+    }
+
+
+def _output_chars(result: ToolResult) -> int:
+    value = result.data.get("output_chars")
+    return value if isinstance(value, int) else len(result.output)
+
+
+def _provider_base_url(model: ModelProvider) -> str | None:
+    config = getattr(model, "config", None)
+    value = getattr(config, "base_url", None)
+    return value if isinstance(value, str) else None

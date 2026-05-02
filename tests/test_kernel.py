@@ -67,12 +67,17 @@ class StaticModel:
         return self.responses.pop(0)
 
 
-class FinishTool:
-    name = "finish"
-    schema = {"name": "finish"}
+class EventsFileCheckingModel:
+    name = "events-file-checking-model"
 
-    def run(self, call: ToolCall, state: RunState) -> ToolResult:
-        return ToolResult(tool_name=self.name, output=call.args.get("summary", "finished"), finish=True)
+    def __init__(self) -> None:
+        self.saw_incremental_events = False
+
+    def complete(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState) -> ModelResponse:
+        events_path = state.output_dir / "events.jsonl"
+        text = events_path.read_text()
+        self.saw_incremental_events = all(event_type in text for event_type in ["RunStarted", "ContextBuilt", "ModelRequest"])
+        return ModelResponse(content="done", finish_reason="stop")
 
 
 class NoopTool:
@@ -96,32 +101,45 @@ class LongOutputTool:
     schema = {"name": "long_output"}
 
     def run(self, call: ToolCall, state: RunState) -> ToolResult:
-        return ToolResult(tool_name=self.name, output="abcdef", data={"full_output_artifact": "artifacts/tool.txt"})
+        return ToolResult(tool_name=self.name, output="abcdef", data={"output_artifact": "artifacts/tool.txt"})
+
+
+class LargeDataTool:
+    name = "large_data"
+    schema = {"name": "large_data"}
+
+    def run(self, call: ToolCall, state: RunState) -> ToolResult:
+        return ToolResult(tool_name=self.name, output="ok", data={"payload": "x" * 10_000})
 
 
 def event_types(state: RunState) -> list[str]:
     return [event.type for event in state.events]
 
 
-def test_kernel_dispatches_model_policy_and_tool_until_finish(tmp_path) -> None:
-    finish_call = ToolCall(name="finish", args={"summary": "done"})
-    model = StaticModel([ModelResponse(tool_calls=[finish_call])])
+def test_kernel_dispatches_model_policy_tool_then_finishes_from_content(tmp_path) -> None:
+    noop_call = ToolCall(name="noop")
+    model = StaticModel(
+        [
+            ModelResponse(tool_calls=[noop_call]),
+            ModelResponse(content="done", finish_reason="stop"),
+        ]
+    )
     kernel = Kernel(
         model=model,
         profile=BasicProfile(),
-        tools=[FinishTool()],
+        tools=[NoopTool()],
         policy=AllowAllPolicy(),
     )
 
-    state = kernel.run("finish the task", workspace=tmp_path)
+    state = kernel.run("run a tool then answer", workspace=tmp_path)
 
     assert state.done is True
     assert state.failed is False
     assert state.summary == "done"
-    assert state.turn_count == 1
+    assert state.turn_count == 2
     assert state.tool_call_count == 1
-    assert [result.tool_name for result in state.tool_results] == ["finish"]
-    assert state.tool_results[0].call_id == finish_call.id
+    assert [result.tool_name for result in state.tool_results] == ["noop"]
+    assert state.tool_results[0].call_id == noop_call.id
     assert event_types(state) == [
         "RunStarted",
         "ContextBuilt",
@@ -134,38 +152,45 @@ def test_kernel_dispatches_model_policy_and_tool_until_finish(tmp_path) -> None:
         "PolicyDecision",
         "ToolCallStarted",
         "ToolCallFinished",
+        "ContextBuilt",
+        "ArtifactWritten",
+        "ArtifactWritten",
+        "ModelRequest",
+        "ArtifactWritten",
+        "ModelResponse",
         "RunFinished",
+        "DiffSnapshot",
     ]
     assert (state.output_dir / "events.jsonl").exists()
     assert (state.output_dir / "summary.md").read_text() == "# Run finished\n\ndone\n"
     metrics = json.loads((state.output_dir / "metrics.json").read_text())
     assert metrics["status"] == "finished"
-    assert metrics["turn_count"] == 1
+    assert metrics["turn_count"] == 2
 
-    model_request = next(event for event in state.events if event.type == "ModelRequest")
-    model_response = next(event for event in state.events if event.type == "ModelResponse")
+    model_request = [event for event in state.events if event.type == "ModelRequest"][0]
+    model_response = [event for event in state.events if event.type == "ModelResponse"][0]
     assert model_request.data["context_artifact"] == "artifacts/context-0001.md"
-    assert model_request.data["request_artifact"] == "artifacts/model-request-0001.json"
+    assert model_request.data["logical_request_artifact"] == "artifacts/model-request-logical-0001.json"
+    assert model_request.data["http_request_artifact"] is None
     assert model_response.data["response_artifact"] == "artifacts/model-response-0001.json"
 
     context = (state.output_dir / model_request.data["context_artifact"]).read_text()
-    request = json.loads((state.output_dir / model_request.data["request_artifact"]).read_text())
+    request = json.loads((state.output_dir / model_request.data["logical_request_artifact"]).read_text())
     response = json.loads((state.output_dir / model_response.data["response_artifact"]).read_text())
 
-    assert "finish the task" in context
-    assert "finish" in context
+    assert "run a tool then answer" in context
+    assert "noop" in context
     assert request["provider"] == "static-model"
-    assert request["messages"][1] == {"role": "user", "content": "finish the task"}
-    assert response["tool_calls"] == [{"id": finish_call.id, "name": "finish", "args": {"summary": "done"}}]
+    assert request["messages"][1] == {"role": "user", "content": "run a tool then answer"}
+    assert response["tool_calls"] == [{"id": noop_call.id, "name": "noop", "args": {}}]
     tool_finished = next(event for event in state.events if event.type == "ToolCallFinished")
     assert tool_finished.data == {
-        "tool_call_id": finish_call.id,
-        "tool": "finish",
+        "tool_call_id": noop_call.id,
+        "tool": "noop",
         "ok": True,
-        "finish": True,
         "blocked": False,
-        "output": "done",
-        "output_chars": 4,
+        "output": "ok",
+        "output_chars": 2,
         "output_truncated": False,
         "data": {},
     }
@@ -179,7 +204,7 @@ def test_kernel_max_turn_failure_writes_required_outputs(tmp_path) -> None:
     kernel = Kernel(
         model=model,
         profile=BasicProfile(),
-        tools=[FinishTool()],
+        tools=[NoopTool()],
         policy=AllowAllPolicy(),
         budgets=RunBudgets(max_turns=0),
     )
@@ -190,11 +215,26 @@ def test_kernel_max_turn_failure_writes_required_outputs(tmp_path) -> None:
     assert state.done is True
     assert state.failed is True
     assert state.failure_reason == "Run exceeded max_turns budget."
-    assert event_types(state) == ["RunStarted", "RunFailed"]
+    assert event_types(state) == ["RunStarted", "RunFailed", "DiffSnapshot"]
     assert (state.output_dir / "events.jsonl").exists()
     assert (state.output_dir / "summary.md").read_text() == "# Run failed\n\nRun exceeded max_turns budget.\n"
     assert (state.output_dir / "metrics.json").exists()
     assert (state.output_dir / "final.diff").read_text() == ""
+
+
+def test_events_are_persisted_before_run_finishes(tmp_path) -> None:
+    model = EventsFileCheckingModel()
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[NoopTool()],
+        policy=AllowAllPolicy(),
+    )
+
+    state = kernel.run("check incremental events", workspace=tmp_path)
+
+    assert state.failed is False
+    assert model.saw_incremental_events is True
 
 
 def test_kernel_max_tool_call_failure_is_evented(tmp_path) -> None:
@@ -223,7 +263,7 @@ def test_kernel_max_tool_call_failure_is_evented(tmp_path) -> None:
     assert state.failure_reason == "Run exceeded max_tool_calls budget."
     assert state.turn_count == 1
     assert state.tool_call_count == 1
-    assert event_types(state)[-1] == "RunFailed"
+    assert event_types(state)[-2] == "RunFailed"
     metrics = json.loads((state.output_dir / "metrics.json").read_text())
     assert metrics["status"] == "failed"
     assert metrics["tool_call_count"] == 1
@@ -289,7 +329,7 @@ def test_policy_exception_fails_closed_and_records_tool_result(tmp_path) -> None
             data={"blocked": True, "error_type": "RuntimeError"},
         )
     ]
-    assert event_types(state)[-3:] == ["PolicyDecision", "ToolCallFinished", "RunFailed"]
+    assert event_types(state)[-3:] == ["ToolCallFinished", "RunFailed", "DiffSnapshot"]
     policy_decision = next(event for event in state.events if event.type == "PolicyDecision")
     assert policy_decision.data["allowed"] is False
     assert policy_decision.data["reason"] == "Policy engine error: policy broke"
@@ -328,11 +368,11 @@ def test_tool_exception_gets_finished_event(tmp_path) -> None:
 
 def test_unknown_tool_records_result_with_available_tools_and_can_recover(tmp_path) -> None:
     call = ToolCall(name="missing")
-    finish_call = ToolCall(name="noop")
+    second_call = ToolCall(name="noop")
     model = StaticModel(
         [
             ModelResponse(tool_calls=[call]),
-            ModelResponse(tool_calls=[finish_call]),
+            ModelResponse(tool_calls=[second_call]),
         ]
     )
     kernel = Kernel(
@@ -356,6 +396,24 @@ def test_unknown_tool_records_result_with_available_tools_and_can_recover(tmp_pa
     assert first_finished.data["data"] == {"error_type": "UnknownTool", "available_tools": ["noop"]}
 
 
+def test_unknown_tool_is_rejected_before_policy(tmp_path) -> None:
+    call = ToolCall(name="missing")
+    model = StaticModel([ModelResponse(tool_calls=[call])])
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[NoopTool()],
+        policy=ExplodingPolicy(),
+        budgets=RunBudgets(max_turns=1),
+    )
+
+    state = kernel.run("missing tool", workspace=tmp_path)
+
+    assert state.failure_reason == "Run exceeded max_turns budget."
+    assert "PolicyDecision" not in event_types(state)
+    assert state.tool_results[0].data["error_type"] == "UnknownTool"
+
+
 def test_tool_finished_output_is_truncated(tmp_path) -> None:
     call = ToolCall(name="long_output")
     model = StaticModel([ModelResponse(tool_calls=[call])])
@@ -373,7 +431,26 @@ def test_tool_finished_output_is_truncated(tmp_path) -> None:
     assert tool_finished.data["output"] == "abc"
     assert tool_finished.data["output_chars"] == 6
     assert tool_finished.data["output_truncated"] is True
-    assert tool_finished.data["data"] == {"full_output_artifact": "artifacts/tool.txt"}
+    assert tool_finished.data["data"] == {"output_artifact": "artifacts/tool.txt"}
+
+
+def test_tool_finished_large_data_is_summarized(tmp_path) -> None:
+    call = ToolCall(name="large_data")
+    model = StaticModel([ModelResponse(tool_calls=[call])])
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[LargeDataTool()],
+        policy=AllowAllPolicy(),
+        budgets=RunBudgets(max_turns=1),
+    )
+
+    state = kernel.run("large data", workspace=tmp_path)
+
+    tool_finished = next(event for event in state.events if event.type == "ToolCallFinished")
+    assert tool_finished.data["data"]["_truncated"] is True
+    assert tool_finished.data["data"]["json_chars"] > 4_000
+    assert len(tool_finished.data["data"]["preview"]) == 4_000
 
 
 def test_text_only_model_response_finishes_run(tmp_path) -> None:
@@ -389,7 +466,7 @@ def test_text_only_model_response_finishes_run(tmp_path) -> None:
 
     assert state.failed is False
     assert state.summary == "final answer"
-    assert event_types(state)[-1] == "RunFinished"
+    assert event_types(state)[-2] == "RunFinished"
 
 
 def test_empty_model_response_without_tool_calls_fails(tmp_path) -> None:
@@ -405,7 +482,7 @@ def test_empty_model_response_without_tool_calls_fails(tmp_path) -> None:
 
     assert state.failed is True
     assert state.failure_reason == "Model returned no content and no tool calls."
-    assert event_types(state)[-1] == "RunFailed"
+    assert event_types(state)[-2] == "RunFailed"
 
 
 def test_workspace_must_exist(tmp_path) -> None:
@@ -441,10 +518,14 @@ def test_event_taxonomy_includes_milestone_zero_required_events() -> None:
         "ContextBuilt",
         "ModelRequest",
         "ModelResponse",
+        "CompactionStarted",
+        "CompactionFinished",
         "ToolCallRequested",
         "PolicyDecision",
         "ToolCallStarted",
         "ToolCallFinished",
+        "ShellPreflight",
+        "FilesListed",
         "CommandStarted",
         "CommandFinished",
         "PatchApplied",

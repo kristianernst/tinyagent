@@ -1,6 +1,6 @@
-# Tinyagent Code Philosophy
+# Tinyagent Philosophy
 
-Tinyagent is a small, expressive agent harness.
+Tinyagent is a tiny event-sourced agent VM with one world-class default profile.
 
 The core should stay readable enough that a strong LLM can understand it in one context window.
 
@@ -11,19 +11,20 @@ We optimize for:
 - low ceremony
 - explicit state
 - replayable behavior
-- strong defaults
 - bounded YOLO
-- benchmarked changes
+- profile-owned behavior
+- artifacts over hidden state
 - deletions over abstractions
 
 We do not optimize for:
 
 - framework completeness
 - premature generality
-- plugin machinery before plugins matter
+- callback forests
 - hidden magic
 - deep inheritance trees
-- code golf
+- large payloads in events
+- provider lock-in
 - feature count
 
 A feature is only accepted if its value exceeds its complexity cost.
@@ -31,6 +32,8 @@ A feature is only accepted if its value exceeds its complexity cost.
 A performance or capability claim needs an eval, benchmark, or trace.
 
 A new abstraction must either remove repeated complexity or make behavior more inspectable.
+
+Large payloads do not belong in events. Large payloads go to artifacts and events reference those artifacts.
 
 The kernel must remain boring.  
 The profile is where behavior lives.  
@@ -72,6 +75,5 @@ Every file, class, function, and abstraction must either:
 ```
 
 If it does not do one of those, it should probably not exist yet.
-
 
 

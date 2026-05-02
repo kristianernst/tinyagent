@@ -1,4 +1,5 @@
 
+# Tinyagent PR Checklist
 
 1. Does this add a new concept? If yes, why is an existing concept insufficient?
 2. Does this increase kernel LoC? If yes, why does it belong in kernel rather than profile/tool/extension?
@@ -9,22 +10,17 @@
 7. Can a model understand this file without reading 20 others?
 8. Did this remove any code?
 
+## Delete budget
 
-Delete budget:
+- What code did this delete?
+- What concept did this collapse?
+- What special case did this remove?
 
-
-What code did this delete?
-What concept did this collapse?
-What special case did this remove?
-
-
-
-__A great Tinyagent PR is not__:
+## A great Tinyagent PR is not
 
 Added agent memory subsystem, retrieval service, planner, graph runner, and callback framework.
 
-
-__A great Tinyagent PR is__:
+## A great Tinyagent PR is
 
 Collapsed tool execution and policy logging into one event path.
 Deleted 120 LoC.
@@ -37,7 +33,7 @@ Refactored profile hooks so verification policy is a 4-line change.
 Added golden trace.
 
 
-__Keep the kernel aggressively small__
+## Keep the kernel aggressively small
 
 I would be cautious about these abstractions appearing too early:
 
