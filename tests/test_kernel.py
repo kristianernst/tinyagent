@@ -3,15 +3,22 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 
+import pytest
+
 from agentd.contracts import Tool
-from agentd.events import EVENT_TYPES, load_events_jsonl
+from agentd.events import EVENT_TYPES, Event, load_events_jsonl
 from agentd.kernel import Kernel
-from agentd.state import Message, ModelResponse, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult
+from agentd.state import Message, ModelResponse, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, Workspace
 
 
 class AllowAllPolicy:
     def evaluate(self, call: ToolCall, state: RunState) -> PolicyDecision:
         return PolicyDecision.allow(f"{call.name} allowed")
+
+
+class DenyAllPolicy:
+    def evaluate(self, call: ToolCall, state: RunState) -> PolicyDecision:
+        return PolicyDecision.deny(f"{call.name} denied")
 
 
 class BasicProfile:
@@ -35,8 +42,8 @@ class BasicProfile:
     def should_finish(self, state: RunState) -> bool:
         return False
 
-    def compact(self, state: RunState) -> RunState:
-        return state
+    def compact(self, state: RunState) -> None:
+        return None
 
 
 class StaticModel:
@@ -69,6 +76,22 @@ class NoopTool:
         return ToolResult(tool_name=self.name, output="ok")
 
 
+class ExplodingTool:
+    name = "explode"
+    schema = {"name": "explode"}
+
+    def run(self, call: ToolCall, state: RunState) -> ToolResult:
+        raise RuntimeError("boom")
+
+
+class LongOutputTool:
+    name = "long_output"
+    schema = {"name": "long_output"}
+
+    def run(self, call: ToolCall, state: RunState) -> ToolResult:
+        return ToolResult(tool_name=self.name, output="abcdef", data={"full_output_artifact": "artifacts/tool.txt"})
+
+
 def event_types(state: RunState) -> list[str]:
     return [event.type for event in state.events]
 
@@ -91,6 +114,7 @@ def test_kernel_dispatches_model_policy_and_tool_until_finish(tmp_path) -> None:
     assert state.turn_count == 1
     assert state.tool_call_count == 1
     assert [result.tool_name for result in state.tool_results] == ["finish"]
+    assert state.tool_results[0].call_id == finish_call.id
     assert event_types(state) == [
         "RunStarted",
         "ContextBuilt",
@@ -126,6 +150,16 @@ def test_kernel_dispatches_model_policy_and_tool_until_finish(tmp_path) -> None:
     assert request["provider"] == "static-model"
     assert request["messages"][1] == {"role": "user", "content": "finish the task"}
     assert response["tool_calls"] == [{"id": finish_call.id, "name": "finish", "args": {"summary": "done"}}]
+    tool_finished = next(event for event in state.events if event.type == "ToolCallFinished")
+    assert tool_finished.data == {
+        "tool_call_id": finish_call.id,
+        "tool": "finish",
+        "ok": True,
+        "finish": True,
+        "blocked": False,
+        "output": "done",
+        "data": {},
+    }
 
     loaded_events = load_events_jsonl(state.output_dir / "events.jsonl")
     assert [event.to_json_dict() for event in loaded_events] == [event.to_json_dict() for event in state.events]
@@ -186,6 +220,153 @@ def test_kernel_max_tool_call_failure_is_evented(tmp_path) -> None:
     assert metrics["tool_call_count"] == 1
 
 
+def test_denied_tool_call_gets_finished_event_and_counts_requested_call(tmp_path) -> None:
+    denied_call = ToolCall(name="noop")
+    model = StaticModel([ModelResponse(tool_calls=[denied_call])])
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[NoopTool()],
+        policy=DenyAllPolicy(),
+        budgets=RunBudgets(max_turns=1),
+    )
+
+    state = kernel.run("deny tool", workspace=tmp_path)
+
+    assert state.failed is True
+    assert state.failure_reason == "Run exceeded max_turns budget."
+    assert state.tool_call_count == 1
+    assert state.tool_results == [
+        ToolResult(
+            tool_name="noop",
+            output="noop denied",
+            call_id=denied_call.id,
+            ok=False,
+            data={"blocked": True},
+        )
+    ]
+    assert "ToolCallStarted" not in event_types(state)
+    tool_finished = next(event for event in state.events if event.type == "ToolCallFinished")
+    assert tool_finished.data["tool_call_id"] == denied_call.id
+    assert tool_finished.data["ok"] is False
+    assert tool_finished.data["blocked"] is True
+    assert tool_finished.data["output"] == "noop denied"
+    assert tool_finished.data["data"] == {"blocked": True}
+
+
+def test_tool_exception_gets_finished_event(tmp_path) -> None:
+    call = ToolCall(name="explode")
+    model = StaticModel([ModelResponse(tool_calls=[call])])
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[ExplodingTool()],
+        policy=AllowAllPolicy(),
+        budgets=RunBudgets(max_turns=1),
+    )
+
+    state = kernel.run("explode", workspace=tmp_path)
+
+    assert state.failed is True
+    assert state.failure_reason == "Run exceeded max_turns budget."
+    assert state.tool_call_count == 1
+    assert state.tool_results[0].call_id == call.id
+    assert state.tool_results[0].ok is False
+    assert state.tool_results[0].output == "Tool error: boom"
+    tool_finished = next(event for event in state.events if event.type == "ToolCallFinished")
+    assert tool_finished.data["tool_call_id"] == call.id
+    assert tool_finished.data["ok"] is False
+    assert tool_finished.data["output"] == "Tool error: boom"
+    assert tool_finished.data["data"] == {"error_type": "RuntimeError"}
+
+
+def test_unknown_tool_gets_finished_event_before_run_failure(tmp_path) -> None:
+    call = ToolCall(name="missing")
+    model = StaticModel([ModelResponse(tool_calls=[call])])
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[],
+        policy=AllowAllPolicy(),
+    )
+
+    state = kernel.run("missing tool", workspace=tmp_path)
+
+    assert state.failed is True
+    assert state.failure_reason == "Unknown tool requested: missing"
+    assert event_types(state)[-2:] == ["ToolCallFinished", "RunFailed"]
+    tool_finished = next(event for event in state.events if event.type == "ToolCallFinished")
+    assert tool_finished.data["tool_call_id"] == call.id
+    assert tool_finished.data["ok"] is False
+    assert tool_finished.data["output"] == "Unknown tool requested: missing"
+    assert tool_finished.data["data"] == {"error_type": "UnknownTool"}
+
+
+def test_tool_finished_output_is_truncated(tmp_path) -> None:
+    call = ToolCall(name="long_output")
+    model = StaticModel([ModelResponse(tool_calls=[call])])
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[LongOutputTool()],
+        policy=AllowAllPolicy(),
+        budgets=RunBudgets(max_turns=1, max_command_output_chars_visible=3),
+    )
+
+    state = kernel.run("long output", workspace=tmp_path)
+
+    tool_finished = next(event for event in state.events if event.type == "ToolCallFinished")
+    assert tool_finished.data["output"] == "abc"
+    assert tool_finished.data["data"] == {"full_output_artifact": "artifacts/tool.txt"}
+
+
+def test_text_only_model_response_finishes_run(tmp_path) -> None:
+    model = StaticModel([ModelResponse(content="final answer", finish_reason="stop")])
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[NoopTool()],
+        policy=AllowAllPolicy(),
+    )
+
+    state = kernel.run("answer", workspace=tmp_path)
+
+    assert state.failed is False
+    assert state.summary == "final answer"
+    assert event_types(state)[-1] == "RunFinished"
+
+
+def test_empty_model_response_without_tool_calls_fails(tmp_path) -> None:
+    model = StaticModel([ModelResponse()])
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[NoopTool()],
+        policy=AllowAllPolicy(),
+    )
+
+    state = kernel.run("empty", workspace=tmp_path)
+
+    assert state.failed is True
+    assert state.failure_reason == "Model returned no content and no tool calls."
+    assert event_types(state)[-1] == "RunFailed"
+
+
+def test_workspace_must_exist(tmp_path) -> None:
+    missing = tmp_path / "missing"
+
+    with pytest.raises(ValueError, match="Workspace does not exist"):
+        RunState.create("task", Workspace(missing))
+
+
+def test_workspace_must_be_directory(tmp_path) -> None:
+    file_path = tmp_path / "workspace.txt"
+    file_path.write_text("not a dir")
+
+    with pytest.raises(ValueError, match="Workspace does not exist"):
+        RunState.create("task", Workspace(file_path))
+
+
 def test_event_taxonomy_includes_milestone_zero_required_events() -> None:
     assert {
         "RunStarted",
@@ -206,3 +387,8 @@ def test_event_taxonomy_includes_milestone_zero_required_events() -> None:
         "DiffSnapshot",
         "ArtifactWritten",
     } <= EVENT_TYPES
+
+
+def test_unknown_event_type_rejected() -> None:
+    with pytest.raises(ValueError, match="Unknown event type"):
+        Event(run_id="run_test", type="TypoEvent")
