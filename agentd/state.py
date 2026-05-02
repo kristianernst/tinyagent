@@ -109,7 +109,11 @@ class RunState:
         if not resolved_workspace.root.exists() or not resolved_workspace.root.is_dir():
             raise ValueError(f"Workspace does not exist or is not a directory: {resolved_workspace.root}")
         resolved_run_id = run_id or f"run_{uuid4().hex}"
-        resolved_output_dir = output_dir or resolved_workspace.root / ".tinyagent" / "runs" / resolved_run_id
+        resolved_output_dir = (
+            output_dir.expanduser().resolve()
+            if output_dir
+            else resolved_workspace.root / ".tinyagent" / "runs" / resolved_run_id
+        )
         return cls(
             run_id=resolved_run_id,
             task=task,

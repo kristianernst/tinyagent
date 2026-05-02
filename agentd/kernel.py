@@ -150,7 +150,23 @@ class Kernel:
         )
         state.tool_call_count += 1
 
-        decision = self.policy.evaluate(call, state)
+        try:
+            decision = self.policy.evaluate(call, state)
+        except Exception as exc:
+            decision = PolicyDecision.deny(f"Policy engine error: {exc}")
+            self._record_policy_decision(state, call, decision)
+            result = ToolResult(
+                tool_name=call.name,
+                call_id=call.id,
+                output=decision.reason,
+                ok=False,
+                data={"blocked": True, "error_type": type(exc).__name__},
+            )
+            state.tool_results.append(result)
+            self._record_tool_result(state, call, result)
+            state.fail(decision.reason)
+            return
+
         self._record_policy_decision(state, call, decision)
         if not decision.allowed:
             result = ToolResult(
@@ -171,11 +187,10 @@ class Kernel:
                 call_id=call.id,
                 output=f"Unknown tool requested: {call.name}",
                 ok=False,
-                data={"error_type": "UnknownTool"},
+                data={"error_type": "UnknownTool", "available_tools": sorted(self.tools)},
             )
             state.tool_results.append(result)
             self._record_tool_result(state, call, result)
-            state.fail(f"Unknown tool requested: {call.name}")
             return
 
         state.add_event("ToolCallStarted", {"tool_call_id": call.id, "tool": call.name})
@@ -205,6 +220,8 @@ class Kernel:
             state.finish(result.output)
 
     def _record_tool_result(self, state: RunState, call: ToolCall, result: ToolResult) -> None:
+        output_limit = state.budgets.max_command_output_chars_visible
+        output = result.output[:output_limit]
         state.add_event(
             "ToolCallFinished",
             {
@@ -213,7 +230,9 @@ class Kernel:
                 "ok": result.ok,
                 "finish": result.finish,
                 "blocked": bool(result.data.get("blocked")),
-                "output": result.output[: state.budgets.max_command_output_chars_visible],
+                "output": output,
+                "output_chars": len(result.output),
+                "output_truncated": len(result.output) > output_limit,
                 "data": result.data,
             },
         )

@@ -149,8 +149,7 @@ def _parse_tool_call(call: dict[str, Any]) -> ToolCall:
         raise ProviderError(f"Tool call arguments for {name} are invalid JSON.") from exc
     if not isinstance(args, dict):
         raise ProviderError(f"Tool call arguments for {name} must be a JSON object.")
-    return ToolCall(
-        id=call.get("id") or "",
-        name=name,
-        args=args,
-    )
+    call_id = call.get("id")
+    if call_id:
+        return ToolCall(id=call_id, name=name, args=args)
+    return ToolCall(name=name, args=args)
