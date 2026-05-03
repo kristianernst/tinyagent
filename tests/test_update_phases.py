@@ -100,6 +100,44 @@ def test_transcript_records_model_tool_result_and_finish_gate(tmp_path) -> None:
     assert state.transcript.to_json_dict()["pending_tool_call_ids"] == []
 
 
+def test_observations_classify_patch_diff_verification_and_policy(tmp_path) -> None:
+    (tmp_path / "hello.py").write_text("def test_ok():\n    assert True\n")
+    patch = "\n".join(
+        [
+            "*** Begin Patch",
+            "*** Update File: hello.py",
+            "@@",
+            "-def test_ok():",
+            "+def test_ok():",
+            "     assert True",
+            "*** End Patch",
+        ]
+    )
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(name="apply_patch", args={"patch": patch}),)),
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "git diff --no-index hello.py hello.py"}),)),
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": f"{sys.executable} -m pytest hello.py"}),)),
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "curl https://example.com"}),)),
+                ModelResponse(content="Done. Network command was blocked by policy. Verification passed.", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    ).run("record observations", workspace=tmp_path, run_id="run_observations_contract")
+
+    kinds = [observation.kind for observation in state.observations]
+    assert "patch_applied" in kinds
+    assert "file_changed" in kinds
+    assert "diff_seen" in kinds
+    assert "verification" in kinds
+    assert "policy_block" in kinds
+    assert any(event.type == "observation.recorded" for event in state.events)
+
+
 def test_context_report_matches_final_model_request_after_hooks(tmp_path) -> None:
     class RequestHook:
         name = "request-hook"

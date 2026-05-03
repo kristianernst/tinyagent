@@ -15,6 +15,7 @@ from agentd.contracts import ApprovalHandler, Executor, LocalExecutor, ModelProv
 from agentd.events import EventSink, json_safe
 from agentd.hooks import TinyHook
 from agentd.model_stream import complete_model_call
+from agentd.observations import extract_observations
 from agentd.output import (
     capture_final_diff,
     write_context_report_artifact,
@@ -659,6 +660,13 @@ class Kernel:
             },
         )
         state.tool_steps.append(ToolStep(call=call, result=result))
+        for observation in extract_observations(call, result, state):
+            state.observations.append(observation)
+            state.emit(
+                "observation.recorded",
+                observation.to_json_dict(),
+                artifact_refs=list(observation.refs),
+            )
 
     def _record_policy_decision(self, state: RunState, call: ToolCall, decision: PolicyDecision) -> None:
         approval_id = decision.approval.approval_id if decision.approval else None
