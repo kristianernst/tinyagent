@@ -1,491 +1,742 @@
-# tinyagent Pro Update Implementation Plan
+# tinyagent Agentic Capability Plan
 
-Status: planning draft
-Source: docs/pro-update.md
+Status: structured approach draft
+Source: docs/comment-on-update.md
+Sandbox reference: https://cursor.com/blog/agent-sandboxing
 Workflow: Graphite stacked branches, each branch reviewable on its own
 
-## 1. Summary
+## 1. Direction
 
-The pro update argues that tinyagent already has the right visible shape: a small
-kernel, a profile-driven run loop, and a default two-tool coding surface
-(`shell` and `apply_patch`). The implementation work should therefore avoid a
-rewrite or a larger tool catalog. The goal is to make the harness more
-perceptive behind the scenes:
+The latest review says tinyagent does not need a larger agent framework. It
+needs harder runtime invariants and better recovery surfaces:
 
-- canonical transcript invariants instead of ad hoc history
-- typed observations extracted from raw tool results
-- dynamic context planning instead of only static layer packing
-- pure progress guardrails for no-progress loops
-- explicit execution envelopes for safer autonomy
-- provider capability modeling to keep provider quirks out of the kernel
-- a minimal extension host over the existing hook shape
-- eval analysis that turns traces into harness-quality feedback
+- every workspace mutation is detected, regardless of which tool caused it
+- worktree isolation is named honestly and separated from real sandboxing
+- shell failures explain policy and sandbox constraints in model-visible terms
+- model/provider specs choose familiar edit tools and context budgets
+- ContextFS becomes the universal recovery surface for history, tools, diffs,
+  failures, observations, and terminal output
+- runs can be streamed, reconnected, replayed, inspected, forked, approved, and
+  rendered by clients
+- evals compare harness variants and explain what changed
 
-The stack should be built bottom-up. Each branch introduces one durable
-primitive and leaves the model-facing behavior as stable as possible.
+The core loop should stay small. The visible workflow should stay lightweight.
+The hardening belongs in evidence, execution boundaries, context, model
+adaptation, session state, and eval feedback.
 
-## 2. Graphite Stack Shape
+## 2. Current Baseline
 
-Start from current `main` and keep each milestone as a Graphite branch stacked
-on the previous one.
+Several primitives from the older plan already exist and should be extended
+rather than re-created:
+
+- `agentd/transcript.py` records model responses, tool calls, tool results,
+  finish-gate items, and compactions.
+- `agentd/observations.py` extracts basic typed observations from shell and
+  patch results.
+- `ApexCoderProfile.plan_next_context(...)` already chooses simple context
+  modes.
+- `agentd/progress.py` blocks repeated failed commands and repeated patch
+  failures.
+- `agentd/execution.py` defines local `ExecutionEnvelope` metadata.
+- `agentd/models.py` defines `ModelCapabilities`.
+- `agentd/extensions.py` provides a small extension host.
+- `agentd/eval_metrics.py` derives initial harness metrics from events.
+
+The main gaps are that the existing pieces are not yet strong enough:
+
+- mutation events are planned/completed around `shell` and `apply_patch`, but
+  they do not prove the workspace actually changed
+- the finish gate still keys edits primarily off `apply_patch`
+- `read_file` and `search_repo` are registered but hidden by the default
+  profile
+- worktree mode is exposed as a sandbox mode even though it is only git
+  isolation
+- there is no real `container` or native sandbox backend
+- sandbox/policy failures are not yet rendered as rich capability failures
+- `ModelCapabilities` does not yet describe edit style, provider protocol, or
+  prompt/tool variants
+- ContextFS is useful but still sparse
+- there is no `agentctl serve` runtime surface
+- evals report one run but do not compare named harness variants
+
+## 3. Sandbox Lessons To Apply
+
+Cursor's sandboxing writeup makes three points that should shape tinyagent:
+
+1. Approval prompts are not enough. Frequent approvals cause fatigue, especially
+   when users run multiple agents in parallel. The useful model is free action
+   inside a constrained environment and explicit approval only when crossing a
+   boundary such as network access.
+2. The sandbox API should be uniform even when implementation is platform
+   specific. Cursor uses different primitives on each OS: Seatbelt via
+   `sandbox-exec` on macOS, Landlock and seccomp on Linux, and Linux sandboxing
+   inside WSL2 on Windows.
+3. The harness must teach the model what the sandbox permits. Shell tool
+   descriptions should state filesystem, git, and network constraints, and
+   failed shell results should name the responsible constraint instead of
+   returning a generic command failure.
+
+tinyagent should not jump straight to a complex native sandbox. It should first
+separate the execution contract from the backend, then add one real enforced
+backend, then make the shell prompt/results sandbox-aware.
+
+## 4. Stack Shape
+
+Use Graphite for implementation work. Prefer stacked PRs over one large branch
+or unrelated flat branches, and keep each stack entry independently reviewable.
+
+Recommended main stack:
 
 ```bash
 gt checkout main
-gt create ta-pro-plan-docs -a -m "Add pro update implementation plan"
-gt create ta-transcript-core --onto ta-pro-plan-docs -m "Add canonical transcript substrate"
-gt create ta-observations --onto ta-transcript-core -m "Extract typed observations from tool results"
-gt create ta-context-plan --onto ta-observations -m "Add dynamic context planning"
-gt create ta-progress-guard --onto ta-context-plan -m "Add progress guardrails"
-gt create ta-execution-envelope --onto ta-progress-guard -m "Formalize execution envelopes"
-gt create ta-model-capabilities --onto ta-execution-envelope -m "Add model provider capabilities"
-gt create ta-extension-host --onto ta-model-capabilities -m "Add minimal extension host"
-gt create ta-eval-analysis --onto ta-extension-host -m "Add harness eval analysis"
+gt create ta-agentic-plan -a -m "Update agentic capability plan"
+gt create ta-visible-inspection --onto ta-agentic-plan -m "Expose structured inspection tools"
+gt create ta-workspace-delta --onto ta-visible-inspection -m "Detect workspace mutations around tool calls"
+gt create ta-sandbox-contract --onto ta-workspace-delta -m "Separate sandbox contract from worktree isolation"
+gt create ta-model-specs --onto ta-sandbox-contract -m "Select tool shapes from model specs"
+gt create ta-contextfs-recovery --onto ta-model-specs -m "Expand ContextFS recovery files"
+gt create ta-runtime-serve --onto ta-contextfs-recovery -m "Add run server and SSE event stream"
+gt create ta-eval-compare --onto ta-runtime-serve -m "Compare harness variants in evals"
 ```
 
-Validate and submit the full stack only after the whole stack is green:
+Recommended side stack:
+
+```bash
+gt create ta-container-sandbox --onto ta-sandbox-contract -m "Add first enforced sandbox backend"
+```
+
+`ta-container-sandbox` depends on the sandbox contract, but it should not block
+model specs, ContextFS, runtime server, or eval comparison. Docker/Podman work
+is platform-sensitive and should mature independently while the main harness
+stack keeps moving.
+
+Run the fast suite after each implementation branch:
 
 ```bash
 PYTHONPATH=. pytest
-gt submit --stack --dry-run
-gt submit --stack --confirm
 ```
 
-If a branch needs revision after review:
+Before publishing the stack:
 
 ```bash
-gt checkout <branch>
 git status
 git diff
-gt modify -a -m "<updated message>"
-gt restack
 PYTHONPATH=. pytest
 gt submit --stack --dry-run
 ```
 
-## 3. Milestone 0: Planning Branch
+## 5. Phase 0: Planning
 
-Branch: `ta-pro-plan-docs`
+Branch: `ta-agentic-plan`
 
-Purpose: capture the implementation roadmap derived from `docs/pro-update.md`
-before making runtime changes.
-
-Changes:
-
-- Add this plan in `docs/plan.md`.
-- Include `docs/pro-update.md` in the branch if it is still untracked when the
-  branch is created, so the implementation rationale travels with the plan.
-- Do not include unrelated untracked docs unless explicitly requested.
+Purpose: replace the older pro-update implementation plan with this current
+roadmap based on `docs/comment-on-update.md` and Cursor's sandboxing article.
 
 Acceptance criteria:
 
-- Documentation-only diff.
-- Plan clearly names every Graphite branch, dependency, and acceptance gate.
-- No runtime code, tests, lockfiles, or generated source exports are changed.
+- `docs/plan.md` names the updated priorities and current baseline.
+- The sandbox plan distinguishes worktree isolation from real sandboxing.
+- No runtime code changes are included in this documentation branch.
 
 Verification:
 
 ```bash
-git diff -- docs/plan.md docs/pro-update.md
+git diff -- docs/plan.md
 ```
 
-## 4. Milestone 1: Transcript And Evidence Substrate
+## 6. Phase 1: Visible Structured Inspection
 
-### Branch: `ta-transcript-core`
+Branch: `ta-visible-inspection`
 
-Purpose: add a canonical transcript substrate that makes model responses, tool
-calls, tool results, compactions, and synthetic harness messages replayable with
-clear invariants.
+Purpose: give the model structured read/search affordances without adding
+workflow structure.
 
-Implementation details:
+Changes:
 
-- Add a new transcript module, likely `agentd/transcript.py`, with immutable or
-  append-only record types for:
-  - model calls and model responses
-  - tool calls and tool results
-  - synthetic tool results for blocked calls
-  - finish-gate injected messages
-  - compaction records
-  - rollback or branch boundaries, even if rollback is only structural in v1
-- Store the transcript on `RunState` while keeping `RunState.tool_steps` as the
-  compatibility path for existing context, finish-gate, replay, and tests.
-- Route kernel recording through transcript helpers at the existing boundaries:
-  model response completed, tool call requested, policy-hidden or unknown tool
-  result, tool execution result, finish blocked, and compaction completed.
-- Enforce minimal invariants:
-  - every recorded tool result has a matching call ID
-  - every dispatched model tool call eventually receives a tool result
-  - hidden and unknown tools are recorded as results, not dropped
-  - large payloads stay artifact-backed instead of embedded into transcript data
-- Preserve the existing event log and artifact format unless a later eval branch
-  deliberately extends them.
-
-Acceptance criteria:
-
-- Existing public behavior remains unchanged.
-- Replay and context reports still work with the compatibility `tool_steps`
-  view.
-- Transcript data can be serialized without including large raw artifacts.
-- Kernel code has one obvious path for recording tool-call/result pairs.
-
-Tests:
-
-- Model response with one tool call records one transcript call and one result.
-- Unknown tool and hidden tool calls record failed results with call IDs.
-- Policy denial records a synthetic failed tool result.
-- Finish-gate blocked response records an injected transcript item.
-- Existing replay, kernel, and context tests still pass.
-
-### Branch: `ta-observations`
-
-Purpose: add a typed observation layer so the harness can understand what raw
-tool output means without exposing more structure to the model.
-
-Implementation details:
-
-- Add an `Observation` dataclass with fields along these lines:
-  - `kind`: a stable string or literal such as `command_failed`, `test_run`,
-    `test_failure`, `file_changed`, `diff_seen`, `verification`, `policy_block`,
-    `patch_applied`, `search_result`, `dependency_error`, or `sandbox_block`
-  - `subject`: command, path, test target, policy permission, or affected file
-  - `summary`: short human-readable evidence summary
-  - `confidence`: default `1.0`
-  - `refs`: artifact paths, call IDs, or file paths
-  - `data`: small structured metadata only
-- Add an observer/extractor module, likely `agentd/observations.py`.
-- Extract observations from existing `ToolResult` metadata instead of parsing
-  arbitrary command output first. Use command text, exit code, failure kind,
-  patch metadata paths, read hints, and context artifacts as primary inputs.
-- Teach shell extraction to classify:
-  - `pytest`, `unittest`, `ruff`, `mypy`, `npm test`, `cargo test`, and `go test`
-    as verification/test commands
-  - nonzero verification commands as test failures or command failures
-  - `git diff`, `git show`, and relevant file inspections as evidence
-  - `rg` commands as search observations with command and artifact refs
-- Teach patch extraction to classify changed paths from `metadata["paths"]` or
-  `data["paths"]`.
-- Store observations on `RunState` and emit an `observation.recorded` event with
-  small data only.
+- Change `ApexCoderProfile.DEFAULT_VISIBLE_TOOL_NAMES` from
+  `("shell", "apply_patch")` to at least
+  `("read_file", "search_repo", "apply_patch", "shell")`.
+- Keep `list_files` optional; `rg --files` through shell remains fine.
+- Update `profiles/apex-coder/system.md` so inspection prefers `read_file` and
+  `search_repo`, while shell remains the default for tests, builds, git, and
+  arbitrary developer commands.
+- Add observation extraction for `read_file` and `search_repo` results rather
+  than only shell `rg` commands.
+- Return richer `ToolResult` metadata for structured inspection:
+  - `read_file` should emit path, line range, total lines, byte count, and
+    `artifact_path`/`read_hints` when a successful read is large enough to need
+    artifact backing.
+  - `search_repo` should set `artifact_path` and `read_hints` for captured
+    search output, not only store artifact paths in `data`.
+- Add observations:
+  - `read_file -> file_read`
+  - `search_repo -> search_result`
+- Update `agentd/observations.py`, `agentd/eval_metrics.py`, and
+  `agentd/context/checkpoint.py` so structured inspection counts as inspection
+  and context evidence.
+- Treat `file.read` and `search.completed` events as pre-edit inspection
+  evidence in eval metrics.
 
 Acceptance criteria:
 
-- Observations are deterministic and cheap.
-- Finish gates and future context planning can consume observations without
-  reparsing tool output.
-- Observation extraction does not break existing tool result schemas.
+- Registered hidden tools still cannot be called unless visible in the model
+  request.
+- Structured search/read outputs stay small and artifact-backed when needed.
+- Finish and eval gates recognize both shell inspection and first-party
+  inspection tools.
+- `read_file -> apply_patch -> final` satisfies inspect-before-edit, but still
+  requires diff/file inspection and verification after the edit.
 
 Tests:
 
-- Successful and failing pytest commands produce verification/test observations.
-- Failed non-test shell command produces `command_failed`.
-- `git diff` or `git show` produces `diff_seen`.
-- Patch results produce one or more `file_changed` observations.
-- Policy-denied tool calls produce `policy_block`.
-- Observation events omit large output payloads.
+- Default profile exposes `read_file`, `search_repo`, `apply_patch`, and
+  `shell`.
+- Hidden `list_files` remains blocked unless explicitly visible.
+- `read_file` before `apply_patch` satisfies the inspect-before-edit metric.
+- `search_repo` emits a `search_result` observation.
+- Large successful `read_file` and `search_repo` results provide artifact paths
+  and read hints.
 
-## 5. Milestone 2: Context Intelligence
+## 7. Phase 2: Workspace Delta Observer
 
-### Branch: `ta-context-plan`
+Branch: `ta-workspace-delta`
 
-Purpose: replace purely static context packing with a small planning layer that
-selects evidence based on the next likely task mode.
+Purpose: make mutation tracking evidence-based instead of tool-name-based.
 
-Implementation details:
+Changes:
 
-- Add a `ContextPlan` type, likely in `agentd/context/types.py`, with:
-  - selected mode: `explore`, `edit`, `debug`, `verify`, `summarize`, or `finish`
-  - pinned item IDs or observation kinds
-  - recent-tail budget
-  - included observation kinds
-  - omitted artifact refs
-  - a short reason string for reports
-- Add a profile method or compatibility hook, for example
-  `plan_next_context(state) -> ContextPlan`.
-- Implement deterministic v1 planning in `ApexCoderProfile`:
-  - `explore`: no edits yet, prioritize task, project instructions, contextfs,
-    recent search/file reads
-  - `edit`: after relevant inspection but before edits, keep changed target
-    files and most recent search evidence
-  - `debug`: after failing tests or command failures, keep failing command,
-    failure artifact, latest edits, and relevant changed files
-  - `verify`: after edits without passing verification, keep latest patch,
-    changed files, and candidate verification commands
-  - `finish`: after passing verification or explicit limitation, keep diff,
-    verification evidence, policy/sandbox limitations, and finish-gate feedback
-  - `summarize`: when compaction is near, prioritize durable known facts,
-    unresolved issues, changed files, and artifact refs
-- Teach `ContextBuilder` to consume the plan while preserving current layers:
-  system prompt, environment, project instructions, task, contextfs index,
-  finish gate, checkpoint, and recent tools.
-- Add plan metadata to context reports: selected mode, reason, included
-  observation kinds, and exclusions.
+- Add `WorkspaceDeltaObserver`, likely in `agentd/workspace_delta.py`.
+- Snapshot cheap workspace state before and after every allowed tool call:
+  - `git status --porcelain=v1 -z`
+  - `git diff --name-only -z HEAD --`
+  - `git diff --stat HEAD --`
+  - `git ls-files --others --exclude-standard -z`
+- Exclude tinyagent-owned and VCS paths from all mutation detection:
+  - `.git/`
+  - `.tinyagent/`
+  - `state.output_dir`
+  - configured generated artifact directories, if any
+- For non-git workspaces, maintain a manifest of
+  `path -> size, mtime_ns, mode`, then hash only files whose stat changed.
+  Do not use a sample-based detector that can miss changes.
+- Emit:
+  - `workspace.delta.started`
+  - `workspace.delta.completed`
+  - `workspace.mutation.detected`
+  - `file.changed`
+  - `diff.snapshot`
+- Write mutation diffs to artifacts such as
+  `context/diffs/mutation-0003.patch`.
+- Append `file_changed` and `diff_seen` observations from detected deltas,
+  independent of whether the mutating tool was `apply_patch`, `shell`, or an
+  extension tool.
+- Change finish gates from "after successful apply_patch" to "after any
+  detected workspace mutation."
+- Keep existing `patch_applied` observations, but treat them as one source of
+  mutation evidence, not the source of truth.
+- Split implementation into two commits inside the branch:
+  - delta observer, events, observations, and artifacts
+  - finish-gate migration from `apply_patch` evidence to mutation evidence
+- Handle verification commands that mutate files without creating a verification
+  loop. If the last mutation was caused by a verification command, require
+  post-mutation diff/file inspection. Require another verification only after a
+  later non-verification mutation.
 
 Acceptance criteria:
 
-- Existing context output remains recognizable.
-- Failing-test evidence survives context pressure.
-- Latest edit, latest diff, latest verification, and latest failure are pinned
-  when relevant.
-- Context reports explain why important items were included or excluded.
+- Shell commands that mutate files require post-mutation diff/file inspection
+  and verification before final answer.
+- Non-mutating shell commands do not trigger edit gates.
+- Non-git workspaces still detect changes well enough to force changed-file
+  inspection.
+- Mutation artifacts are recoverable through ContextFS.
+- ContextFS and run artifact writes do not themselves count as workspace
+  mutations.
 
 Tests:
 
-- Debug mode keeps failing test output even under a tiny recent-tool budget.
-- Verify mode keeps latest patch evidence and asks for verification evidence.
-- Finish mode keeps diff and passing verification evidence.
-- Static context tests still pass with added plan metadata.
+- `python -c 'open("x.txt","w").write("x")'` triggers
+  `workspace.mutation.detected`.
+- `pytest` or `rg` without file changes does not trigger mutation.
+- A shell mutation followed by final answer is blocked until diff/file
+  inspection and verification evidence exists.
+- Non-git workspace mutation produces changed-file evidence.
+- ContextFS refresh after a read-only command does not trigger mutation gates.
+- Snapshot-test or generated-file mutation from a verification command requires
+  diff/file inspection, but not another verification unless source edits follow.
 
-### Branch: `ta-progress-guard`
+## 8. Phase 3: Sandbox Contract
 
-Purpose: stop obvious no-progress loops with a pure harness-side guard that
-inspects transcript and observations.
+Branch: `ta-sandbox-contract`
 
-Implementation details:
+Purpose: make execution boundaries explicit before adding a real sandbox.
 
-- Add a `ProgressGuard` protocol and default implementation.
-- Invoke it before tool execution and after result recording.
-- Keep it pure: it should return allow/block/guidance decisions and never mutate
-  state directly.
-- Detect:
-  - exact repeated failed shell command
-  - same tool plus same args repeatedly failing
-  - repeated read-only commands with no new observations
-  - repeated patch failures with the same error
-  - edit attempts after recent policy/sandbox blocks without changed approach
-- When blocking, record a synthetic failed tool result with `failure_kind`
-  `progress_blocked` and model-visible guidance that names the repeated pattern.
-- Avoid blocking legitimate retry after changed inputs, changed cwd, changed
-  command, or newly observed evidence.
+Changes:
+
+- Replace `SandboxMode = Literal["none", "worktree"]` with a clearer split:
+  - `workspace_mode = current | worktree | auto`
+  - `sandbox_mode = none | container | native`
+  - optionally keep `worktree` as a deprecated CLI alias that maps to
+    `workspace_mode=worktree` and `sandbox_mode=none`
+- Model separate concepts explicitly:
+  - `WorkspaceMode = Literal["auto", "current", "worktree"]`
+  - `SandboxMode = Literal["none", "container", "native"]`
+  - `NetworkMode = Literal["deny", "ask", "allow"]`
+  - `SandboxBackend = Literal["none", "docker", "podman", "seatbelt",
+    "landlock_seccomp", "wsl2"]`
+- Update `WorkspaceEnvelope` so `sandbox_enforced` is true only when a real
+  sandbox backend enforces filesystem/process/network boundaries.
+- Expand `ExecutionEnvelope` with:
+  - read roots
+  - write roots
+  - denied paths
+  - network mode
+  - git access mode
+  - escalation hint
+  - backend name and version
+- Update shell tool descriptions to tell the model what filesystem, git, and
+  network permissions are available in the current envelope.
+- Standardize failure metadata as multiple dimensions rather than one flat
+  string:
+
+```json
+{
+  "failure_kind": "sandbox_blocked",
+  "capability": "network",
+  "source": "sandbox",
+  "recoverability": "request_approval"
+}
+```
+
+- Use the dimensions consistently:
+  - `policy_denied + capability=network + source=policy`
+  - `sandbox_blocked + capability=network + source=sandbox`
+  - `sandbox_blocked + capability=filesystem + source=sandbox`
+  - `command_failed + capability=process + source=tool`
+- Render sandbox failures as capability failures, for example:
+  `sandbox blocked command: network denied. Request approval or choose an
+  offline path.`
 
 Acceptance criteria:
 
-- Guard prevents thrashing without becoming a planner.
-- The model receives actionable feedback through normal tool-result channels.
-- Existing policy repeated-command behavior remains compatible.
+- Worktree mode is no longer described as a real sandbox.
+- Existing local shell behavior remains unchanged in `sandbox_mode=none`.
+- Policy-denied and sandbox-blocked results are distinguishable in events,
+  observations, metrics, and final-answer gates.
+- Shell output gives the model enough information to recover from denied
+  capabilities.
+- `worktree` is removed as an internal sandbox mode, except for an explicit CLI
+  migration alias if kept.
 
 Tests:
 
-- Three identical failed commands trigger a progress block.
-- A modified command after a failure is allowed.
-- Repeated `sed`/`rg` reads with no new observations trigger guidance.
-- Successful new evidence resets the no-progress counter.
+- CLI accepts `none`, `container`, and `native` sandbox modes and rejects
+  unsupported combinations clearly.
+- Deprecated `--sandbox-mode worktree`, if kept, warns or maps predictably.
+- Shell result metadata includes envelope capabilities.
+- Policy denial and synthetic sandbox denial produce different observations,
+  failure sources, capabilities, and recoverability hints.
 
-## 6. Milestone 3: Safety And Provider Foundation
+## 9. Phase 4: Model Specs And Edit Adapters
 
-### Branch: `ta-execution-envelope`
+Branch: `ta-model-specs`
 
-Purpose: make execution boundaries explicit so tinyagent can later swap in
-stronger sandbox backends without changing shell semantics.
+Purpose: use model/provider knowledge to expose familiar tool shapes and budget
+context correctly.
 
-Implementation details:
+Changes:
 
-- Add execution envelope types for:
-  - workspace root and effective cwd
-  - sanitized env policy
-  - timeout and output caps
-  - writable roots
-  - network policy metadata
-  - process group cancellation behavior
-  - sandbox backend name and enforcement status
-- Refactor `ShellTool` to build and use an envelope before `subprocess.Popen`.
-- Preserve current local execution behavior in the default backend.
-- Include envelope metadata in shell `ToolResult.metadata` and relevant events.
-- Standardize failure kinds for timeout, cancellation, command failure,
-  policy-denied, sandbox-blocked, and unknown execution errors.
-- Do not introduce a real OS sandbox in this branch unless it can be done as a
-  backend behind the same interface without changing tests or policy semantics.
+- Keep `ModelCapabilities`, and add `ModelSpec` beside it rather than mutating
+  the existing dataclass aggressively:
 
-Acceptance criteria:
+```python
+@dataclass(frozen=True)
+class ModelSpec:
+    provider: str
+    model: str
+    protocol: Literal["chat_completions", "responses", "anthropic", "gemini"]
+    edit_style: Literal["apply_patch", "str_replace", "whole_file"]
+    prompt_variant: str = "default"
+    tokenizer: str = "heuristic"
+    capabilities: ModelCapabilities = ModelCapabilities()
+```
 
-- Shell commands still run exactly as before in local mode.
-- Timeouts and cancellation still terminate process groups.
-- Envelope details are visible in debug events and small result metadata.
-- Future sandbox backends have a clear interface.
-
-Tests:
-
-- Timeout behavior unchanged.
-- Cancellation behavior unchanged.
-- Env remains sanitized.
-- Output artifacts and context artifacts still work.
-- Envelope metadata appears in command completed/failed events.
-
-### Branch: `ta-model-capabilities`
-
-Purpose: make provider behavior capability-aware so context budgeting and
-serialization do not hardcode OpenAI-compatible Chat Completions assumptions.
-
-Implementation details:
-
-- Add `ModelCapabilities` with:
-  - context window
-  - max output tokens
-  - tool support
+- Include:
+  - model
+  - provider
+  - protocol: `chat_completions | responses | anthropic | gemini`
+  - edit style: `apply_patch | str_replace | whole_file`
   - parallel tool support
   - reasoning support
-  - image support
   - prompt-cache support
-  - tool protocol, initially `chat_completions`
-- Add capabilities to `ModelProvider` through an attribute or helper function
-  that provides defaults for existing providers.
-- Teach `OpenAICompatibleProvider` and `FakeModelProvider` to declare
-  capabilities.
-- Feed capability values into `ContextConfig` budget decisions where practical.
-- Fail clearly if tools are requested for a provider that declares no tool
-  support.
-- Keep provider-specific payload construction inside providers, not kernel.
+  - context window
+  - output limit
+  - tokenizer
+  - prompt variant
+- Add edit tools:
+  - `apply_patch`: patch grammar, rollback, path-safe
+  - `str_replace_edit`: `old_str`/`new_str`, require unique match, rollback,
+    path-safe
+  - `write_file`: full overwrite, size cap, path-safe, generated or small files
+    only by default
+- Keep `apply_patch` as the OpenAI/Codex-like default.
+- Let the profile choose visible edit tools from the spec:
+  - OpenAI/Codex-like: `read_file`, `search_repo`, `apply_patch`, `shell`
+  - Claude-like: `read_file`, `search_repo`, `str_replace_edit`, `shell`
+  - Generic: `read_file`, `search_repo`, `write_file`, `shell`
+- Do not expose multiple primary edit tools by default.
+- Make token budgeting provider-aware where practical, replacing rough
+  character division with model-specific counters when available.
 
 Acceptance criteria:
 
-- Existing OpenAI-compatible and fake providers keep working.
-- Context budgeting reflects model capability defaults.
-- Kernel remains provider-agnostic.
-- Unsupported capabilities fail explicitly.
+- The kernel remains provider-agnostic.
+- Provider-specific serialization and payload quirks stay in providers.
+- The model sees only one primary edit tool by default.
+- Unsupported provider/tool combinations fail clearly.
 
 Tests:
 
-- Fake provider exposes deterministic capabilities.
-- OpenAI-compatible provider exposes env/config-derived or default
-  capabilities.
-- Context compact threshold respects context window and output reserve.
-- Provider without tool support fails clearly when visible tools are present.
+- Fake OpenAI-like model sees `apply_patch`.
+- Fake Claude-like model sees `str_replace_edit`.
+- Provider without tool support fails before model call when visible tools are
+  requested.
+- Context budget uses the selected spec's context and output limits.
+- If the selected spec exposes `str_replace_edit` and the model calls
+  `apply_patch`, the call is blocked as hidden.
 
-## 7. Milestone 4: Extensibility And Eval Feedback
+## 10. Phase 5: ContextFS Recovery Surface
 
-### Branch: `ta-extension-host`
+Branch: `ta-contextfs-recovery`
 
-Purpose: promote the current hook ABI into a small extension host so users can
-customize behavior without modifying the kernel.
+Purpose: make files the universal recovery and discovery primitive.
 
-Implementation details:
+Changes:
 
-- Add `Extension` and `ExtensionHost` types.
-- Preserve compatibility with existing `TinyHook` objects.
-- Support explicit local extension loading from a conservative location such as
-  `.tinyagent/extensions/*.py` or a config file, with no marketplace behavior.
-- Let extensions:
-  - register hooks
-  - register optional tools
-  - inject or patch context
-  - block or mutate tool calls through existing hook semantics
-  - patch tool results
-  - observe compaction and finish decisions
-- Keep default loading disabled or explicit if there is any ambiguity around
-  executing project-local Python code.
-- Document the extension lifecycle and safety model in `extensions/README.md`.
+- Expand ContextFS with:
+  - `context/INDEX.md`
+  - `context/task.md`
+  - `context/current_status.md`
+  - `context/current_diff.patch`
+  - `context/last_failure.md`
+  - `context/observations.md`
+  - `context/transcript.md`
+  - `context/history/raw.jsonl`
+  - `context/history/summary.md`
+  - `context/tools/INDEX.md`
+  - `context/tools/<tool>.md`
+  - existing `context/shell/*.txt` tool output files
+  - `context/diffs/<mutation>.patch`
+- Do not add `context/terminal/<session>.txt` until there is a real persistent
+  terminal/session abstraction.
+- Add a safe first-party mechanism for model recovery reads:
+  - either `read_context(path)`
+  - or `ReadFileTool(allow_context_artifacts=True)`
+- Strictly allow only intended recovery files, such as:
+  - `context/**`
+  - `artifacts/context-checkpoint-*.md`
+  - selected tool output artifacts when referenced by ContextFS
+- Do not expose raw internal artifacts by default:
+  - `model-request-http-*.json`
+  - `model-response-*.json`
+  - `events.jsonl`, unless intentionally exposed through ContextFS
+  - `metrics.json`, unless intentionally exposed through ContextFS
+- Move long tool examples and capability explanations out of the static prompt
+  and into `context/tools/*.md`.
+- Change context building to inject a concise ContextFS index and fewer large
+  recent tool previews.
+- Add optional LLM compaction as a single `Compactor` interface. Keep the
+  deterministic compactor as the default fallback.
+- Use structured handoff sections for LLM compaction:
+  Active Task, Goal, Constraints, Completed Actions, Active State, Blockers,
+  Key Decisions, Pending User Asks, Relevant Files, Remaining Work, and
+  Critical Context.
 
 Acceptance criteria:
 
-- Existing direct hook injection still works.
-- Extensions are loaded deterministically when explicitly enabled.
-- Extension failures follow the current hook error policy.
-- Hidden extension tools cannot be called unless visible to the model.
+- A model can recover the latest task, diff, failure, observations, and
+  transcript from files.
+- Long outputs stay artifact-backed and are not pasted into event payloads.
+- Context reports explain included and excluded items.
+- Compaction output is framed as reference material, not as new instructions.
+- ContextFS files intended for recovery are readable through the safe
+  first-party mechanism without opening all run artifacts.
 
 Tests:
 
-- Extension injects a context message.
-- Extension blocks a tool call and returns a synthetic result.
-- Extension mutates a tool result.
-- Extension registers a tool that is only callable when visible.
-- Hook error policy is honored.
+- ContextFS writes all expected files during a run.
+- `context/observations.md` includes mutation, verification, policy, and
+  sandbox evidence.
+- `context/transcript.md` preserves tool call/result pairing.
+- Compaction references raw history and preserves the latest user ask.
+- The model can read `context/INDEX.md`, `context/current_diff.patch`,
+  `context/observations.md`, `context/transcript.md`, and `context/tools/*.md`.
+- The model cannot read raw model request/response artifacts through the
+  ContextFS reader unless explicitly allowed.
 
-### Branch: `ta-eval-analysis`
+## 11. Phase 6: Runtime Server And UI State
 
-Purpose: convert transcripts and observations into eval metrics that identify
-harness quality problems.
+Branch: `ta-runtime-serve`
 
-Implementation details:
+Purpose: expose the existing event log as a live runtime for clients without
+turning the kernel into a UI framework.
 
-- Extend `agentd/eval_metrics.py` with metrics for:
-  - inspected before editing
-  - diff inspected after editing
-  - verification after editing
-  - repeated failed command attempts
-  - progress-guard interventions
+Changes:
+
+- Add `agentctl serve`.
+- Add a small runtime layer:
+  - `RunStore` for durable events/artifacts
+  - `RunBus` for live subscribers
+  - `RunController` for start/cancel/approve/fork
+  - `SessionStore` only if needed for branchable sessions
+- Name v1 semantics precisely:
+  - reconnectable UI, not resumable agent execution after process death
+  - forkable runs, not full thread branching
+  - approval broker, not just an HTTP endpoint
+- Add an `ApprovalBroker` so the kernel can block on approval while HTTP
+  requests resolve pending approval IDs:
+
+```python
+class ApprovalBroker:
+    def request(...)
+    def resolve(...)
+```
+
+- Add HTTP endpoints:
+  - `GET /api/runs`
+  - `POST /api/runs`
+  - `GET /api/runs/{id}`
+  - `GET /api/runs/{id}/events` using SSE
+  - `POST /api/runs/{id}/cancel`
+  - `POST /api/runs/{id}/approve`
+  - `POST /api/runs/{id}/fork`
+  - `GET /api/runs/{id}/artifacts/{path}`
+- Support event-stream reconnect through `Last-Event-ID` and/or
+  `?after_seq=123`.
+- Derive frontend objects from events and artifacts:
+  `Run`, `Turn`, `ModelCall`, `ToolCall`, `Command`, `Patch`,
+  `WorkspaceDelta`, `ContextBuild`, `Approval`, `Artifact`, and `EvalResult`.
+- Keep the first server zero-database. Read `events.jsonl`, `metrics.json`,
+  `final.md`, `final.diff`, and artifacts. Add SQLite only as an index/cache
+  later.
+
+Acceptance criteria:
+
+- CLI, SDK, replay, and server use the same canonical event stream.
+- A client can reconnect and reconstruct run state from durable events.
+- Fork and approval endpoints operate through explicit runtime primitives.
+- UI state is derived, not a second source of truth.
+- True live steering and post-crash continuation are deferred until there is a
+  real thread/session protocol.
+
+Tests:
+
+- SSE streams events for a fake-provider run.
+- SSE reconnect with `after_seq` or `Last-Event-ID` replays missed durable
+  events before streaming live events.
+- `GET /api/runs/{id}` reconstructs a completed run from disk.
+- Cancel endpoint stops an active run.
+- Approval endpoint resolves a brokered pending approval.
+- Fork endpoint starts from a selected event/run boundary.
+
+## 12. Phase 7: Eval Comparison Loop
+
+Branch: `ta-eval-compare`
+
+Purpose: make harness changes measurable.
+
+Changes:
+
+- Add `agentd/config.py` with a `RunConfig` loader before variant comparison.
+  The config should cover:
+  - provider
+  - model spec
+  - profile
+  - visible tools
+  - context config
+  - policy config
+  - sandbox mode
+  - workspace mode
+  - hooks/extensions
+  - budgets
+- Add:
+
+```bash
+agentctl eval compare suites/editing \
+  --variant baseline=configs/baseline.toml \
+  --variant contextfs2=configs/contextfs2.toml
+```
+
+- Generate per-variant and delta reports for:
+  - solve rate
+  - validation pass rate
+  - tokens in/out
+  - tool calls
+  - failed tool calls
+  - repeated tool calls
+  - time to first edit
+  - time to verification
+  - mutations without diff inspection
+  - mutations without verification
+  - context compactions
+  - ContextFS recovery reads
+  - policy denials
+  - sandbox blocks
   - finish-gate interventions
-  - policy/sandbox blocks reported
-  - context token estimate and recent-tool context share
-  - large output artifact count and truncation count
-  - missing evidence for final claims
-- Keep existing eval task format compatible.
-- Add report output that maps failures to likely harness fixes:
-  context missing, observation missing, policy wrong, execution failed, provider
-  malformed, loop not detected, verifier absent, or finish gate weak.
-- Prefer deterministic metrics over LLM-judged evals in this branch.
+  - output truncation and artifact counts
+- Map failures to harness categories:
+  context missing, observation missing, policy wrong, sandbox too tight,
+  execution failed, provider malformed, loop not detected, verifier absent, or
+  finish gate weak.
+- Include reproducibility metadata for every variant:
+  - git sha
+  - branch
+  - config hash
+  - model id
+  - provider
+  - profile name
+  - visible tool names
+  - sandbox mode
+  - context config
 
 Acceptance criteria:
 
-- Existing eval runner tests pass.
-- Metrics can be computed from old event logs where possible and from new
-  transcript/observation data where available.
-- Threshold failures are clear enough to guide branch-level fixes.
+- Existing eval suites and thresholds remain compatible.
+- Variant comparison can run fake providers deterministically.
+- Reports make it obvious whether a harness branch improved or regressed the
+  target behavior.
+- Comparison reports are interpretable from config and git metadata alone.
 
 Tests:
 
-- Synthetic run with edit but no verification fails verification metric.
-- Synthetic run with repeated failed command counts retries and guard block.
-- Synthetic run with finish-gate intervention counts the intervention.
-- Large output/truncation metrics are reported.
-- Existing eval thresholds remain backward compatible.
+- Two fake variants produce a comparison report.
+- A run with shell mutation but no diff inspection reports
+  `mutation_without_diff`.
+- A sandbox-denied command increments sandbox metrics and category.
+- Threshold failures include variant names.
+- Config hash and selected model/profile/tool metadata appear in the report.
 
-## 8. Cross-Branch Constraints
+## 13. Side Stack: First Enforced Sandbox Backend
 
-- Preserve the default model-visible tool surface: `shell` and `apply_patch`.
-- Do not move planning, todos, or workflow graphs into the kernel.
-- Keep large payloads in artifacts and expose only summaries, refs, and small
-  metadata in state/events.
-- Maintain compatibility with existing CLI, replay, context report, and eval
-  surfaces unless the branch explicitly extends them.
-- Keep branch diffs reviewable. If a branch grows too large, split it before
-  submitting the stack.
-- Use structured types and parsers where available. Avoid broad output parsing
-  when existing metadata is enough.
-- Unsupported provider, sandbox, or extension behavior should fail clearly
-  instead of being hidden behind kernel special cases.
+Branch: `ta-container-sandbox`
 
-## 9. Verification Plan
+Base: `ta-sandbox-contract`
 
-Run fast tests after each branch:
+Purpose: add one real execution boundary behind the sandbox contract without
+blocking the rest of the main harness stack.
 
-```bash
-PYTHONPATH=. pytest
-```
+Preferred first backend:
 
-Run focused checks while developing each subsystem:
+- Docker or Podman container mode, because it is practical across many
+  developer machines and avoids writing native policy first.
 
-```bash
-PYTHONPATH=. pytest tests/test_kernel.py
-PYTHONPATH=. pytest tests/test_context.py
-PYTHONPATH=. pytest tests/test_tools.py
-PYTHONPATH=. pytest tests/test_eval_runner.py
-PYTHONPATH=. pytest tests/test_update_phases.py
-```
+Container behavior:
 
-Use integration tests only when explicitly validating live providers:
+- Fail at run setup if `sandbox_mode=container` is requested and Docker/Podman
+  is unavailable. Do not defer this into a random shell failure.
+- Run the container as the current UID/GID where possible so generated files do
+  not become root-owned.
+- Mount the effective workspace read-write at `/workspace` and run commands
+  with `/workspace` as the working directory.
+- Set an isolated home, for example `/home/tinyagent`.
+- Do not mount host `~/.ssh`, shell history, global git config, credentials,
+  cloud config directories, package manager tokens, or parent directories.
+- Handle Git safe-directory behavior by setting temporary config inside the
+  isolated home, for example `git config --global --add safe.directory
+  /workspace`.
+- Define network modes explicitly:
+  - `network=deny -> docker/podman --network none`
+  - `network=ask -> policy approval path`
+  - `network=allow -> normal network`
+- Preserve current timeout, output cap, process cancellation, and artifact
+  behavior.
+- Return structured sandbox failures when a command requests denied access.
+- State clearly that the container backend applies primarily to process
+  execution, especially `shell`. In-process tools such as `apply_patch`,
+  `read_file`, and `search_repo` still run in the host Python process and must
+  remain protected by path policy.
 
-```bash
-TINYAGENT_RUN_INTEGRATION=1 PYTHONPATH=. pytest tests/integration/test_openai_compat_real.py
-```
+Later native backends:
 
-Before submitting:
+- macOS `sandbox-exec`/Seatbelt profile generation.
+- Linux Landlock/seccomp or bubblewrap.
+- Windows through WSL2 first; native Windows only when there is a concrete
+  backend with acceptable developer-tool support.
 
-```bash
-git status
-git diff
-PYTHONPATH=. pytest
-gt log
-gt submit --stack --dry-run
-```
+Acceptance criteria:
 
-## 10. Rollout Notes
+- `sandbox_mode=container` enforces workspace-scoped writes and isolated home.
+- Network commands fail with `sandbox_blocked + capability=network` unless
+  explicitly allowed.
+- Common local test/build commands still work when they do not require external
+  access.
+- Sandbox constraints are visible in shell result summaries and metadata.
+- Files created in the workspace are owned by the current user where the runtime
+  supports UID/GID mapping.
 
-The safest review order is the same as the stack order. Transcript and
-observations should land before context planning, because context planning needs
-durable evidence. Context planning and progress guardrails should land before
-execution/provider/extensibility work, because they are the most likely to
-surface hidden assumptions in the loop. Eval analysis should land last so it can
-measure all prior primitives.
+Tests:
 
-If review feedback forces a redesign, revise the lowest affected branch and
-restack upward with Graphite. Do not patch around a lower-level abstraction flaw
-in a higher branch.
+- Command can write inside `/workspace`.
+- Command cannot write outside the mounted workspace.
+- Command cannot read a fixture secret outside workspace.
+- `curl https://example.com` fails as `sandbox_blocked` with
+  `capability=network` by default.
+- Container runtime missing yields a clear setup failure, not an unknown tool
+  error.
+- Git commands work inside a mounted git repo after safe-directory setup.
 
+## 14. Later Work
+
+Do not start these before the core stack above is stable:
+
+- project-local skills/prompts/extensions under `.tinyagent/`
+- diagnostics provider for likely project checks
+- one scoped `delegate` tool that forks a child run and returns a summary
+- MCP adapter after dynamic tool docs and sandboxing are in place
+- native macOS/Linux sandbox backends after the container backend proves the
+  sandbox contract
+- SQLite index/cache for large run stores
+- richer web UI panes and dashboards
+
+## 15. Non-Goals
+
+- No baked-in plan mode in the kernel.
+- No todo ontology or workflow graph runtime.
+- No multi-agent manager as core architecture.
+- No memory database before session files and ContextFS are strong.
+- No MCP before sandboxing and dynamic tool discovery.
+- No provider hacks in the kernel.
+- No prompt-only safety story for filesystem, network, or secret boundaries.
+
+## 16. Cross-Branch Constraints
+
+- Keep kernel changes small and mechanically reviewable.
+- Preserve existing CLI, replay, inspect, SDK, and eval behavior unless a branch
+  explicitly extends them.
+- Large payloads belong in artifacts; events and state carry summaries, refs,
+  and small metadata.
+- Every new runtime guarantee needs an event, an observation or metric, and at
+  least one regression test.
+- Work with existing uncommitted docs; do not sweep unrelated generated exports
+  or local artifacts into implementation branches.
+- Treat unsupported sandbox/provider/edit-tool behavior as explicit failure,
+  not silent fallback.
+- The delta observer must ignore tinyagent-owned artifacts and ContextFS writes.
+- ContextFS files intended for model recovery must be readable through a safe
+  first-party mechanism.
+- Server v1 supports reconnect and replay; true run continuation and live
+  steering are later unless explicitly implemented.
+
+## 17. First Five PRs
+
+1. Expose `read_file` and `search_repo` in the default profile and make
+   structured inspection count as evidence.
+2. Add `WorkspaceDeltaObserver` and make finish gates mutation-based.
+3. Split worktree isolation from real sandbox modes and render sandbox
+   constraints clearly.
+4. Add `ModelSpec`-driven edit tool selection.
+5. Upgrade ContextFS with safe recovery reads, then build the runtime server and
+   eval comparison on top.
+
+The enforced container backend is the first side-stack PR after
+`ta-sandbox-contract`, not a blocker for the main stack.
