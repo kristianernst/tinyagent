@@ -6,16 +6,29 @@ import subprocess
 import sys
 from dataclasses import replace
 
-from agentd.context import BuiltContext
+from agentd.context import BuiltContext, ContextConfig
 from agentd.eval_metrics import evaluate_thresholds, extract_run_metrics
 from agentd.kernel import Kernel
 from agentd.models import FakeModelProvider
-from agentd.policy import LocalPolicy
+from agentd.policy import LocalPolicy, PolicyConfig, PolicyRule
 from agentd.profiles import ApexCoderProfile
 from agentd.run_graph import fork_run
 from agentd.sdk import Agent
 from agentd.state import Message, ModelResponse, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, ToolStep, Workspace
 from agentd.tools import ShellTool, default_tools
+
+
+class RecordingModel:
+    name = "recording"
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.messages = []
+
+    def complete(self, messages, tools, state):
+        del tools, state
+        self.messages.append(list(messages))
+        return self.responses.pop(0)
 
 
 def test_toolresult_contextfs_and_context_report_contracts(tmp_path) -> None:
@@ -35,13 +48,32 @@ def test_toolresult_contextfs_and_context_report_contracts(tmp_path) -> None:
     result = state.tool_results[0]
     assert result.truncated is True
     assert result.artifact_path and result.artifact_path.startswith("context/shell/")
-    assert result.read_hints and result.read_hints[0].startswith("tail -120 context/shell/")
+    assert result.read_hints and result.read_hints[0].startswith("tail -120 .tinyagent/runs/run_contextfs_contract/context/shell/")
     assert (state.output_dir / result.artifact_path).read_text() == ("x" * 80) + "\n"
+    reread = ShellTool().run(ToolCall(name="shell", args={"cmd": result.read_hints[0]}), state)
+    assert reread.ok is True
+    assert reread.data["output_chars"] >= 80
     index = (state.output_dir / "context" / "INDEX.md").read_text()
     assert result.artifact_path in index
     report_event = next(event for event in state.events if event.type == "context.report.written")
     report = json.loads((state.output_dir / report_event.data["context_report_artifact"]).read_text())
     assert any(item["id"] == "contextfs:index" for item in report["included"])
+
+
+def test_initial_model_context_includes_contextfs_index(tmp_path) -> None:
+    model = RecordingModel([ModelResponse(content="done", finish_reason="stop")])
+    state = Kernel(
+        model=model,
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    ).run("read contextfs first", workspace=tmp_path, run_id="run_initial_contextfs")
+
+    assert state.failed is False
+    first_request = model.messages[0]
+    contextfs = next(message for message in first_request if message.meta.get("context_layer") == "contextfs_index")
+    assert ".tinyagent/runs/run_initial_contextfs/context/task.md" in contextfs.content
 
 
 def test_finish_gate_blocks_edit_without_diff_or_verification(tmp_path) -> None:
@@ -76,6 +108,48 @@ def test_finish_gate_blocks_edit_without_diff_or_verification(tmp_path) -> None:
     assert "inspect git diff" in blocked.data["reason"]
 
 
+def test_git_status_alone_does_not_satisfy_post_edit_finish_gate(tmp_path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    (tmp_path / "hello.txt").write_text("hello\n")
+    subprocess.run(["git", "add", "hello.txt"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-c", "user.email=tinyagent@example.test", "-c", "user.name=tinyagent", "commit", "-m", "init"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    patch = "\n".join(
+        [
+            "*** Begin Patch",
+            "*** Update File: hello.txt",
+            "@@",
+            "-hello",
+            "+hello updated",
+            "*** End Patch",
+        ]
+    )
+    kernel = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(name="apply_patch", args={"patch": patch}),)),
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "git status --short"}),)),
+                ModelResponse(content="Done. Could not run verification in this environment.", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    )
+
+    state = kernel.run("edit, status, finish", workspace=tmp_path, run_id="run_status_not_diff")
+
+    assert state.failed is True
+    blocked = next(event for event in state.events if event.type == "finish.blocked")
+    assert "inspect git diff" in blocked.data["reason"]
+
+
 def test_declarative_policy_metadata_and_repeated_command_guard(tmp_path) -> None:
     state = RunState.create("policy", Workspace(tmp_path), run_id="run_policy")
     policy = LocalPolicy()
@@ -95,6 +169,41 @@ def test_declarative_policy_metadata_and_repeated_command_guard(tmp_path) -> Non
     repeated = policy.evaluate(ToolCall(name="shell", args={"cmd": cmd}), state)
     assert repeated.kind == "deny"
     assert repeated.matched_rule == "bash.repeated_failed_command"
+
+    allow_network_config = PolicyConfig(
+        default="deny",
+        rules=(PolicyRule("network", "*", "allow"), PolicyRule("bash", "*", "allow")),
+    )
+    allowed_network = LocalPolicy(config=allow_network_config).evaluate(
+        ToolCall(name="shell", args={"cmd": "curl https://example.com"}),
+        state,
+    )
+    assert allowed_network.kind == "allow"
+    assert allowed_network.permission == "network"
+
+
+def test_policy_blocks_common_env_path_variants(tmp_path) -> None:
+    state = RunState.create("policy", Workspace(tmp_path), run_id="run_policy_env")
+    policy = LocalPolicy()
+    for cmd in ("cat ./.env", "cat config/.env", f"{sys.executable} -c 'open(\".env\").read()'"):
+        decision = policy.evaluate(ToolCall(name="shell", args={"cmd": cmd}), state)
+        assert decision.kind == "deny"
+        assert decision.permission == "secrets"
+
+
+def test_noncritical_stable_context_respects_budget(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    (tmp_path / "AGENTS.md").write_text("project instruction\n" * 200)
+    state = RunState.create("budget context", Workspace(tmp_path), run_id="run_context_budget")
+    profile = ApexCoderProfile(context_config=ContextConfig(compact_at_tokens=20, max_recent_tool_tokens=1))
+
+    built = profile.build_context(state)
+
+    assert any(item.id == "system:profile" for item in built.included)
+    assert any(item.id == "task:current" for item in built.included)
+    assert any(exclusion.item_id == "project:instructions" for exclusion in built.excluded)
 
 
 def test_worktree_sandbox_mode_records_enforced_boundary(tmp_path) -> None:

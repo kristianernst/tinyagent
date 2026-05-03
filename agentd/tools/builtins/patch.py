@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from agentd.contextfs import read_hints, write_context_tool_output
+from agentd.contextfs import model_readable_path, read_hints, write_context_tool_output
 from agentd.state import RunState, ToolCall, ToolResult
 from agentd.tools.core import (
     ToolError,
@@ -77,6 +77,7 @@ class ApplyPatchTool:
             ok = False
         artifact = write_tool_output_artifact(state, call, "patch-output", output, kind="patch_output")
         context_artifact = write_context_tool_output(state, call, output, kind="patch_output")
+        context_read_path = model_readable_path(state, context_artifact)
         preview = visible_output(output, state)
         failure_kind = None if ok else "invalid_tool_args"
         state.emit(
@@ -111,7 +112,7 @@ class ApplyPatchTool:
                 "failure_kind": failure_kind,
             },
             metadata={"paths": touched},
-            read_hints=read_hints(context_artifact, failure=not ok),
+            read_hints=read_hints(context_read_path, failure=not ok),
         )
 
 

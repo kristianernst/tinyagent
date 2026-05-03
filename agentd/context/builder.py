@@ -15,6 +15,9 @@ from agentd.events import json_safe
 from agentd.state import Message, RunState, ToolStep
 
 DEFAULT_SHELL_PREFLIGHT_COMMANDS = ("rg", "git", "python3", "python", "sed")
+CRITICAL_CONTEXT_PRIORITY = 900
+RECENT_TOOL_PREVIEW_CHARS = 1_200
+SMALL_STABLE_CONTEXT_TOKENS = 64
 
 
 class ContextBuilder:
@@ -40,7 +43,14 @@ class ContextBuilder:
             if contextfs_index
             else None,
             _item("finish_gate:messages", "user", finish_gate, "finish_gate", 780) if finish_gate else None,
-            _item("working_state:checkpoint", "user", checkpoint, "working_state", 700, stable=True),
+            _item(
+                "working_state:checkpoint",
+                "user",
+                checkpoint,
+                "working_state",
+                900 if state.context_checkpoint else 700,
+                stable=True,
+            ),
             _item("recent_tools:preview", "user", recent_tools, "recent_tool_steps", 600, stable=True),
         ]
         included, excluded = _pack_items([item for item in candidates if item is not None], self.config)
@@ -202,20 +212,37 @@ def _latest_index(steps: Sequence[ToolStep], predicate: Any) -> int | None:
 def _render_tool_step(step: ToolStep, state: RunState) -> str:
     call = step.call
     result = step.result
-    limit = state.budgets.max_command_output_chars_visible
-    output = result.output[:limit]
-    suffix = "\n[truncated]" if len(result.output) > limit else ""
-    return "\n".join(
+    preview_source = result.content_preview or result.output
+    limit = min(state.budgets.max_command_output_chars_visible, RECENT_TOOL_PREVIEW_CHARS)
+    output = preview_source[:limit]
+    suffix = "\n[truncated]" if len(preview_source) > limit else ""
+    lines = [
+        f"Tool: {call.name}",
+        f"Call ID: {call.id}",
+        f"Args: {_small_json(call.args, max_chars=500)}",
+        f"OK: {result.ok}",
+    ]
+    if result.summary:
+        lines.append(f"Summary: {result.summary}")
+    failure_kind = result.failure_kind or result.data.get("failure_kind")
+    if failure_kind:
+        lines.append(f"Failure kind: {failure_kind}")
+    artifact = result.artifact_path or result.data.get("context_artifact") or result.data.get("output_artifact")
+    if artifact:
+        lines.append(f"Artifact: {artifact}")
+    if result.read_hints:
+        lines.append("Suggested read:")
+        lines.extend(f"- {hint}" for hint in result.read_hints)
+    small_data = _small_tool_data(result.data)
+    if small_data:
+        lines.append(f"Data: {_small_json(small_data, max_chars=500)}")
+    lines.extend(
         [
-            f"Tool: {call.name}",
-            f"Call ID: {call.id}",
-            f"Args: {_small_json(call.args)}",
-            f"OK: {result.ok}",
-            f"Data: {_small_json(result.data)}",
             "Output:",
             f"{output}{suffix}",
         ]
     )
+    return "\n".join(lines)
 
 
 def _is_diff_or_status_step(step: ToolStep) -> bool:
@@ -234,6 +261,19 @@ def _small_json(value: object, *, max_chars: int = 2_000) -> str:
     if len(encoded) <= max_chars:
         return encoded
     return json.dumps({"_truncated": True, "json_chars": len(encoded), "preview": encoded[:max_chars]}, sort_keys=True)
+
+
+def _small_tool_data(data: dict[str, Any]) -> dict[str, Any]:
+    omitted = {
+        "context_artifact",
+        "output_artifact",
+        "output_chars",
+        "stdout_chars",
+        "stderr_chars",
+        "duration_ms",
+        "failure_kind",
+    }
+    return {key: value for key, value in data.items() if key not in omitted}
 
 
 def _item(
@@ -262,7 +302,10 @@ def _pack_items(items: Sequence[ContextItem], config: ContextConfig) -> tuple[li
     excluded: list[ContextExclusion] = []
     total = 0
     for item in sorted(items, key=lambda value: (-value.priority, value.id)):
-        if item.stable or total + item.token_estimate <= budget:
+        hard_include = item.stable and (
+            item.priority >= CRITICAL_CONTEXT_PRIORITY or item.token_estimate <= SMALL_STABLE_CONTEXT_TOKENS
+        )
+        if hard_include or total + item.token_estimate <= budget:
             included.append(item)
             total += item.token_estimate
         else:
