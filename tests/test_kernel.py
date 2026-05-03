@@ -14,6 +14,7 @@ from agentd.events import (
     EVENT_DEBUG_LEVELS,
     EVENT_TYPES,
     LIVE_ONLY_EVENT_TYPES,
+    ConsoleTextSink,
     Event,
     JsonlStreamSink,
     MemoryEventSink,
@@ -1132,6 +1133,48 @@ def test_jsonl_stream_sink_filters_events_by_debug_level() -> None:
     internal_sink = JsonlStreamSink(internal_output, debug_level=4)
     internal_sink.emit(events[1])
     assert json.loads(internal_output.getvalue())["data"]["delta"] == "thought"
+
+
+def test_console_text_sink_renders_selected_live_events_and_closes_lines() -> None:
+    output = StringIO()
+    sink = ConsoleTextSink(output)
+
+    events = [
+        Event(run_id="run_test", type="model.text.delta", data={"delta": "answer"}, visibility="user", durability="ephemeral"),
+        Event(
+            run_id="run_test",
+            type="model.reasoning.delta",
+            data={"delta": "safe summary"},
+            visibility="user",
+            durability="ephemeral",
+        ),
+        Event(
+            run_id="run_test",
+            type="model.reasoning.delta",
+            data={"delta": "private"},
+            visibility="internal",
+            durability="ephemeral",
+        ),
+        Event(
+            run_id="run_test",
+            type="model.tool_call.assembly.completed",
+            data={"tool": "shell", "args": {"cmd": "pytest -q"}},
+        ),
+        Event(run_id="run_test", type="tool.execution.completed", data={"tool": "shell", "output_chars": 12}),
+        Event(run_id="run_test", type="model.text.delta", data={"delta": "done"}, visibility="user", durability="ephemeral"),
+        Event(run_id="run_test", type="turn.completed", visibility="user"),
+    ]
+
+    for event in events:
+        sink.emit(event)
+
+    assert output.getvalue() == (
+        "answer\n"
+        "[reasoning] safe summary\n"
+        "[tool] shell: pytest -q\n"
+        "[ok] shell completed, 12 chars\n"
+        "done\n"
+    )
 
 
 def test_run_state_emit_uses_one_sequence_for_durable_and_live_events(tmp_path) -> None:

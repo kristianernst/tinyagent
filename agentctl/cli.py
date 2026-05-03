@@ -129,12 +129,13 @@ def main(argv: list[str] | None = None) -> int:
         except RunCancelled:
             print("run cancelled: sigint")
             return 130
+        except (OSError, ValueError) as exc:
+            print(f"run error: {exc}")
+            return 1
         if args.stream == "jsonl":
             if state.cancelled:
                 return 130
             return 1 if state.failed else 0
-        if args.stream == "text" and state.final_output:
-            print()
         print(f"run_id: {state.run_id}")
         print(f"output_dir: {state.output_dir}")
         print(f"status: {'cancelled' if state.cancelled else 'failed' if state.failed else 'completed'}")

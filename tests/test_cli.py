@@ -138,6 +138,26 @@ def test_agentctl_run_rejects_invalid_debug_level(tmp_path, capsys) -> None:
     assert captured.out == "debug error: --debug must be non-negative.\n"
 
 
+def test_agentctl_run_missing_workspace_fails_cleanly(tmp_path, capsys) -> None:
+    missing = tmp_path / "missing"
+
+    exit_code = main(
+        [
+            "run",
+            "answer",
+            "--provider",
+            "fake",
+            "--workspace",
+            str(missing),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert captured.out == f"run error: Workspace does not exist or is not a directory: {missing.resolve()}\n"
+    assert captured.err == ""
+
+
 def test_agentctl_eval_fake_suite_writes_results(tmp_path, capsys) -> None:
     suite = tmp_path / "suite"
     case = suite / "read-file"

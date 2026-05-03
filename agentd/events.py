@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -304,15 +305,98 @@ class NullSink:
 class ConsoleTextSink:
     def __init__(self, file: TextIO | None = None) -> None:
         self.file = file or sys.stdout
+        self.at_line_start = True
 
     def emit(self, event: Event) -> None:
-        if event.type != "model.text.delta":
+        if event.type == "model.text.delta":
+            self._write_delta(event.data.get("delta"))
+        elif event.type == "model.reasoning.delta" and event.visibility in {"public", "user"}:
+            self._write_line(f"[reasoning] {_event_text(event)}")
+        elif event.type == "model.tool_call.assembly.completed":
+            tool = str(event.data.get("tool") or "tool")
+            self._write_line(f"[tool] {tool}: {_tool_args_summary(event)}")
+        elif event.type in {"tool.execution.completed", "tool.execution.failed", "tool.execution.cancelled", "tool.execution.blocked"}:
+            self._write_line(_tool_status_summary(event))
+        elif event.type in {"turn.completed", "turn.failed", "turn.interrupted", "run.completed", "run.failed", "run.cancelled"}:
+            self._close_line()
+
+    def _write_delta(self, value: Any) -> None:
+        if not isinstance(value, str) or not value:
             return
-        delta = event.data.get("delta")
-        if not isinstance(delta, str) or not delta:
-            return
-        self.file.write(delta)
+        self.file.write(value)
+        self.at_line_start = value.endswith("\n")
         self.file.flush()
+
+    def _write_line(self, line: str) -> None:
+        if not line:
+            return
+        self._close_line()
+        self.file.write(line + "\n")
+        self.at_line_start = True
+        self.file.flush()
+
+    def _close_line(self) -> None:
+        if self.at_line_start:
+            return
+        self.file.write("\n")
+        self.at_line_start = True
+        self.file.flush()
+
+
+def _event_text(event: Event) -> str:
+    value = event.data.get("delta") or event.data.get("reason") or event.data.get("output") or ""
+    return _clip_text(str(value).replace("\n", " "))
+
+
+def _tool_args_summary(event: Event) -> str:
+    args = event.data.get("args")
+    if not isinstance(args, dict):
+        return ""
+    cmd = args.get("cmd")
+    if isinstance(cmd, str) and cmd:
+        return _clip_text(cmd)
+    patch = args.get("patch")
+    if isinstance(patch, str) and patch:
+        paths = _patch_paths(patch)
+        if paths:
+            return ", ".join(paths)
+        return "patch"
+    return _clip_text(json.dumps(json_safe(args), sort_keys=True))
+
+
+def _tool_status_summary(event: Event) -> str:
+    tool = str(event.data.get("tool") or "tool")
+    match event.type:
+        case "tool.execution.completed":
+            output_chars = event.data.get("output_chars")
+            suffix = f", {output_chars} chars" if isinstance(output_chars, int) else ""
+            return f"[ok] {tool} completed{suffix}"
+        case "tool.execution.failed":
+            return f"[fail] {tool}: {_event_text(event)}"
+        case "tool.execution.cancelled":
+            return f"[cancelled] {tool}: {_event_text(event)}"
+        case "tool.execution.blocked":
+            return f"[blocked] {tool}: {_event_text(event)}"
+    return ""
+
+
+def _patch_paths(patch: str) -> list[str]:
+    paths: list[str] = []
+    for line in patch.splitlines():
+        match = re.match(r"^\*\*\* (?:Update|Add|Delete) File: (.+)$", line)
+        if match:
+            paths.append(match.group(1))
+            continue
+        match = re.match(r"^\*\*\* Move to: (.+)$", line)
+        if match:
+            paths.append(match.group(1))
+    return paths
+
+
+def _clip_text(text: str, *, limit: int = 160) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "..."
 
 
 class JsonlStreamSink:
