@@ -15,12 +15,19 @@ from agentd.workspace import Workspace, WorkspaceEnvelope
 
 if TYPE_CHECKING:
     from agentd.context import ContextState
+    from agentd.transcript import Transcript
 
 
 def _default_context_state() -> ContextState:
     from agentd.context import ContextState
 
     return ContextState()
+
+
+def _default_transcript() -> Transcript:
+    from agentd.transcript import Transcript
+
+    return Transcript()
 
 
 @dataclass(frozen=True)
@@ -242,6 +249,7 @@ class RunState:
     context_checkpoint_tool_step_count: int = 0
     context_token_estimate: int = 0
     compaction_count: int = 0
+    transcript: Transcript = field(default_factory=_default_transcript)
     finish_gate_messages: list[str] = field(default_factory=list)
     parent_run_id: str | None = None
     parent_event_id: str | None = None
