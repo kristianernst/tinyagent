@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from agentd import __version__
-from agentd.eval_runner import default_eval_output_dir, render_eval_report, run_eval_suite
+from agentd.eval_runner import check_eval_thresholds, default_eval_output_dir, render_eval_report, run_eval_suite
 from agentd.events import ConsoleTextSink, JsonlStreamSink, debug_level_from_env
 from agentd.kernel import Kernel
 from agentd.models import FakeModelProvider, ProviderError
@@ -19,6 +19,7 @@ from agentd.policy import default_policy
 from agentd.profiles import ApexCoderProfile
 from agentd.providers.openai_compat import OpenAICompatibleProvider
 from agentd.replay import replay_run
+from agentd.run_graph import fork_run
 from agentd.run_control import CancelToken, RunCancelled
 from agentd.run_record import load_run_record, render_run_inspection
 from agentd.state import ApprovalRequest, ApprovalResolution, ModelResponse, RunState, ToolCall
@@ -39,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--workspace", default=".")
     run_parser.add_argument("--workspace-mode", choices=["auto", "worktree", "current"], default="auto")
     run_parser.add_argument("--approval-mode", choices=["never", "on-request", "yolo"], default="yolo")
-    run_parser.add_argument("--sandbox-mode", choices=["none"], default="none")
+    run_parser.add_argument("--sandbox-mode", choices=["none", "worktree"], default="none")
     run_parser.add_argument("--run-id")
     run_parser.add_argument("--output-dir", type=Path)
     run_parser.add_argument(
@@ -60,13 +61,19 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_parser = subparsers.add_parser("inspect", help="Inspect a recorded agent run.")
     inspect_parser.add_argument("run_path", type=Path, help="Run directory or events.jsonl path.")
 
+    fork_parser = subparsers.add_parser("fork", help="Create fork metadata from a recorded run event.")
+    fork_parser.add_argument("run_path", type=Path, help="Run directory or events.jsonl path.")
+    fork_parser.add_argument("--at", required=True, help="Event id or sequence to fork from.")
+    fork_parser.add_argument("--output-dir", type=Path)
+
     eval_parser = subparsers.add_parser("eval", help="Run a local eval suite.")
     eval_parser.add_argument("suite_path", type=Path, help="Directory containing eval cases.")
     eval_parser.add_argument("--provider", choices=["fake", "openai-compatible"], default="fake")
     eval_parser.add_argument("--output-dir", type=Path)
+    eval_parser.add_argument("--thresholds", type=Path)
     eval_parser.add_argument("--workspace-mode", choices=["auto", "worktree", "current"], default="current")
     eval_parser.add_argument("--approval-mode", choices=["never", "on-request", "yolo"], default="yolo")
-    eval_parser.add_argument("--sandbox-mode", choices=["none"], default="none")
+    eval_parser.add_argument("--sandbox-mode", choices=["none", "worktree"], default="none")
     eval_parser.add_argument(
         "--stream",
         choices=["off", "text", "jsonl"],
@@ -157,6 +164,15 @@ def main(argv: list[str] | None = None) -> int:
         print(render_run_inspection(load_run_record(args.run_path)), end="")
         return 0
 
+    if args.command == "fork":
+        try:
+            path = fork_run(args.run_path, args.at, output_dir=args.output_dir)
+        except (OSError, ValueError) as exc:
+            print(f"fork error: {exc}")
+            return 1
+        print(f"fork_dir: {path}")
+        return 0
+
     if args.command == "eval":
         try:
             debug_level = _debug_level(args.debug)
@@ -189,7 +205,10 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         report = render_eval_report(eval_run)
         print(report, end="")
-        return 0 if all(result.success for result in eval_run.results) else 1
+        threshold_failures = check_eval_thresholds(eval_run, args.thresholds) if args.thresholds else []
+        for failure in threshold_failures:
+            print(f"threshold failed: {failure}")
+        return 0 if all(result.success for result in eval_run.results) and not threshold_failures else 1
 
     parser.error(f"unknown command '{args.command}'")
     return 2

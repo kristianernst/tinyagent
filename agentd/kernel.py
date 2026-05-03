@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from agentd.context import BuiltContext, estimate_messages_tokens, estimate_tools_tokens, message_text
+from agentd.contextfs import refresh_contextfs
 from agentd.contracts import ApprovalHandler, Executor, LocalExecutor, ModelProvider, PolicyEngine, Profile, Tool
 from agentd.events import EventSink, json_safe
+from agentd.hooks import TinyHook
 from agentd.model_stream import complete_model_call
 from agentd.output import (
     capture_final_diff,
+    write_context_report_artifact,
     write_model_http_request_artifact,
     write_model_request_artifacts,
     write_model_response_artifact,
@@ -26,6 +29,7 @@ from agentd.state import (
     ApprovalMode,
     ApprovalRequest,
     ApprovalResolution,
+    FinishDecision,
     Message,
     PolicyDecision,
     RunBudgets,
@@ -58,6 +62,7 @@ class Kernel:
         approval_mode: ApprovalMode = "yolo",
         workspace_mode: WorkspaceMode = "auto",
         sandbox_mode: SandboxMode = "none",
+        hooks: Sequence[TinyHook] = (),
     ) -> None:
         self.model = model
         self.profile = profile
@@ -71,6 +76,7 @@ class Kernel:
         self.approval_mode = approval_mode
         self.workspace_mode = workspace_mode
         self.sandbox_mode = sandbox_mode
+        self.hooks = tuple(hooks)
 
     def run(
         self,
@@ -85,6 +91,9 @@ class Kernel:
         workspace_mode: WorkspaceMode | None = None,
         approval_mode: ApprovalMode | None = None,
         sandbox_mode: SandboxMode | None = None,
+        parent_run_id: str | None = None,
+        parent_event_id: str | None = None,
+        branch_name: str | None = None,
     ) -> RunState:
         resolved_run_id = run_id or f"run_{uuid4().hex}"
         prepared_workspace = prepare_workspace(
@@ -99,10 +108,14 @@ class Kernel:
             budgets=self.budgets,
             run_id=resolved_run_id,
             output_dir=output_dir,
+            parent_run_id=parent_run_id,
+            parent_event_id=parent_event_id,
+            branch_name=branch_name,
         )
         state.workspace_envelope = prepared_workspace.envelope
         state.approval_mode = approval_mode or self.approval_mode
         state.status = "running"
+        self._run_hooks(state, "on_run_start", state)
         if cancel_token is not None:
             state.cancel_token = cancel_token
         use_stream = self.stream if stream is None else stream
@@ -123,6 +136,9 @@ class Kernel:
                 "approval_mode": state.approval_mode,
                 "sandbox_mode": state.workspace_envelope.sandbox_mode if state.workspace_envelope else (sandbox_mode or self.sandbox_mode),
                 "sandbox_enforced": bool(state.workspace_envelope.sandbox_enforced) if state.workspace_envelope else False,
+                "parent_run_id": state.parent_run_id,
+                "parent_event_id": state.parent_event_id,
+                "branch_name": state.branch_name,
             },
         )
         self._emit_workspace_boundary(state, prepared_workspace.worktree_created)
@@ -165,7 +181,10 @@ class Kernel:
             if self._should_compact(state):
                 self._compact(state)
                 built_context = self._build_context(state, visible_tools)
+            built_context = self._on_context(state, built_context)
             messages = built_context.messages
+            messages, visible_tools = self._before_model_call(state, messages, visible_tools)
+            visible_tool_names = frozenset(tool.name for tool in visible_tools)
             state.emit(
                 "context.built",
                 {
@@ -176,12 +195,31 @@ class Kernel:
                     "tool_context_chars": built_context.tool_context_chars,
                     "project_instruction_chars": built_context.project_instruction_chars,
                     "context_artifacts": [artifact.path for artifact in built_context.artifacts],
+                    "context_report_artifact": None,
+                    "contextfs_index_path": built_context.contextfs_index_path,
                     "compaction_count": state.compaction_count,
                     "checkpoint_artifact": state.context_checkpoint_artifact or None,
                 },
             )
             model_call_index = state.model_call_count + 1
             model_call_id = f"model-call-{model_call_index:04d}"
+            context_report_artifact = write_context_report_artifact(
+                state,
+                call_index=model_call_index,
+                built_context=built_context,
+                budget=_context_budget(self.profile, state),
+            )
+            state.emit(
+                "context.report.written",
+                {
+                    "model_call_id": model_call_id,
+                    "model_call_index": model_call_index,
+                    "context_report_artifact": context_report_artifact,
+                    "included_count": len(built_context.included),
+                    "excluded_count": len(built_context.excluded),
+                    "contextfs_index_path": built_context.contextfs_index_path,
+                },
+            )
             context_artifact, request_artifact = write_model_request_artifacts(
                 state,
                 call_index=model_call_index,
@@ -207,6 +245,7 @@ class Kernel:
                     "tool_count": len(visible_tools),
                     "stream": stream,
                     "context_artifact": context_artifact,
+                    "context_report_artifact": context_report_artifact,
                     "logical_request_artifact": request_artifact,
                     "http_request_artifact": http_request_artifact,
                 },
@@ -227,6 +266,7 @@ class Kernel:
                     call_index=model_call_index,
                     stream=stream,
                 )
+                response = self._after_model_response(state, response)
             except RunCancelled:
                 state.emit(
                     "model.cancelled",
@@ -292,7 +332,18 @@ class Kernel:
 
             if not response.tool_calls:
                 if response.content:
-                    state.finish(response.content)
+                    decision = self._before_finish(state, response)
+                    if decision.allow:
+                        state.finish(response.content)
+                    else:
+                        state.finish_gate_messages.append(decision.injected_message or decision.reason)
+                        state.emit(
+                            "finish.blocked",
+                            {"reason": decision.reason, "injected_message": decision.injected_message},
+                            visibility="user",
+                        )
+                        state.finish_step("completed", data={"provider": self.model.name, "finish_blocked": True})
+                        continue
                 else:
                     state.fail("Model returned no content and no tool calls.")
                 return
@@ -306,7 +357,18 @@ class Kernel:
                     return
 
             if self.profile.should_finish(state):
-                state.finish(response.content or state.final_output or "Run finished by profile.")
+                candidate = response.content or state.final_output or "Run finished by profile."
+                decision = self._before_finish(state, ModelResponse(content=candidate, finish_reason=response.finish_reason))
+                if decision.allow:
+                    state.finish(candidate)
+                else:
+                    state.finish_gate_messages.append(decision.injected_message or decision.reason)
+                    state.emit(
+                        "finish.blocked",
+                        {"reason": decision.reason, "injected_message": decision.injected_message},
+                        visibility="user",
+                    )
+                    continue
                 return
 
     def _dispatch_tool_call(self, state: RunState, call: ToolCall, *, visible_tool_names: frozenset[str]) -> None:
@@ -321,10 +383,15 @@ class Kernel:
                 output=f"Unknown tool requested: {call.name}",
                 ok=False,
                 data={"error_type": "UnknownTool", "available_tools": sorted(self.tools)},
+                failure_kind="invalid_tool_args",
+                summary=f"Unknown tool requested: {call.name}",
+                content_preview=f"Unknown tool requested: {call.name}",
             )
             self._append_tool_step(state, call, result)
             self._record_tool_result(state, call, result)
             self._record_tool_blocked(state, call, result.output)
+            index_path = refresh_contextfs(state)
+            state.emit("contextfs.index.updated", {"path": index_path, "tool_call_id": call.id})
             return
 
         if call.name not in visible_tool_names:
@@ -333,11 +400,20 @@ class Kernel:
                 call_id=call.id,
                 output=f"Tool is not visible for this profile: {call.name}",
                 ok=False,
-                data={"blocked": True, "error_type": "ToolNotVisible", "visible_tools": sorted(visible_tool_names)},
+                data={
+                    "blocked": True,
+                    "error_type": "ToolNotVisible",
+                    "visible_tools": sorted(visible_tool_names),
+                },
+                failure_kind="policy_denied",
+                summary=f"Tool is not visible for this profile: {call.name}",
+                content_preview=f"Tool is not visible for this profile: {call.name}",
             )
             self._append_tool_step(state, call, result)
             self._record_tool_result(state, call, result)
             self._record_tool_blocked(state, call, result.output)
+            index_path = refresh_contextfs(state)
+            state.emit("contextfs.index.updated", {"path": index_path, "tool_call_id": call.id})
             return
 
         try:
@@ -351,14 +427,30 @@ class Kernel:
                 output=decision.reason,
                 ok=False,
                 data={"blocked": True, "error_type": type(exc).__name__},
+                failure_kind="policy_denied",
+                summary=decision.reason,
+                content_preview=decision.reason,
             )
             self._append_tool_step(state, call, result)
             self._record_tool_result(state, call, result)
             self._record_tool_blocked(state, call, result.output)
+            index_path = refresh_contextfs(state)
+            state.emit("contextfs.index.updated", {"path": index_path, "tool_call_id": call.id})
             state.fail(decision.reason)
             return
 
         self._record_policy_decision(state, call, decision)
+        hook_result = self._before_tool_call(state, call, decision)
+        if isinstance(hook_result, ToolResult):
+            result = hook_result if hook_result.call_id else replace(hook_result, call_id=call.id)
+            self._append_tool_step(state, call, result)
+            self._record_tool_result(state, call, result)
+            self._record_tool_blocked(state, call, result.output)
+            index_path = refresh_contextfs(state)
+            state.emit("contextfs.index.updated", {"path": index_path, "tool_call_id": call.id})
+            return
+        if isinstance(hook_result, ToolCall):
+            call = hook_result
         if decision.kind == "needs_approval":
             decision = self._resolve_approval(state, call, decision)
             if decision.kind == "deny":
@@ -370,10 +462,15 @@ class Kernel:
                 output=decision.reason or "Policy denied tool call.",
                 ok=False,
                 data={"blocked": True},
+                failure_kind="policy_denied",
+                summary=decision.reason or "Policy denied tool call.",
+                content_preview=decision.reason or "Policy denied tool call.",
             )
             self._append_tool_step(state, call, result)
             self._record_tool_result(state, call, result)
             self._record_tool_blocked(state, call, result.output)
+            index_path = refresh_contextfs(state)
+            state.emit("contextfs.index.updated", {"path": index_path, "tool_call_id": call.id})
             return
 
         tool_execution_id = f"tool-exec-{call.id}"
@@ -395,6 +492,9 @@ class Kernel:
                 output=state.cancel_reason or "cancelled",
                 ok=False,
                 data={"cancelled": True, "reason": state.cancel_reason or "cancelled"},
+                failure_kind="unknown",
+                summary=state.cancel_reason or "cancelled",
+                content_preview=state.cancel_reason or "cancelled",
             )
         except Exception as exc:
             result = ToolResult(
@@ -403,17 +503,17 @@ class Kernel:
                 output=f"Tool error: {exc}",
                 ok=False,
                 data={"error_type": type(exc).__name__},
+                failure_kind="unknown",
+                summary=f"Tool error: {exc}",
+                content_preview=f"Tool error: {exc}",
             )
+        result = self._after_tool_result(state, result)
         if not result.call_id:
-            result = ToolResult(
-                tool_name=result.tool_name,
-                output=result.output,
-                call_id=call.id,
-                ok=result.ok,
-                data=result.data,
-            )
+            result = replace(result, call_id=call.id)
         self._append_tool_step(state, call, result)
         self._record_tool_result(state, call, result)
+        index_path = refresh_contextfs(state)
+        state.emit("contextfs.index.updated", {"path": index_path, "tool_call_id": call.id})
         if result.data.get("cancelled"):
             state.finish_step("cancelled", data={"reason": result.data.get("reason") or "cancelled"})
         elif result.ok:
@@ -434,6 +534,8 @@ class Kernel:
                     "reason": result.data.get("reason") or state.cancel_reason or "cancelled",
                     "output": result.output[: state.budgets.max_command_output_chars_visible],
                     "output_chars": _output_chars(result),
+                    "artifact_path": result.artifact_path,
+                    "failure_kind": result.failure_kind or result.data.get("failure_kind"),
                     "data": _small_event_data(result.data),
                 },
                 visibility="user",
@@ -442,29 +544,36 @@ class Kernel:
         output_limit = state.budgets.max_command_output_chars_visible
         output = result.output[:output_limit]
         output_chars = _output_chars(result)
-        if result.data.get("output_artifact"):
+        if result.artifact_path or result.data.get("output_artifact"):
             state.emit(
                 "tool.execution.output.snapshot",
                 {
                     "tool_call_id": call.id,
                     "tool": call.name,
                     "output_chars": output_chars,
+                    "artifact_path": result.artifact_path,
                     "output_artifact": result.data.get("output_artifact"),
+                    "context_artifact": result.data.get("context_artifact"),
                 },
             )
-        state.emit(
-            "tool.execution.completed" if result.ok else "tool.execution.failed",
-            {
-                "tool_call_id": call.id,
-                "tool": call.name,
-                "ok": result.ok,
-                "blocked": bool(result.data.get("blocked")),
-                "output": output,
-                "output_chars": output_chars,
-                "output_truncated": output_chars > len(output),
-                "data": _small_event_data(result.data),
-            },
-        )
+        payload = {
+            "tool_call_id": call.id,
+            "tool": call.name,
+            "ok": result.ok,
+            "blocked": bool(result.data.get("blocked")),
+            "output": output,
+            "output_chars": output_chars,
+            "output_truncated": output_chars > len(output),
+            "data": _small_event_data(result.data),
+        }
+        if result.artifact_path:
+            payload["artifact_path"] = result.artifact_path
+        failure_kind = result.failure_kind or result.data.get("failure_kind")
+        if failure_kind:
+            payload["failure_kind"] = failure_kind
+        if result.read_hints:
+            payload["read_hints"] = result.read_hints
+        state.emit("tool.execution.completed" if result.ok else "tool.execution.failed", payload)
 
     def _append_tool_step(self, state: RunState, call: ToolCall, result: ToolResult) -> None:
         state.tool_steps.append(ToolStep(call=call, result=result))
@@ -481,6 +590,8 @@ class Kernel:
                 "reason": decision.reason,
                 "redacted": decision.redacted,
                 "approval_id": approval_id,
+                "matched_rule": decision.matched_rule,
+                "permission": decision.permission,
             },
         )
 
@@ -737,6 +848,8 @@ class Kernel:
         state.emit(event_type, data)
 
     def _build_context(self, state: RunState, visible_tools: list[Tool]) -> BuiltContext:
+        index_path = refresh_contextfs(state)
+        state.emit("contextfs.index.updated", {"path": index_path})
         build_context = getattr(self.profile, "build_context", None)
         if callable(build_context):
             built_context = build_context(state)
@@ -766,6 +879,7 @@ class Kernel:
                 "tool_step_count": len(state.tool_steps),
             },
         )
+        self._run_hooks(state, "before_compact", state)
         self.profile.compact(state)
         state.emit(
             "checkpoint.completed",
@@ -775,6 +889,124 @@ class Kernel:
                 "checkpoint_artifact": state.context_checkpoint_artifact or None,
             },
         )
+
+    def _before_finish(self, state: RunState, response: ModelResponse) -> FinishDecision:
+        before_finish = getattr(self.profile, "before_finish", None)
+        decision = before_finish(state, response) if callable(before_finish) else FinishDecision.allowed()
+        for hook in self.hooks:
+            method = getattr(hook, "before_finish", None)
+            if not callable(method):
+                continue
+            name = _hook_name(hook)
+            state.emit("hook.started", {"hook": name, "method": "before_finish"})
+            try:
+                decision = method(state, response, decision)
+            except Exception as exc:
+                state.emit("hook.failed", {"hook": name, "method": "before_finish", "reason": str(exc)}, visibility="user")
+            else:
+                state.emit("hook.completed", {"hook": name, "method": "before_finish"})
+        return decision
+
+    def _run_hooks(self, state: RunState, method_name: str, *args) -> None:
+        for hook in self.hooks:
+            method = getattr(hook, method_name, None)
+            if not callable(method):
+                continue
+            name = _hook_name(hook)
+            state.emit("hook.started", {"hook": name, "method": method_name})
+            try:
+                method(*args)
+            except Exception as exc:
+                state.emit("hook.failed", {"hook": name, "method": method_name, "reason": str(exc)}, visibility="user")
+            else:
+                state.emit("hook.completed", {"hook": name, "method": method_name})
+
+    def _on_context(self, state: RunState, built_context: BuiltContext) -> BuiltContext:
+        current = built_context
+        for hook in self.hooks:
+            method = getattr(hook, "on_context", None)
+            if not callable(method):
+                continue
+            name = _hook_name(hook)
+            state.emit("hook.started", {"hook": name, "method": "on_context"})
+            try:
+                current = method(state, current)
+            except Exception as exc:
+                state.emit("hook.failed", {"hook": name, "method": "on_context", "reason": str(exc)}, visibility="user")
+            else:
+                state.emit("hook.completed", {"hook": name, "method": "on_context"})
+        return current
+
+    def _after_model_response(self, state: RunState, response: ModelResponse) -> ModelResponse:
+        current = response
+        for hook in self.hooks:
+            method = getattr(hook, "after_model_response", None)
+            if not callable(method):
+                continue
+            name = _hook_name(hook)
+            state.emit("hook.started", {"hook": name, "method": "after_model_response"})
+            try:
+                current = method(state, current)
+            except Exception as exc:
+                state.emit("hook.failed", {"hook": name, "method": "after_model_response", "reason": str(exc)}, visibility="user")
+            else:
+                state.emit("hook.completed", {"hook": name, "method": "after_model_response"})
+        return current
+
+    def _before_model_call(self, state: RunState, messages: list[Message], tools: list[Tool]) -> tuple[list[Message], list[Tool]]:
+        current_messages: list[Message] = messages
+        current_tools: list[Tool] = tools
+        for hook in self.hooks:
+            method = getattr(hook, "before_model_call", None)
+            if not callable(method):
+                continue
+            name = _hook_name(hook)
+            state.emit("hook.started", {"hook": name, "method": "before_model_call"})
+            try:
+                returned = method(state, current_messages, current_tools)
+                if isinstance(returned, tuple) and len(returned) == 2:
+                    current_messages = list(returned[0])
+                    current_tools = list(returned[1])
+            except Exception as exc:
+                state.emit("hook.failed", {"hook": name, "method": "before_model_call", "reason": str(exc)}, visibility="user")
+            else:
+                state.emit("hook.completed", {"hook": name, "method": "before_model_call"})
+        return current_messages, current_tools
+
+    def _before_tool_call(self, state: RunState, call: ToolCall, decision: PolicyDecision) -> ToolCall | ToolResult | None:
+        current: ToolCall | ToolResult | None = call
+        for hook in self.hooks:
+            method = getattr(hook, "before_tool_call", None)
+            if not callable(method):
+                continue
+            name = _hook_name(hook)
+            state.emit("hook.started", {"hook": name, "method": "before_tool_call"})
+            try:
+                returned = method(state, current if isinstance(current, ToolCall) else call, decision)
+                current = returned if returned is not None else current
+            except Exception as exc:
+                state.emit("hook.failed", {"hook": name, "method": "before_tool_call", "reason": str(exc)}, visibility="user")
+            else:
+                state.emit("hook.completed", {"hook": name, "method": "before_tool_call"})
+            if isinstance(current, ToolResult):
+                return current
+        return current if isinstance(current, ToolCall) and current != call else None
+
+    def _after_tool_result(self, state: RunState, result: ToolResult) -> ToolResult:
+        current = result
+        for hook in self.hooks:
+            method = getattr(hook, "after_tool_result", None)
+            if not callable(method):
+                continue
+            name = _hook_name(hook)
+            state.emit("hook.started", {"hook": name, "method": "after_tool_result"})
+            try:
+                current = method(state, current)
+            except Exception as exc:
+                state.emit("hook.failed", {"hook": name, "method": "after_tool_result", "reason": str(exc)}, visibility="user")
+            else:
+                state.emit("hook.completed", {"hook": name, "method": "after_tool_result"})
+        return current
 
 
 def _small_event_data(data: dict[str, Any]) -> dict[str, Any]:
@@ -792,6 +1024,18 @@ def _small_event_data(data: dict[str, Any]) -> dict[str, Any]:
 def _output_chars(result: ToolResult) -> int:
     value = result.data.get("output_chars")
     return value if isinstance(value, int) else len(result.output)
+
+
+def _context_budget(profile: Profile, state: RunState) -> int:
+    config = getattr(profile, "context_config", None)
+    budget = getattr(config, "effective_compact_at_tokens", None)
+    if isinstance(budget, int):
+        return budget
+    return state.context_token_estimate
+
+
+def _hook_name(hook: TinyHook) -> str:
+    return str(getattr(hook, "name", hook.__class__.__name__))
 
 
 def _yolo_resolution(approval: ApprovalRequest) -> ApprovalResolution:

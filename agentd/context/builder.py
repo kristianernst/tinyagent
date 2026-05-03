@@ -9,7 +9,7 @@ from typing import Any
 
 from agentd.context.checkpoint import artifact_refs_from_tool_steps, is_test_command_text
 from agentd.context.instructions import load_project_instructions
-from agentd.context.types import BuiltContext, ContextConfig, ProjectInstructions
+from agentd.context.types import BuiltContext, ContextConfig, ContextExclusion, ContextItem, ProjectInstructions
 from agentd.contracts import Tool
 from agentd.events import json_safe
 from agentd.state import Message, RunState, ToolStep
@@ -27,17 +27,28 @@ class ContextBuilder:
         environment = render_environment_context(state, self.config)
         project = render_project_instructions(project_instructions)
         task = f"Task:\n{state.task}"
+        finish_gate = render_finish_gate_messages(state)
+        contextfs_index_path, contextfs_index = render_contextfs_index(state)
         checkpoint = render_context_checkpoint(state)
         recent_tools = render_recent_tool_steps(state, self.config)
-        messages = [
-            Message(role="system", content=self.system_prompt),
-            Message(role="user", content=environment, meta={"context_layer": "environment"}),
-            Message(role="user", content=project, meta={"context_layer": "project_instructions"}),
-            Message(role="user", content=task, meta={"context_layer": "task"}),
-            Message(role="user", content=checkpoint, meta={"context_layer": "working_state"}),
-            Message(role="user", content=recent_tools, meta={"context_layer": "recent_tool_steps"}),
+        candidates = [
+            _item("system:profile", "system", self.system_prompt, "system_prompt", 1000, stable=True),
+            _item("environment:current", "user", environment, "environment", 850, stable=True),
+            _item("project:instructions", "user", project, "project_instructions", 800, stable=True),
+            _item("task:current", "user", task, "task", 950, stable=True),
+            _item("contextfs:index", "user", contextfs_index, "contextfs_index", 900, stable=True)
+            if contextfs_index
+            else None,
+            _item("finish_gate:messages", "user", finish_gate, "finish_gate", 780) if finish_gate else None,
+            _item("working_state:checkpoint", "user", checkpoint, "working_state", 700, stable=True),
+            _item("recent_tools:preview", "user", recent_tools, "recent_tool_steps", 600, stable=True),
         ]
-        static_context_chars = sum(len(message_text(message)) for message in messages[:-1])
+        included, excluded = _pack_items([item for item in candidates if item is not None], self.config)
+        messages = [
+            Message(role=item.role, content=item.text, meta={"context_layer": item.source, "context_item_id": item.id})
+            for item in included
+        ]
+        static_context_chars = sum(len(message_text(message)) for message in messages if message.meta.get("context_layer") != "recent_tool_steps")
         tool_context_chars = len(recent_tools)
         return BuiltContext(
             messages=messages,
@@ -46,6 +57,9 @@ class ContextBuilder:
             tool_context_chars=tool_context_chars,
             project_instruction_chars=project_instructions.chars,
             artifacts=artifact_refs_from_tool_steps(_tool_steps_since_checkpoint(state)),
+            included=included,
+            excluded=excluded,
+            contextfs_index_path=contextfs_index_path,
         )
 
 
@@ -119,6 +133,22 @@ def render_context_checkpoint(state: RunState) -> str:
         artifact = f"\n\nCheckpoint artifact: {state.context_checkpoint_artifact}" if state.context_checkpoint_artifact else ""
         return f"Previous checkpoint:\n{checkpoint}{artifact}"
     return "Previous checkpoint:\nNo checkpoint yet."
+
+
+def render_contextfs_index(state: RunState) -> tuple[str | None, str]:
+    relative = "context/INDEX.md"
+    path = state.output_dir / relative
+    if not path.exists():
+        return None, ""
+    return relative, "\n".join(["ContextFS index:", "", path.read_text()])
+
+
+def render_finish_gate_messages(state: RunState) -> str:
+    if not state.finish_gate_messages:
+        return ""
+    lines = ["Finish gate feedback:"]
+    lines.extend(f"- {message}" for message in state.finish_gate_messages[-5:])
+    return "\n".join(lines)
 
 
 def render_recent_tool_steps(state: RunState, config: ContextConfig | None = None) -> str:
@@ -204,6 +234,40 @@ def _small_json(value: object, *, max_chars: int = 2_000) -> str:
     if len(encoded) <= max_chars:
         return encoded
     return json.dumps({"_truncated": True, "json_chars": len(encoded), "preview": encoded[:max_chars]}, sort_keys=True)
+
+
+def _item(
+    item_id: str,
+    role: str,
+    text: str,
+    source: str,
+    priority: int,
+    *,
+    stable: bool = False,
+) -> ContextItem:
+    return ContextItem(
+        id=item_id,
+        role=role,
+        text=text,
+        source=source,
+        priority=priority,
+        token_estimate=estimate_tokens(text),
+        stable=stable,
+    )
+
+
+def _pack_items(items: Sequence[ContextItem], config: ContextConfig) -> tuple[list[ContextItem], list[ContextExclusion]]:
+    budget = config.effective_compact_at_tokens
+    included: list[ContextItem] = []
+    excluded: list[ContextExclusion] = []
+    total = 0
+    for item in sorted(items, key=lambda value: (-value.priority, value.id)):
+        if item.stable or total + item.token_estimate <= budget:
+            included.append(item)
+            total += item.token_estimate
+        else:
+            excluded.append(ContextExclusion(item_id=item.id, reason="budget", token_estimate=item.token_estimate))
+    return sorted(included, key=lambda value: items.index(value)), excluded
 
 
 def _tool_dict(tool: Tool) -> dict[str, Any]:

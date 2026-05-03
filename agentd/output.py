@@ -167,6 +167,44 @@ def write_model_request_artifacts(
     return context_artifact, request_artifact
 
 
+def write_context_report_artifact(
+    state: RunState,
+    *,
+    call_index: int,
+    built_context,
+    budget: int,
+) -> str:
+    return write_json_artifact(
+        state,
+        f"context-report-{call_index:04d}.json",
+        {
+            "request_id": f"model-call-{call_index:04d}",
+            "token_estimate": built_context.token_estimate,
+            "budget": budget,
+            "contextfs_index_path": built_context.contextfs_index_path,
+            "included": [
+                {
+                    "id": item.id,
+                    "source": item.source,
+                    "tokens": item.token_estimate,
+                    "priority": item.priority,
+                    "stable": item.stable,
+                }
+                for item in built_context.included
+            ],
+            "excluded": [
+                {
+                    "id": item.item_id,
+                    "reason": item.reason,
+                    "tokens": item.token_estimate,
+                }
+                for item in built_context.excluded
+            ],
+        },
+        kind="context_report",
+    )
+
+
 def write_model_http_request_artifact(
     state: RunState,
     *,
@@ -208,6 +246,9 @@ def _metrics(state: RunState) -> dict[str, Any]:
     envelope = state.workspace_envelope
     return {
         "run_id": state.run_id,
+        "parent_run_id": state.parent_run_id,
+        "parent_event_id": state.parent_event_id,
+        "branch_name": state.branch_name,
         "status": "cancelled" if state.cancelled else "failed" if state.failed else "completed",
         "terminal_status": state.terminal_status,
         "failure_reason": state.failure_reason,

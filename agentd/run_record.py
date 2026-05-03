@@ -51,6 +51,8 @@ class CommandRecord:
 class RunRecord:
     run_path: str
     run_id: str = ""
+    parent_run_id: str | None = None
+    parent_event_id: str | None = None
     task: str = ""
     status: str = "unknown"
     failure_reason: str = ""
@@ -96,6 +98,8 @@ def load_run_record(run_path: Path) -> RunRecord:
     return RunRecord(
         run_path=str(root),
         run_id=run_id,
+        parent_run_id=metrics.get("parent_run_id") or (started.data.get("parent_run_id") if started else None),
+        parent_event_id=metrics.get("parent_event_id") or (started.data.get("parent_event_id") if started else None),
         task=str(metrics.get("task") or task),
         status=status,
         failure_reason=failure_reason,
@@ -122,6 +126,8 @@ def render_run_inspection(record: RunRecord) -> str:
         "# Tinyagent Run Inspect",
         "",
         f"run_id: {record.run_id}",
+        f"parent_run_id: {record.parent_run_id or ''}",
+        f"parent_event_id: {record.parent_event_id or ''}",
         f"status: {record.status}",
         f"task: {record.task}",
         f"run_path: {record.run_path}",

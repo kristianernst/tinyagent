@@ -32,8 +32,12 @@ def resolve_workspace_path(state: RunState, path: str | Path = ".", *, allow_run
     resolved = state.workspace.resolve_path(path)
     if not state.workspace.contains(resolved):
         raise ToolError(f"Path is outside workspace: {path}")
+    if not allow_run_artifacts and _is_env_path(state, resolved):
+        raise ToolError(f"Path is protected environment file: {relative_workspace_path(state, resolved)}")
     if not allow_run_artifacts and is_relative_to(resolved, state.output_dir.resolve()):
         raise ToolError(f"Path is inside current run artifacts: {relative_workspace_path(state, resolved)}")
+    if not allow_run_artifacts and _is_workspace_tinyagent_path(state, resolved):
+        raise ToolError(f"Path is inside protected .tinyagent evidence: {relative_workspace_path(state, resolved)}")
     return resolved
 
 
@@ -78,7 +82,16 @@ def tool_env(state: RunState) -> dict[str, str]:
 
 
 def error_result(tool_name: str, call: ToolCall, exc: Exception) -> ToolResult:
-    return ToolResult(tool_name=tool_name, call_id=call.id, output=str(exc), ok=False, data={"error_type": type(exc).__name__})
+    return ToolResult(
+        tool_name=tool_name,
+        call_id=call.id,
+        output=str(exc),
+        ok=False,
+        data={"error_type": type(exc).__name__, "failure_kind": "invalid_tool_args"},
+        failure_kind="invalid_tool_args",
+        summary=str(exc),
+        content_preview=str(exc),
+    )
 
 
 def is_relative_to(path: Path, root: Path) -> bool:
@@ -87,3 +100,21 @@ def is_relative_to(path: Path, root: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _is_workspace_tinyagent_path(state: RunState, path: Path) -> bool:
+    root = state.workspace.root.resolve()
+    try:
+        relative = path.resolve().relative_to(root)
+    except ValueError:
+        return False
+    return bool(relative.parts and relative.parts[0] == ".tinyagent")
+
+
+def _is_env_path(state: RunState, path: Path) -> bool:
+    root = state.workspace.root.resolve()
+    try:
+        relative = path.resolve().relative_to(root)
+    except ValueError:
+        return False
+    return bool(relative.parts and (relative.parts[-1] == ".env" or relative.parts[-1].startswith(".env.")))

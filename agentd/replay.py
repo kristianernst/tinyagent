@@ -64,6 +64,7 @@ def _event_detail(event: Event) -> str:
         case "model.call.started":
             artifacts = [
                 data.get("context_artifact"),
+                data.get("context_report_artifact"),
                 data.get("logical_request_artifact"),
                 data.get("http_request_artifact"),
             ]
@@ -94,10 +95,16 @@ def _event_detail(event: Event) -> str:
             | "tool.execution.cancelled"
             | "tool.execution.blocked"
         ):
-            artifact = ""
+            artifact = str(data.get("artifact_path") or "")
             if isinstance(data.get("data"), dict):
-                artifact = str(data["data"].get("output_artifact") or "")
+                artifact = artifact or str(data["data"].get("context_artifact") or data["data"].get("output_artifact") or "")
             return f"{data.get('tool')} {data.get('tool_call_id')} {artifact}".strip()
+        case "context.report.written":
+            return f"model_call={data.get('model_call_index')} {data.get('context_report_artifact') or ''}".strip()
+        case "contextfs.index.updated":
+            return str(data.get("path") or "")
+        case "contextfs.artifact.written":
+            return f"{data.get('tool')} {data.get('tool_call_id')} {data.get('path')}".strip()
         case "command.cancelled":
             return f"{data.get('cmd')} returncode={data.get('returncode')} {data.get('output_artifact') or ''}".strip()
         case "policy.evaluated":
