@@ -9,6 +9,7 @@ import subprocess
 import time
 from typing import Any
 
+from agentd.contextfs import read_hints, write_context_tool_output
 from agentd.run_control import RunCancelled
 from agentd.state import RunState, ToolCall, ToolResult
 from agentd.tools.core import combined_output, error_result, tool_env, visible_output, write_tool_output_artifact
@@ -32,6 +33,7 @@ class ShellTool:
     }
 
     def run(self, call: ToolCall, state: RunState) -> ToolResult:
+        started = time.monotonic()
         cmd = str(call.args.get("cmd", ""))
         if not cmd:
             return ToolResult(tool_name=self.name, call_id=call.id, output="cmd is required", ok=False)
@@ -70,6 +72,8 @@ class ShellTool:
             stdout, stderr = _terminate_process_group(process)
             output = combined_output(stdout, stderr) or f"Command timed out after {timeout}s."
             artifact = write_tool_output_artifact(state, call, "command-output", output, kind="command_output")
+            context_artifact = write_context_tool_output(state, call, output, kind="shell_output")
+            preview = visible_output(output, state)
             state.emit(
                 "command.timeout",
                 {
@@ -79,21 +83,36 @@ class ShellTool:
                     "timeout": True,
                     "returncode": process.returncode,
                     "output_artifact": artifact,
+                    "context_artifact": context_artifact,
                     "output_chars": len(output),
+                    "duration_ms": _duration_ms(started),
+                    "failure_kind": "timeout",
                 },
             )
             return ToolResult(
                 tool_name=self.name,
                 call_id=call.id,
-                output=visible_output(output, state),
+                output=preview,
                 ok=False,
+                exit_code=process.returncode,
+                duration_ms=_duration_ms(started),
+                summary=f"Command timed out after {timeout}s.",
+                content_preview=preview,
+                artifact_path=context_artifact,
+                truncated=len(preview) < len(output),
+                failure_kind="timeout",
                 data={
                     "cmd": cmd,
                     "timeout": True,
                     "returncode": process.returncode,
                     "output_artifact": artifact,
+                    "context_artifact": context_artifact,
                     "output_chars": len(output),
+                    "duration_ms": _duration_ms(started),
+                    "failure_kind": "timeout",
                 },
+                metadata={"cwd": str(state.workspace.root), "command_normalized": cmd},
+                read_hints=read_hints(context_artifact, failure=True),
             )
         except RunCancelled:
             state.request_cancel(
@@ -104,6 +123,8 @@ class ShellTool:
             stdout, stderr = _terminate_process_group(process)
             output = combined_output(stdout, stderr) or "Command cancelled."
             artifact = write_tool_output_artifact(state, call, "command-output", output, kind="command_output")
+            context_artifact = write_context_tool_output(state, call, output, kind="shell_output")
+            preview = visible_output(output, state)
             state.emit(
                 "command.cancelled",
                 {
@@ -112,53 +133,92 @@ class ShellTool:
                     "reason": state.cancel_reason or "cancelled",
                     "returncode": process.returncode,
                     "output_artifact": artifact,
+                    "context_artifact": context_artifact,
                     "output_chars": len(output),
                     "escalated": state.cancel_escalated,
+                    "duration_ms": _duration_ms(started),
+                    "failure_kind": "unknown",
                 },
                 visibility="user",
             )
             return ToolResult(
                 tool_name=self.name,
                 call_id=call.id,
-                output=visible_output(output, state),
+                output=preview,
                 ok=False,
+                exit_code=process.returncode,
+                duration_ms=_duration_ms(started),
+                summary=state.cancel_reason or "Command cancelled.",
+                content_preview=preview,
+                artifact_path=context_artifact,
+                truncated=len(preview) < len(output),
+                failure_kind="unknown",
                 data={
                     "cmd": cmd,
                     "cancelled": True,
                     "reason": state.cancel_reason or "cancelled",
                     "returncode": process.returncode,
                     "output_artifact": artifact,
+                    "context_artifact": context_artifact,
                     "output_chars": len(output),
+                    "duration_ms": _duration_ms(started),
+                    "failure_kind": "unknown",
                 },
+                metadata={"cwd": str(state.workspace.root), "command_normalized": cmd},
+                read_hints=read_hints(context_artifact, failure=True),
             )
 
         output = combined_output(stdout, stderr) or f"Command exited {process.returncode}."
         artifact = write_tool_output_artifact(state, call, "command-output", output, kind="command_output")
+        context_artifact = write_context_tool_output(state, call, output, kind="shell_output")
+        preview = visible_output(output, state)
+        ok = process.returncode == 0
+        failure_kind = None if ok else "command_failed"
         state.emit(
-            "command.completed" if process.returncode == 0 else "command.failed",
+            "command.completed" if ok else "command.failed",
             {
                 "tool_call_id": call.id,
                 "cmd": cmd,
-                "ok": process.returncode == 0,
+                "ok": ok,
                 "timeout": False,
                 "returncode": process.returncode,
                 "stdout_chars": len(stdout),
                 "stderr_chars": len(stderr),
                 "output_artifact": artifact,
+                "context_artifact": context_artifact,
                 "output_chars": len(output),
+                "duration_ms": _duration_ms(started),
+                "failure_kind": failure_kind,
             },
         )
         return ToolResult(
             tool_name=self.name,
             call_id=call.id,
-            output=visible_output(output, state),
-            ok=process.returncode == 0,
+            output=preview,
+            ok=ok,
+            exit_code=process.returncode,
+            duration_ms=_duration_ms(started),
+            summary=f"Command exited {process.returncode}.",
+            content_preview=preview,
+            artifact_path=context_artifact,
+            truncated=len(preview) < len(output),
+            failure_kind=failure_kind,
             data={
                 "cmd": cmd,
                 "returncode": process.returncode,
                 "output_artifact": artifact,
+                "context_artifact": context_artifact,
                 "output_chars": len(output),
+                "duration_ms": _duration_ms(started),
+                "failure_kind": failure_kind,
             },
+            metadata={
+                "cwd": str(state.workspace.root),
+                "stdout_chars": len(stdout),
+                "stderr_chars": len(stderr),
+                "command_normalized": cmd,
+            },
+            read_hints=read_hints(context_artifact, failure=not ok),
         )
 
 
@@ -200,3 +260,7 @@ def _signal_process_group(process: subprocess.Popen[str], sig: signal.Signals) -
         os.killpg(process.pid, sig)
     except ProcessLookupError:
         return
+
+
+def _duration_ms(started: float) -> int:
+    return int((time.monotonic() - started) * 1000)

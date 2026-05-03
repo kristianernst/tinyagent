@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 from agentd.state import Message
 
@@ -26,6 +27,26 @@ class ContextConfig:
 class ArtifactRef:
     path: str
     description: str = ""
+
+
+@dataclass(frozen=True)
+class ContextItem:
+    id: str
+    role: str
+    text: str
+    source: str
+    priority: int
+    token_estimate: int
+    stable: bool = False
+    tags: tuple[str, ...] = ()
+    expires_after_steps: int | None = None
+
+
+@dataclass(frozen=True)
+class ContextExclusion:
+    item_id: str
+    reason: Literal["budget", "expired", "lower_priority", "duplicate", "profile_filtered"]
+    token_estimate: int
 
 
 @dataclass
@@ -62,3 +83,6 @@ class BuiltContext:
     tool_context_chars: int
     project_instruction_chars: int
     artifacts: list[ArtifactRef] = field(default_factory=list)
+    included: list[ContextItem] = field(default_factory=list)
+    excluded: list[ContextExclusion] = field(default_factory=list)
+    contextfs_index_path: str | None = None

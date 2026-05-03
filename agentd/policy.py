@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import re
+import shlex
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from agentd.contracts import PolicyEngine
 from agentd.state import ApprovalRequest, PolicyDecision, RunState, ToolCall
@@ -15,6 +18,7 @@ class LocalPolicy:
 
     def __init__(self, *, allow_run_artifacts: bool = False) -> None:
         self.allow_run_artifacts = allow_run_artifacts
+        self.config = default_policy_config()
 
     def evaluate(self, call: ToolCall, state: RunState) -> PolicyDecision:
         try:
@@ -53,11 +57,32 @@ class LocalPolicy:
     def _evaluate_shell(self, call: ToolCall, state: RunState) -> PolicyDecision:
         cmd = str(call.args.get("cmd", ""))
         if not cmd:
-            return PolicyDecision.deny("Shell command is required.")
+            return PolicyDecision.deny("Shell command is required.", matched_rule="shell.required", permission="bash")
         lower = cmd.lower()
+        repeated = _repeated_failed_command_count(state, cmd)
+        if repeated >= self.config.repeated_command_failure_limit:
+            return PolicyDecision.deny(
+                f"repeated identical failed command denied after {repeated} failures",
+                matched_rule="bash.repeated_failed_command",
+                permission="bash",
+            )
         for pattern, reason in RISKY_SHELL_PATTERNS:
             if re.search(pattern, lower):
-                return PolicyDecision.deny(reason)
+                return PolicyDecision.deny(reason, matched_rule=pattern, permission="bash")
+        protected_write = _protected_tinyagent_write(cmd)
+        if protected_write:
+            return PolicyDecision.deny(
+                f"shell write to protected .tinyagent evidence is denied: {protected_write}",
+                matched_rule="contextfs_write.deny",
+                permission="contextfs_write",
+            )
+        env_access = _env_file_access(cmd)
+        if env_access:
+            return PolicyDecision.deny(
+                f"access to protected environment file is denied: {env_access}",
+                matched_rule="secrets.deny",
+                permission="read",
+            )
         redirect_escape = _outside_redirect_target(cmd, state)
         if redirect_escape:
             return PolicyDecision.needs_approval(
@@ -72,11 +97,29 @@ class LocalPolicy:
                 ),
             )
         if _NETWORK_SHELL_PATTERN.search(lower):
-            return PolicyDecision.needs_approval(
-                "network-looking shell command requires approval",
-                _approval_request(call, state, action_kind="network", risk="high", args_preview=cmd, command=cmd),
+            return PolicyDecision.deny(
+                "network-looking shell command is denied by default",
+                matched_rule="network.deny",
+                permission="network",
             )
-        return PolicyDecision.allow("shell command passed local denylist")
+        return PolicyDecision.allow("shell command passed local denylist", matched_rule="bash.default_allow", permission="bash")
+
+
+PolicyAction = Literal["allow", "ask", "deny"]
+
+
+@dataclass(frozen=True)
+class PolicyRule:
+    permission: str
+    pattern: str
+    action: PolicyAction
+
+
+@dataclass(frozen=True)
+class PolicyConfig:
+    default: PolicyAction = "deny"
+    rules: tuple[PolicyRule, ...] = field(default_factory=tuple)
+    repeated_command_failure_limit: int = 2
 
 
 RISKY_SHELL_PATTERNS = (
@@ -84,6 +127,7 @@ RISKY_SHELL_PATTERNS = (
     (r"\brm\b(?=[^;&|]*(?:-[^\s;&|]*r|--recursive))(?=[^;&|]*(?:-[^\s;&|]*f|--force))", "recursive force removal is denied by default."),
     (r"\bgit\s+reset\s+--hard\b", "git reset --hard is denied by default."),
     (r"\bgit\s+clean\s+-[^\n;&|]*f", "git clean -f is denied by default."),
+    (r"\bgit\s+push\b", "git push is denied by default."),
     (r"\bmkfs\b", "filesystem formatting commands are denied by default."),
     (r"\bshutdown\b|\breboot\b", "machine power commands are denied by default."),
     (r":\(\)\s*\{\s*:\|:", "fork-bomb-like shell functions are denied by default."),
@@ -91,6 +135,11 @@ RISKY_SHELL_PATTERNS = (
 
 _NETWORK_SHELL_PATTERN = re.compile(r"\b(curl|wget|ssh|scp|sftp|rsync|nc|ncat|telnet)\b")
 _REDIRECT_PATTERN = re.compile(r"(?:^|[\s;&|])(?:>|>>|<)\s*(?P<path>[^()\s;&|]+)")
+_TINYAGENT_WRITE_PATTERN = re.compile(
+    r"(?:(?:>|>>)\s*(?P<redirect>\.tinyagent(?:/|\b)[^\s;&|]*)|"
+    r"\b(?:tee|mkdir|touch|rm|mv|cp)\b[^\n;&|]*(?P<command>\.tinyagent(?:/|\b)[^\s;&|]*))"
+)
+_ENV_FILE_PATTERN = re.compile(r"(?P<path>(?:^|[\s'\"])\.env(?:\.[A-Za-z0-9_.-]+)?)(?:[\s'\"]|$)")
 
 
 def _dirty_current_workspace(state: RunState) -> bool:
@@ -106,6 +155,8 @@ def _outside_redirect_target(cmd: str, state: RunState) -> str:
         raw = match.group("path").strip("'\"")
         if not raw or raw.startswith("&"):
             continue
+        if raw == "/dev/null":
+            continue
         path = Path(raw).expanduser()
         if not path.is_absolute():
             continue
@@ -116,6 +167,37 @@ def _outside_redirect_target(cmd: str, state: RunState) -> str:
         elif not state.workspace.contains(path):
             return raw
     return ""
+
+
+def _protected_tinyagent_write(cmd: str) -> str:
+    match = _TINYAGENT_WRITE_PATTERN.search(cmd)
+    return (match.group("redirect") or match.group("command")) if match else ""
+
+
+def _env_file_access(cmd: str) -> str:
+    match = _ENV_FILE_PATTERN.search(cmd)
+    return match.group("path").strip() if match else ""
+
+
+def _repeated_failed_command_count(state: RunState, cmd: str) -> int:
+    normalized = _normalize_command(cmd)
+    count = 0
+    for step in reversed(state.tool_steps):
+        if step.call.name != "shell":
+            continue
+        if _normalize_command(str(step.call.args.get("cmd", ""))) != normalized:
+            continue
+        if step.result.ok:
+            break
+        count += 1
+    return count
+
+
+def _normalize_command(cmd: str) -> str:
+    try:
+        return " ".join(shlex.split(cmd))
+    except ValueError:
+        return " ".join(cmd.split())
 
 
 def _approval_request(
@@ -144,3 +226,22 @@ def _approval_request(
 
 def default_policy() -> PolicyEngine:
     return LocalPolicy()
+
+
+def default_policy_config() -> PolicyConfig:
+    return PolicyConfig(
+        default="deny",
+        rules=(
+            PolicyRule("network", "*", "deny"),
+            PolicyRule("contextfs_write", ".tinyagent/**", "deny"),
+            PolicyRule("secrets", ".env*", "deny"),
+            PolicyRule("external_directory", "*", "ask"),
+            PolicyRule("bash", "git status*", "allow"),
+            PolicyRule("bash", "git diff*", "allow"),
+            PolicyRule("bash", "rg *", "allow"),
+            PolicyRule("bash", "sed *", "allow"),
+            PolicyRule("bash", "pytest *", "allow"),
+            PolicyRule("bash", "uv run pytest*", "allow"),
+            PolicyRule("bash", "npm test*", "allow"),
+        ),
+    )

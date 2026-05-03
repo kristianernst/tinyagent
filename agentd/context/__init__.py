@@ -18,7 +18,7 @@ from agentd.context.checkpoint import (
     summarize_context_state,
 )
 from agentd.context.instructions import PROJECT_INSTRUCTION_FILE, load_project_instructions
-from agentd.context.types import ArtifactRef, BuiltContext, ContextConfig, ContextState, ProjectInstructions
+from agentd.context.types import ArtifactRef, BuiltContext, ContextConfig, ContextExclusion, ContextItem, ContextState, ProjectInstructions
 
 __all__ = [
     "PROJECT_INSTRUCTION_FILE",
@@ -26,6 +26,8 @@ __all__ = [
     "BuiltContext",
     "ContextBuilder",
     "ContextConfig",
+    "ContextExclusion",
+    "ContextItem",
     "ContextState",
     "ProjectInstructions",
     "artifact_refs_from_tool_steps",

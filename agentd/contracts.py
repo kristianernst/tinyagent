@@ -6,7 +6,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, Protocol
 
 from agentd.model_stream import ModelDelta
-from agentd.state import ApprovalRequest, ApprovalResolution, Message, ModelResponse, PolicyDecision, RunState, ToolCall, ToolResult
+from agentd.state import ApprovalRequest, ApprovalResolution, FinishDecision, Message, ModelResponse, PolicyDecision, RunState, ToolCall, ToolResult
 
 
 class Tool(Protocol):
@@ -40,6 +40,8 @@ class Profile(Protocol):
     def should_continue(self, state: RunState) -> bool: ...
 
     def should_finish(self, state: RunState) -> bool: ...
+
+    def before_finish(self, state: RunState, response: ModelResponse) -> FinishDecision: ...
 
     def should_compact(self, state: RunState) -> bool: ...
 

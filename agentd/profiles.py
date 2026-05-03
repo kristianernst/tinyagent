@@ -5,10 +5,12 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
+import re
 
 from agentd.context import BuiltContext, ContextBuilder, ContextConfig, compact_state
+from agentd.context.checkpoint import is_test_command_text
 from agentd.contracts import Tool
-from agentd.state import Message, RunState
+from agentd.state import FinishDecision, Message, ModelResponse, RunState, ToolStep
 
 PROFILE_ROOT = Path(__file__).resolve().parents[1] / "profiles"
 
@@ -60,6 +62,47 @@ class ApexCoderProfile:
     def should_finish(self, state: RunState) -> bool:
         return False
 
+    def before_finish(self, state: RunState, response: ModelResponse) -> FinishDecision:
+        content = response.content or ""
+        edited_index = _latest_index(state.tool_steps, _is_successful_edit)
+        if edited_index is not None:
+            if _latest_index(state.tool_steps, _is_diff_inspection) is None or _latest_index(state.tool_steps, _is_diff_inspection) < edited_index:
+                return FinishDecision.blocked(
+                    "finish blocked: inspect git diff after edits",
+                    "Before finalizing, inspect git diff after the latest edit.",
+                )
+            verification_index = _latest_index(state.tool_steps, _is_successful_verification)
+            if verification_index is None or verification_index < edited_index:
+                if not _mentions_verification_limitation(content):
+                    return FinishDecision.blocked(
+                        "finish blocked: run verification after edits or explain why it cannot run",
+                        "Before finalizing, run the smallest relevant verification command, or explain exactly why it cannot run.",
+                    )
+
+        last_step = state.tool_steps[-1] if state.tool_steps else None
+        if last_step is not None and not last_step.result.ok and not _mentions_failure(content):
+            return FinishDecision.blocked(
+                "finish blocked: last tool failed and final answer did not report it",
+                "The last tool failed. Report the failure/current state before finalizing, or continue investigating.",
+            )
+
+        blocked_step = _latest_index(
+            state.tool_steps,
+            lambda step: (step.result.failure_kind or step.result.data.get("failure_kind")) in {"policy_denied", "sandbox_blocked"},
+        )
+        if blocked_step is not None and not _mentions_limitation(content):
+            return FinishDecision.blocked(
+                "finish blocked: policy/sandbox limitation was not reported",
+                "A policy or sandbox limitation occurred. Mention it explicitly or request approval before finalizing.",
+            )
+
+        if _claims_tests_passed(content) and _latest_index(state.tool_steps, _is_successful_verification) is None:
+            return FinishDecision.blocked(
+                "finish blocked: final answer claims tests passed without passing verification evidence",
+                "Do not claim tests passed unless a passing verification command exists in the trace.",
+            )
+        return FinishDecision.allowed()
+
     def should_compact(self, state: RunState) -> bool:
         new_steps = len(state.tool_steps) - state.context_checkpoint_tool_step_count
         if new_steps <= 0:
@@ -70,3 +113,49 @@ class ApexCoderProfile:
 
     def compact(self, state: RunState) -> None:
         compact_state(state, self.context_config)
+
+
+def _latest_index(steps: list[ToolStep], predicate) -> int | None:
+    for index in range(len(steps) - 1, -1, -1):
+        if predicate(steps[index]):
+            return index
+    return None
+
+
+def _is_successful_edit(step: ToolStep) -> bool:
+    return step.call.name == "apply_patch" and step.result.ok
+
+
+def _is_diff_inspection(step: ToolStep) -> bool:
+    if step.call.name != "shell" or not step.result.ok:
+        return False
+    cmd = str(step.call.args.get("cmd", "")).lower()
+    return any(pattern in cmd for pattern in ("git diff", "git status", "git show"))
+
+
+def _is_successful_verification(step: ToolStep) -> bool:
+    if step.call.name != "shell" or not step.result.ok:
+        return False
+    cmd = str(step.call.args.get("cmd", ""))
+    return is_test_command_text(cmd) or any(
+        token in cmd.lower() for token in ("-m pytest", "-m unittest", "npm test", "cargo test", "go test", "ruff", "mypy")
+    )
+
+
+def _mentions_verification_limitation(content: str) -> bool:
+    text = content.lower()
+    return any(phrase in text for phrase in ("could not run", "unable to run", "did not run", "not run", "verification unavailable"))
+
+
+def _mentions_failure(content: str) -> bool:
+    text = content.lower()
+    return any(word in text for word in ("failed", "failure", "error", "blocked", "denied", "could not"))
+
+
+def _mentions_limitation(content: str) -> bool:
+    text = content.lower()
+    return any(word in text for word in ("policy", "sandbox", "blocked", "denied", "approval", "permission"))
+
+
+def _claims_tests_passed(content: str) -> bool:
+    return re.search(r"\b(tests?|checks?|verification)\s+(passed|pass|green|succeeded)", content.lower()) is not None

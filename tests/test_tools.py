@@ -151,9 +151,8 @@ def test_local_policy_blocks_outside_paths_and_risky_shell(tmp_path) -> None:
     assert "outside workspace" in outside.reason
     assert shell.allowed is False
     assert "denied" in shell.reason
-    assert network.kind == "needs_approval"
-    assert network.approval is not None
-    assert network.approval.action_kind == "network"
+    assert network.kind == "deny"
+    assert network.permission == "network"
     assert redirect.kind == "needs_approval"
     assert redirect.approval is not None
     assert redirect.approval.action_kind == "workspace_escape"
@@ -690,7 +689,7 @@ def test_apex_profile_blocks_registered_but_hidden_tools(tmp_path, tool_name, ar
     model = FakeModelProvider(
         [
             ModelResponse(tool_calls=(hidden_call,)),
-            ModelResponse(content="done", finish_reason="stop"),
+            ModelResponse(content=f"Blocked hidden tool {tool_name}; no changes made.", finish_reason="stop"),
         ]
     )
     kernel = Kernel(
@@ -703,7 +702,7 @@ def test_apex_profile_blocks_registered_but_hidden_tools(tmp_path, tool_name, ar
     state = kernel.run(f"try hidden {tool_name}", workspace=tmp_path, run_id=f"run_hidden_{tool_name}")
 
     assert state.failed is False
-    assert state.final_output == "done"
+    assert state.final_output == f"Blocked hidden tool {tool_name}; no changes made."
     assert state.turn_count == 1
     assert state.model_call_count == 2
     result = state.tool_results[0]
@@ -717,6 +716,7 @@ def test_apex_profile_blocks_registered_but_hidden_tools(tmp_path, tool_name, ar
         "model.tool_call.assembly.completed",
         "tool.execution.failed",
         "tool.execution.blocked",
+        "contextfs.index.updated",
     ]
 
 
@@ -768,6 +768,7 @@ def test_golden_trace_calc_pytest_patch_loop_records_required_artifacts(tmp_path
             ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": test_command}),)),
             ModelResponse(tool_calls=(ToolCall(name="apply_patch", args={"patch": patch}),)),
             ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": test_command}),)),
+            ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "git diff -- calc.py"}),)),
             ModelResponse(content="Fixed calc.py and verified tests.", finish_reason="stop"),
         ]
     )
@@ -853,7 +854,8 @@ def test_workspace_auto_uses_worktree_for_clean_git_repo(tmp_path) -> None:
     model = FakeModelProvider(
         [
             ModelResponse(tool_calls=(ToolCall(name="apply_patch", args={"patch": patch}),)),
-            ModelResponse(content="done", finish_reason="stop"),
+            ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "git diff -- hello.txt"}),)),
+            ModelResponse(content="done; verification not run for this worktree smoke test.", finish_reason="stop"),
         ]
     )
     kernel = Kernel(
@@ -883,7 +885,7 @@ def test_yolo_approval_mode_does_not_allow_network_shell(tmp_path) -> None:
     model = FakeModelProvider(
         [
             ModelResponse(tool_calls=(shell_call,)),
-            ModelResponse(content="done", finish_reason="stop"),
+            ModelResponse(content="Network command was denied by policy; no command ran.", finish_reason="stop"),
         ]
     )
     kernel = Kernel(
@@ -898,10 +900,10 @@ def test_yolo_approval_mode_does_not_allow_network_shell(tmp_path) -> None:
 
     assert state.failed is False
     assert "command.started" not in [event.type for event in state.events]
-    assert any(event.type == "approval.requested" for event in state.events)
-    resolution = next(event for event in state.events if event.type == "approval.resolved")
-    assert resolution.data["decision"] == "denied"
-    assert "network" in resolution.data["reason"]
+    assert not any(event.type == "approval.requested" for event in state.events)
+    denial = next(event for event in state.events if event.type == "policy.evaluated" and event.data["tool_call_id"] == shell_call.id)
+    assert denial.data["kind"] == "deny"
+    assert denial.data["permission"] == "network"
     blocked = next(event for event in state.events if event.type == "tool.execution.blocked")
     assert blocked.data["tool_call_id"] == shell_call.id
 
@@ -926,7 +928,8 @@ def test_fake_provider_trace_shells_patches_answers_with_content_and_captures_di
             ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "sed -n '1,120p' hello.txt"}),)),
             ModelResponse(tool_calls=(ToolCall(name="apply_patch", args={"patch": patch}),)),
             ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "cat hello.txt"}),)),
-            ModelResponse(content="done", finish_reason="stop"),
+            ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "git diff -- hello.txt"}),)),
+            ModelResponse(content="done; verification not run for this trace smoke test.", finish_reason="stop"),
         ]
     )
     kernel = Kernel(
@@ -939,7 +942,7 @@ def test_fake_provider_trace_shells_patches_answers_with_content_and_captures_di
     state = kernel.run("read, patch, shell, answer", workspace=tmp_path, run_id="run_trace")
 
     assert state.failed is False
-    assert state.final_output == "done"
+    assert state.final_output == "done; verification not run for this trace smoke test."
     assert (tmp_path / "hello.txt").read_text() == "hello tinyagent\n"
     assert "-hello" in state.final_diff
     assert "+hello tinyagent" in state.final_diff
@@ -951,7 +954,7 @@ def test_fake_provider_trace_shells_patches_answers_with_content_and_captures_di
     assert event_types[-1] == "run.completed"
     assert "turn.completed" in event_types
     patch_result = next(result for result in state.tool_results if result.tool_name == "apply_patch")
-    shell_result = [result for result in state.tool_results if result.tool_name == "shell"][-1]
+    shell_result = next(result for step, result in [(step, step.result) for step in state.tool_steps] if step.call.args.get("cmd") == "cat hello.txt")
     assert (state.output_dir / patch_result.data["output_artifact"]).exists()
     assert (state.output_dir / shell_result.data["output_artifact"]).read_text() == "hello tinyagent\n"
 
@@ -1064,7 +1067,7 @@ def test_golden_trace_covers_context_artifacts_tool_args_shell_artifact_and_untr
     assert shell_result.data["output_chars"] == len("shell output\n")
 
     replay = replay_run(state.output_dir)
-    assert "command-output" in replay
+    assert "context/shell" in replay
     assert (tmp_path / "created.txt").read_text() == "new file\n"
 
     metrics = json.loads((state.output_dir / "metrics.json").read_text())

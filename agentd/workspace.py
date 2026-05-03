@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Literal
 
 WorkspaceMode = Literal["auto", "worktree", "current"]
-SandboxMode = Literal["none"]
+SandboxMode = Literal["none", "worktree"]
 
 
 @dataclass(frozen=True)
@@ -110,7 +110,7 @@ def prepare_workspace(
     worktree_path: Path | None = None
     worktree_created = False
 
-    use_worktree = mode == "worktree" or (mode == "auto" and dirty.is_git_repo and dirty.has_head and dirty.clean)
+    use_worktree = sandbox_mode == "worktree" or mode == "worktree" or (mode == "auto" and dirty.is_git_repo and dirty.has_head and dirty.clean)
     if use_worktree:
         if not dirty.is_git_repo or not dirty.has_head:
             raise ValueError("workspace-mode=worktree requires a git workspace with HEAD")
@@ -133,7 +133,7 @@ def prepare_workspace(
         dirty_state_before=dirty,
         allowed_roots=(effective_root,),
         sandbox_mode=sandbox_mode,
-        sandbox_enforced=False,
+        sandbox_enforced=sandbox_mode == "worktree" and effective_mode == "worktree",
     )
     return PreparedWorkspace(workspace=Workspace(effective_root), envelope=envelope, worktree_created=worktree_created)
 

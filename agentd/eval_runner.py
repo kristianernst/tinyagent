@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from agentd.contracts import ModelProvider, PolicyEngine, Profile, Tool
+from agentd.eval_metrics import evaluate_thresholds, extract_run_metrics
 from agentd.events import EventSink
 from agentd.kernel import Kernel
 from agentd.run_control import CancelToken
@@ -47,6 +48,15 @@ class EvalResult:
     command_count: int
     patch_count: int
     final_diff_chars: int
+    context_token_estimate: int = 0
+    tool_error_count: int = 0
+    tool_error_kinds: dict[str, int] | None = None
+    policy_denials: int = 0
+    sandbox_blocks: int = 0
+    finish_gate_blocks: int = 0
+    artifact_bytes_written: int = 0
+    compaction_count: int = 0
+    repeated_tool_call_count: int = 0
     failure_reason: str = ""
     validation_output_path: str = ""
 
@@ -146,17 +156,29 @@ def render_eval_report(eval_run: EvalRun) -> str:
         f"output_dir: {eval_run.output_dir}",
         f"cases: {total}",
         f"successes: {passed}",
+        f"solve_rate: {passed / total if total else 0:.3f}",
+        f"tool_errors: {sum(result.tool_error_count for result in eval_run.results)}",
+        f"policy_denials: {sum(result.policy_denials for result in eval_run.results)}",
+        f"finish_gate_blocks: {sum(result.finish_gate_blocks for result in eval_run.results)}",
         "",
-        "| Case | Success | Run | Validation | Turns | Tools | Commands | Patch | Diff chars |",
-        "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Case | Success | Run | Validation | Turns | Tools | Errors | Policy | Finish blocks | Diff chars |",
+        "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for result in eval_run.results:
         lines.append(
             "| "
             f"{result.case_id} | {str(result.success).lower()} | {result.status} | "
             f"{str(result.validation_ok).lower()} | {result.turn_count} | {result.tool_call_count} | "
-            f"{result.command_count} | {result.patch_count} | {result.final_diff_chars} |"
+            f"{result.tool_error_count} | {result.policy_denials} | {result.finish_gate_blocks} | {result.final_diff_chars} |"
         )
+    error_counts: dict[str, int] = {}
+    for result in eval_run.results:
+        for kind, count in (result.tool_error_kinds or {}).items():
+            error_counts[kind] = error_counts.get(kind, 0) + count
+    if error_counts:
+        lines.extend(["", "## Error Kinds"])
+        for kind, count in sorted(error_counts.items()):
+            lines.append(f"- {kind}: {count}")
     failures = [result for result in eval_run.results if not result.success]
     if failures:
         lines.extend(["", "## Failures"])
@@ -164,6 +186,10 @@ def render_eval_report(eval_run: EvalRun) -> str:
             reason = result.failure_reason or f"validation exit {result.validation_exit_code}"
             lines.append(f"- {result.case_id}: {reason}")
     return "\n".join(lines) + "\n"
+
+
+def check_eval_thresholds(eval_run: EvalRun, threshold_path: Path) -> list[str]:
+    return evaluate_thresholds([result.to_json_dict() for result in eval_run.results], threshold_path)
 
 
 def default_eval_output_dir(suite_path: Path) -> Path:
@@ -213,6 +239,7 @@ def _run_case(
         sandbox_mode=sandbox_mode,
     )
     record = load_run_record(run_dir)
+    metrics = extract_run_metrics(run_dir)
     validation_exit_code = None
     validation_ok = True
     validation_output_path = ""
@@ -225,6 +252,7 @@ def _run_case(
     return _result_from_record(
         case,
         record,
+        metrics=metrics,
         workspace_dir=workspace_dir,
         success=success,
         validation_ok=validation_ok,
@@ -279,6 +307,7 @@ def _result_from_record(
     case: EvalCase,
     record: RunRecord,
     *,
+    metrics,
     workspace_dir: Path,
     success: bool,
     validation_ok: bool,
@@ -300,6 +329,15 @@ def _result_from_record(
         command_count=record.command_count,
         patch_count=record.patch_count,
         final_diff_chars=record.final_diff_chars,
+        context_token_estimate=metrics.context_token_estimate,
+        tool_error_count=metrics.tool_error_count,
+        tool_error_kinds=metrics.tool_error_kinds,
+        policy_denials=metrics.policy_denials,
+        sandbox_blocks=metrics.sandbox_blocks,
+        finish_gate_blocks=metrics.finish_gate_blocks,
+        artifact_bytes_written=metrics.artifact_bytes_written,
+        compaction_count=metrics.compaction_count,
+        repeated_tool_call_count=metrics.repeated_tool_call_count,
         failure_reason=record.failure_reason,
         validation_output_path=validation_output_path,
     )

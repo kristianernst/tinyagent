@@ -60,6 +60,15 @@ class ToolResult:
     call_id: str = ""
     ok: bool = True
     data: dict[str, Any] = field(default_factory=dict)
+    exit_code: int | None = field(default=None, compare=False)
+    duration_ms: int = field(default=0, compare=False)
+    summary: str = field(default="", compare=False)
+    content_preview: str = field(default="", compare=False)
+    artifact_path: str | None = field(default=None, compare=False)
+    truncated: bool = field(default=False, compare=False)
+    failure_kind: str | None = field(default=None, compare=False)
+    metadata: dict[str, Any] = field(default_factory=dict, compare=False)
+    read_hints: list[str] = field(default_factory=list, compare=False)
 
 
 @dataclass(frozen=True)
@@ -77,6 +86,21 @@ class ModelResponse:
 
     def __post_init__(self) -> None:
         self.tool_calls = tuple(self.tool_calls)
+
+
+@dataclass(frozen=True)
+class FinishDecision:
+    allow: bool
+    reason: str = ""
+    injected_message: str | None = None
+
+    @classmethod
+    def allowed(cls, reason: str = "allowed") -> FinishDecision:
+        return cls(True, reason)
+
+    @classmethod
+    def blocked(cls, reason: str, injected_message: str | None = None) -> FinishDecision:
+        return cls(False, reason, injected_message)
 
 
 ApprovalDecision = Literal["approved", "denied", "cancelled", "expired"]
@@ -138,22 +162,39 @@ class PolicyDecision:
     reason: str = ""
     redacted: bool = False
     approval: ApprovalRequest | None = None
+    matched_rule: str | None = None
+    permission: str = "unknown"
+    suggested_approval: dict[str, Any] | None = None
 
     @property
     def allowed(self) -> bool:
         return self.kind == "allow"
 
     @classmethod
-    def allow(cls, reason: str = "allowed") -> PolicyDecision:
-        return cls(kind="allow", reason=reason)
+    def allow(cls, reason: str = "allowed", *, matched_rule: str | None = None, permission: str = "unknown") -> PolicyDecision:
+        return cls(kind="allow", reason=reason, matched_rule=matched_rule, permission=permission)
 
     @classmethod
-    def deny(cls, reason: str) -> PolicyDecision:
-        return cls(kind="deny", reason=reason)
+    def deny(cls, reason: str, *, matched_rule: str | None = None, permission: str = "unknown") -> PolicyDecision:
+        return cls(kind="deny", reason=reason, matched_rule=matched_rule, permission=permission)
 
     @classmethod
-    def needs_approval(cls, reason: str, approval: ApprovalRequest) -> PolicyDecision:
-        return cls(kind="needs_approval", reason=reason, approval=approval)
+    def needs_approval(
+        cls,
+        reason: str,
+        approval: ApprovalRequest,
+        *,
+        matched_rule: str | None = None,
+        permission: str = "unknown",
+    ) -> PolicyDecision:
+        return cls(
+            kind="needs_approval",
+            reason=reason,
+            approval=approval,
+            matched_rule=matched_rule,
+            permission=permission,
+            suggested_approval=approval.to_json_dict(),
+        )
 
 
 @dataclass
@@ -201,6 +242,10 @@ class RunState:
     context_checkpoint_tool_step_count: int = 0
     context_token_estimate: int = 0
     compaction_count: int = 0
+    finish_gate_messages: list[str] = field(default_factory=list)
+    parent_run_id: str | None = None
+    parent_event_id: str | None = None
+    branch_name: str | None = None
 
     @property
     def tool_results(self) -> list[ToolResult]:
@@ -215,6 +260,9 @@ class RunState:
         budgets: RunBudgets | None = None,
         run_id: str | None = None,
         output_dir: Path | None = None,
+        parent_run_id: str | None = None,
+        parent_event_id: str | None = None,
+        branch_name: str | None = None,
     ) -> RunState:
         resolved_workspace = Workspace(workspace.resolved_root())
         if not resolved_workspace.root.exists() or not resolved_workspace.root.is_dir():
@@ -231,6 +279,9 @@ class RunState:
             workspace=resolved_workspace,
             output_dir=resolved_output_dir,
             budgets=budgets or RunBudgets(),
+            parent_run_id=parent_run_id,
+            parent_event_id=parent_event_id,
+            branch_name=branch_name,
         )
 
     def emit(
