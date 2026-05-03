@@ -228,7 +228,7 @@ def _run_case(
         approval_mode=approval_mode,
         sandbox_mode=sandbox_mode,
     )
-    kernel.run(
+    state = kernel.run(
         case.task,
         workspace=workspace_dir,
         run_id=case.id,
@@ -243,8 +243,9 @@ def _run_case(
     validation_exit_code = None
     validation_ok = True
     validation_output_path = ""
+    validation_workspace = state.workspace.root
     if case.validation_command and record.status == "completed":
-        validation_exit_code, validation_output_path = _run_validation(case, workspace_dir, validation_dir)
+        validation_exit_code, validation_output_path = _run_validation(case, validation_workspace, validation_dir)
         validation_ok = validation_exit_code == 0
     elif case.validation_command:
         validation_ok = False
@@ -253,7 +254,7 @@ def _run_case(
         case,
         record,
         metrics=metrics,
-        workspace_dir=workspace_dir,
+        workspace_dir=validation_workspace,
         success=success,
         validation_ok=validation_ok,
         validation_exit_code=validation_exit_code,

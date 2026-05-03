@@ -6,7 +6,7 @@ import subprocess
 import sys
 from dataclasses import replace
 
-from agentd.context import BuiltContext, ContextConfig
+from agentd.context import BuiltContext, ContextConfig, estimate_messages_tokens, estimate_tools_tokens
 from agentd.eval_metrics import evaluate_thresholds, extract_run_metrics
 from agentd.kernel import Kernel
 from agentd.models import FakeModelProvider
@@ -60,6 +60,35 @@ def test_toolresult_contextfs_and_context_report_contracts(tmp_path) -> None:
     assert any(item["id"] == "contextfs:index" for item in report["included"])
 
 
+def test_context_report_matches_final_model_request_after_hooks(tmp_path) -> None:
+    class RequestHook:
+        name = "request-hook"
+
+        def on_context(self, state: RunState, context: BuiltContext) -> BuiltContext:
+            return replace(context, messages=[*context.messages, Message(role="user", content="hook context")])
+
+        def before_model_call(self, state: RunState, messages, tools):
+            return [*messages, Message(role="user", content="before model hook context")], tools[:1]
+
+    state = Kernel(
+        model=FakeModelProvider([ModelResponse(content="done", finish_reason="stop")]),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        hooks=[RequestHook()],
+        workspace_mode="current",
+    ).run("hook context report", workspace=tmp_path, run_id="run_hook_report")
+
+    assert state.failed is False
+    started = next(event for event in state.events if event.type == "model.call.started")
+    report = json.loads((state.output_dir / started.data["context_report_artifact"]).read_text())
+    request = json.loads((state.output_dir / started.data["logical_request_artifact"]).read_text())
+    messages = [Message(role=message["role"], content=message["content"]) for message in request["messages"]]
+    expected_tokens = estimate_messages_tokens(messages) + estimate_tools_tokens(default_tools()[:1])
+    assert report["token_estimate"] == expected_tokens
+    assert request["messages"][-1]["content"] == "before model hook context"
+
+
 def test_initial_model_context_includes_contextfs_index(tmp_path) -> None:
     model = RecordingModel([ModelResponse(content="done", finish_reason="stop")])
     state = Kernel(
@@ -105,7 +134,36 @@ def test_finish_gate_blocks_edit_without_diff_or_verification(tmp_path) -> None:
 
     assert state.failed is True
     blocked = next(event for event in state.events if event.type == "finish.blocked")
-    assert "inspect git diff" in blocked.data["reason"]
+    assert "inspect changed files" in blocked.data["reason"]
+
+
+def test_non_git_finish_gate_accepts_changed_file_inspection(tmp_path) -> None:
+    (tmp_path / "hello.txt").write_text("hello\n")
+    patch = "\n".join(
+        [
+            "*** Begin Patch",
+            "*** Update File: hello.txt",
+            "@@",
+            "-hello",
+            "+hello updated",
+            "*** End Patch",
+        ]
+    )
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(name="apply_patch", args={"patch": patch}),)),
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "sed -n '1,120p' hello.txt"}),)),
+                ModelResponse(content="Done. Could not run verification in this environment.", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    ).run("edit non-git", workspace=tmp_path, run_id="run_non_git_finish")
+
+    assert state.failed is False
 
 
 def test_git_status_alone_does_not_satisfy_post_edit_finish_gate(tmp_path) -> None:
@@ -182,6 +240,14 @@ def test_declarative_policy_metadata_and_repeated_command_guard(tmp_path) -> Non
     assert allowed_network.permission == "network"
 
 
+def test_policy_blocks_relative_redirect_workspace_escape(tmp_path) -> None:
+    state = RunState.create("policy", Workspace(tmp_path), run_id="run_policy_redirect")
+    decision = LocalPolicy().evaluate(ToolCall(name="shell", args={"cmd": "printf x > ../outside.txt"}), state)
+
+    assert decision.kind == "needs_approval"
+    assert decision.permission == "external_directory"
+
+
 def test_policy_blocks_common_env_path_variants(tmp_path) -> None:
     state = RunState.create("policy", Workspace(tmp_path), run_id="run_policy_env")
     policy = LocalPolicy()
@@ -189,6 +255,25 @@ def test_policy_blocks_common_env_path_variants(tmp_path) -> None:
         decision = policy.evaluate(ToolCall(name="shell", args={"cmd": cmd}), state)
         assert decision.kind == "deny"
         assert decision.permission == "secrets"
+
+
+def test_eval_metrics_count_policy_denial_once(tmp_path) -> None:
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "curl https://example.com"}),)),
+                ModelResponse(content="Network command was denied by policy.", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    ).run("deny network", workspace=tmp_path, run_id="run_policy_metric_once")
+
+    metrics = extract_run_metrics(state.output_dir)
+    assert metrics.policy_denials == 1
+    assert metrics.tool_error_kinds["policy_denied"] == 1
 
 
 def test_noncritical_stable_context_respects_budget(tmp_path, monkeypatch) -> None:
@@ -230,6 +315,19 @@ def test_worktree_sandbox_mode_records_enforced_boundary(tmp_path) -> None:
     boundary = next(event for event in state.events if event.type == "workspace.boundary")
     assert boundary.data["sandbox_mode"] == "worktree"
     assert boundary.data["sandbox_enforced"] is True
+
+
+def test_final_contextfs_raw_history_includes_run_completion(tmp_path) -> None:
+    state = Kernel(
+        model=FakeModelProvider([ModelResponse(content="done", finish_reason="stop")]),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    ).run("final contextfs", workspace=tmp_path, run_id="run_final_contextfs")
+
+    raw = (state.output_dir / "context" / "history" / "raw.jsonl").read_text()
+    assert '"type": "run.completed"' in raw
 
 
 def test_hook_can_inject_context_and_block_tool(tmp_path) -> None:
