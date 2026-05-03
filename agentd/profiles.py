@@ -7,7 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 import re
 
-from agentd.context import BuiltContext, ContextBuilder, ContextConfig, compact_state
+from agentd.context import BuiltContext, ContextBuilder, ContextConfig, ContextPlan, compact_state
 from agentd.context.checkpoint import is_test_command_text
 from agentd.contracts import Tool
 from agentd.state import FinishDecision, Message, ModelResponse, RunState, ToolStep
@@ -48,7 +48,42 @@ class ApexCoderProfile:
         )
 
     def build_context(self, state: RunState) -> BuiltContext:
-        return ContextBuilder(system_prompt=self.system_prompt(), config=self.context_config).build(state)
+        return ContextBuilder(system_prompt=self.system_prompt(), config=self.context_config).build(
+            state,
+            plan=self.plan_next_context(state),
+        )
+
+    def plan_next_context(self, state: RunState) -> ContextPlan:
+        kinds = [observation.kind for observation in state.observations]
+        edited_index = _latest_index(state.tool_steps, _is_successful_edit)
+        verification_index = _latest_index(state.tool_steps, _is_successful_verification)
+        diff_index = _latest_index(state.tool_steps, _is_diff_inspection)
+        latest_failed = _latest_index(state.tool_steps, lambda step: not step.result.ok)
+        if any(kind in {"test_failure", "command_failed"} for kind in kinds) or latest_failed is not None:
+            return ContextPlan(
+                mode="debug",
+                pinned_observation_kinds=frozenset({"test_failure", "command_failed", "file_changed", "policy_block"}),
+                reason="recent failure needs debugging evidence",
+            )
+        if edited_index is not None and (verification_index is None or verification_index < edited_index):
+            return ContextPlan(
+                mode="verify",
+                pinned_observation_kinds=frozenset({"patch_applied", "file_changed", "diff_seen", "verification"}),
+                reason="latest edit still needs verification evidence",
+            )
+        if edited_index is not None and (diff_index is not None or verification_index is not None):
+            return ContextPlan(
+                mode="finish",
+                pinned_observation_kinds=frozenset({"file_changed", "diff_seen", "verification", "policy_block"}),
+                reason="finish candidate needs change and verification evidence",
+            )
+        if state.tool_steps:
+            return ContextPlan(
+                mode="edit",
+                pinned_observation_kinds=frozenset({"search_result", "diff_seen"}),
+                reason="recent inspection can guide edits",
+            )
+        return ContextPlan(mode="explore", reason="initial context discovery")
 
     def build_messages(self, state: RunState) -> Sequence[Message]:
         return self.build_context(state).messages

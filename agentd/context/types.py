@@ -24,6 +24,22 @@ class ContextConfig:
 
 
 @dataclass(frozen=True)
+class ContextPlan:
+    mode: Literal["explore", "edit", "debug", "verify", "summarize", "finish"] = "explore"
+    pinned_observation_kinds: frozenset[str] = frozenset()
+    recent_tail_budget: int | None = None
+    reason: str = "default context plan"
+
+    def to_json_dict(self) -> dict[str, object]:
+        return {
+            "mode": self.mode,
+            "pinned_observation_kinds": sorted(self.pinned_observation_kinds),
+            "recent_tail_budget": self.recent_tail_budget,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
 class ArtifactRef:
     path: str
     description: str = ""
@@ -86,3 +102,4 @@ class BuiltContext:
     included: list[ContextItem] = field(default_factory=list)
     excluded: list[ContextExclusion] = field(default_factory=list)
     contextfs_index_path: str | None = None
+    context_plan: ContextPlan | None = None
