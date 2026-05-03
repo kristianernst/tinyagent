@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import signal
 import sys
+from pathlib import Path
 
+import agentctl.cli as cli
 from agentctl.cli import _sigint_cancel, main
 from agentd.run_control import CancelToken
 
@@ -17,6 +19,59 @@ def test_agentctl_help_exits_successfully(capsys) -> None:
     assert "Control the tinyagent harness." in captured.out
     assert "run" in captured.out
     assert "replay" in captured.out
+    assert "serve" in captured.out
+
+
+def test_agentctl_serve_help_exits_successfully(capsys) -> None:
+    try:
+        main(["serve", "--help"])
+    except SystemExit as exc:
+        assert exc.code == 0
+
+    captured = capsys.readouterr()
+
+    assert "--workspace" in captured.out
+    assert "--host" in captured.out
+    assert "--port" in captured.out
+    assert "--run-root" in captured.out
+
+
+def test_agentctl_serve_uses_runtime_server_options(tmp_path, capsys, monkeypatch) -> None:
+    calls = []
+
+    class FakeServer:
+        server_port = 9999
+
+        def serve_forever(self):
+            raise KeyboardInterrupt
+
+        def server_close(self):
+            calls.append(("closed",))
+
+    def fake_create_runtime_server(workspace, *, host, port, run_root):
+        calls.append((Path(workspace), host, port, run_root))
+        return FakeServer()
+
+    monkeypatch.setattr(cli, "create_runtime_server", fake_create_runtime_server)
+
+    exit_code = main(
+        [
+            "serve",
+            "--workspace",
+            str(tmp_path),
+            "--host",
+            "127.0.0.2",
+            "--port",
+            "1234",
+            "--run-root",
+            str(tmp_path / "runs"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 130
+    assert "serving tinyagent runtime on http://127.0.0.2:9999" in captured.out
+    assert calls == [(tmp_path, "127.0.0.2", 1234, tmp_path / "runs"), ("closed",)]
 
 
 def test_agentctl_version_exits_successfully(capsys) -> None:

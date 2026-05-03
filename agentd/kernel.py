@@ -564,6 +564,7 @@ class Kernel:
                 return
         if decision.kind == "needs_approval":
             decision = self._resolve_approval(state, call, decision)
+            state.raise_if_cancelled()
             if decision.kind == "deny":
                 self._record_policy_decision(state, call, decision)
         if not decision.allowed:
