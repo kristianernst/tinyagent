@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
-import re
 
 from agentd.context import BuiltContext, ContextBuilder, ContextConfig, ContextPlan, compact_state
 from agentd.context.checkpoint import is_test_command_text
@@ -109,11 +109,15 @@ class ApexCoderProfile:
                         "Before finalizing, inspect git diff after the latest edit.",
                     )
             else:
-                file_inspection_index = _latest_index(state.tool_steps, lambda step: _is_changed_file_inspection(step, state.tool_steps[edited_index]))
+                file_inspection_index = _latest_index(
+                    state.tool_steps,
+                    lambda step: _is_changed_file_inspection(step, state.tool_steps[edited_index]),
+                )
                 if (file_inspection_index is None or file_inspection_index < edited_index) and not _mentions_diff_limitation(content):
                     return FinishDecision.blocked(
                         "finish blocked: inspect changed files after edits",
-                        "Before finalizing in this non-git workspace, inspect the changed file contents or explain that git diff is unavailable.",
+                        "Before finalizing in this non-git workspace, inspect changed files "
+                        "or explain that git diff is unavailable.",
                     )
             verification_index = _latest_index(state.tool_steps, _is_successful_verification)
             if verification_index is None or verification_index < edited_index:

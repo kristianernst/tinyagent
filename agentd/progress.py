@@ -13,11 +13,11 @@ class ProgressDecision:
     reason: str = ""
 
     @classmethod
-    def allowed(cls) -> "ProgressDecision":
+    def allowed(cls) -> ProgressDecision:
         return cls(True)
 
     @classmethod
-    def blocked(cls, reason: str) -> "ProgressDecision":
+    def blocked(cls, reason: str) -> ProgressDecision:
         return cls(False, reason)
 
 
@@ -31,12 +31,15 @@ class ProgressGuard:
                 )
             if _is_read_only_command(cmd) and _same_successful_read_count(state, cmd) >= 2:
                 return ProgressDecision.blocked(
-                    f"Progress guard blocked repeated read-only command with no new evidence: `{cmd}`. Use the evidence already collected or inspect a different target."
+                    f"Progress guard blocked repeated read-only command with no new evidence: `{cmd}`. "
+                    "Use the evidence already collected or inspect a different target."
                 )
         if call.name == "apply_patch":
             patch = str(call.args.get("patch") or "")
             if patch and _failed_same_patch_count(state, patch) >= 2:
-                return ProgressDecision.blocked("Progress guard blocked repeated patch failure. Inspect the file and change the patch before retrying.")
+                return ProgressDecision.blocked(
+                    "Progress guard blocked repeated patch failure. Inspect the file and change the patch before retrying."
+                )
         return ProgressDecision.allowed()
 
 
