@@ -145,6 +145,8 @@ class Kernel:
         if "shell" in self.tools:
             state.shell_preflight = shell_preflight()
             state.emit("shell.preflight.completed", state.shell_preflight)
+        index_path = refresh_contextfs(state)
+        state.emit("contextfs.index.updated", {"path": index_path, "phase": "startup"})
 
         try:
             state.raise_if_cancelled()

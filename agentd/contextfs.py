@@ -19,6 +19,14 @@ def contextfs_index_path(state: "RunState") -> str:
     return f"{CONTEXT_DIR}/INDEX.md"
 
 
+def model_readable_path(state: "RunState", context_relative: str | Path) -> str:
+    absolute = (state.output_dir / context_relative).resolve()
+    try:
+        return absolute.relative_to(state.workspace.root.resolve()).as_posix()
+    except ValueError:
+        return absolute.as_posix()
+
+
 def write_context_tool_output(state: "RunState", call: "ToolCall", output: str, *, kind: str) -> str:
     sequence = len(state.tool_steps) + 1
     tool_dir = "shell" if call.name == "shell" else "patch" if call.name == "apply_patch" else safe_artifact_name(call.name)
@@ -53,6 +61,8 @@ def refresh_contextfs(state: "RunState") -> str:
     _write_text(state, "environment.md", render_environment_context(state))
     _write_text(state, "current_diff.md", _repo_state_text(state))
     _write_text(state, "last_failure.md", _last_failure_text(state))
+    _write_text(state, "history/compacted.md", _compacted_history_text(state))
+    _write_text(state, "history/raw.jsonl", _raw_history_text(state))
     index = _index_text(state)
     _write_text(state, "INDEX.md", index)
     return contextfs_index_path(state)
@@ -119,20 +129,26 @@ def _last_failure_text(state: "RunState") -> str:
 
 
 def _index_text(state: "RunState") -> str:
+    task_path = model_readable_path(state, "context/task.md")
+    diff_path = model_readable_path(state, "context/current_diff.md")
+    environment_path = model_readable_path(state, "context/environment.md")
+    failure_path = model_readable_path(state, "context/last_failure.md")
+    compacted_path = model_readable_path(state, "context/history/compacted.md")
+    raw_history_path = model_readable_path(state, "context/history/raw.jsonl")
     lines = [
         "# tinyagent ContextFS",
         "",
         "Read only what is needed. Large outputs are stored here to keep prompt context bounded.",
         "",
         "## Task",
-        "- context/task.md: original task and current run state.",
+        f"- {task_path}: original task and current run state.",
         "",
         "## Current Repo State",
-        "- context/current_diff.md: latest git status and diff stat.",
-        "- context/environment.md: cwd, shell, workspace, approvals, and sandbox metadata.",
+        f"- {diff_path}: latest git status and diff stat.",
+        f"- {environment_path}: cwd, shell, workspace, approvals, and sandbox metadata.",
         "",
         "## Recent Failures",
-        "- context/last_failure.md: latest failing tool result, if any.",
+        f"- {failure_path}: latest failing tool result, if any.",
         "",
         "## Tool Outputs",
     ]
@@ -143,13 +159,36 @@ def _index_text(state: "RunState") -> str:
             artifact = step.result.artifact_path or step.result.data.get("context_artifact") or step.result.data.get("output_artifact")
             ok = "ok" if step.result.ok else "failed"
             if artifact:
-                lines.append(f"- {artifact}: {step.call.name} `{step.call.id}` {ok}.")
+                readable = model_readable_path(state, artifact)
+                lines.append(f"- {readable}: {step.call.name} `{step.call.id}` {ok}. Artifact id: `{artifact}`.")
                 for hint in step.result.read_hints:
                     lines.append(f"  Suggested read: `{hint}`")
             else:
                 lines.append(f"- {step.call.name} `{step.call.id}` {ok}: no artifact.")
-    lines.extend(["", "## History", "- history/compacted.md: future checkpoint summary location.", ""])
+    lines.extend(
+        [
+            "",
+            "## History",
+            f"- {compacted_path}: latest compacted checkpoint summary, if any.",
+            f"- {raw_history_path}: durable event log snapshot for this run.",
+            "",
+        ]
+    )
     return "\n".join(lines)
+
+
+def _compacted_history_text(state: "RunState") -> str:
+    if state.context_checkpoint.strip():
+        artifact = f"\n\nCheckpoint artifact: {state.context_checkpoint_artifact}" if state.context_checkpoint_artifact else ""
+        return f"# Compacted History\n\n{state.context_checkpoint.strip()}{artifact}\n"
+    return "# Compacted History\n\nNo compaction checkpoint yet.\n"
+
+
+def _raw_history_text(state: "RunState") -> str:
+    events_path = state.output_dir / "events.jsonl"
+    if events_path.exists():
+        return events_path.read_text()
+    return ""
 
 
 def _git(state: "RunState", args: list[str]) -> str | None:

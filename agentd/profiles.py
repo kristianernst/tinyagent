@@ -66,7 +66,8 @@ class ApexCoderProfile:
         content = response.content or ""
         edited_index = _latest_index(state.tool_steps, _is_successful_edit)
         if edited_index is not None:
-            if _latest_index(state.tool_steps, _is_diff_inspection) is None or _latest_index(state.tool_steps, _is_diff_inspection) < edited_index:
+            diff_index = _latest_index(state.tool_steps, _is_diff_inspection)
+            if diff_index is None or diff_index < edited_index:
                 return FinishDecision.blocked(
                     "finish blocked: inspect git diff after edits",
                     "Before finalizing, inspect git diff after the latest edit.",
@@ -130,7 +131,7 @@ def _is_diff_inspection(step: ToolStep) -> bool:
     if step.call.name != "shell" or not step.result.ok:
         return False
     cmd = str(step.call.args.get("cmd", "")).lower()
-    return any(pattern in cmd for pattern in ("git diff", "git status", "git show"))
+    return any(pattern in cmd for pattern in ("git diff", "git show"))
 
 
 def _is_successful_verification(step: ToolStep) -> bool:

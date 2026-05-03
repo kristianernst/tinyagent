@@ -9,7 +9,7 @@ import subprocess
 import time
 from typing import Any
 
-from agentd.contextfs import read_hints, write_context_tool_output
+from agentd.contextfs import model_readable_path, read_hints, write_context_tool_output
 from agentd.run_control import RunCancelled
 from agentd.state import RunState, ToolCall, ToolResult
 from agentd.tools.core import combined_output, error_result, tool_env, visible_output, write_tool_output_artifact
@@ -73,6 +73,7 @@ class ShellTool:
             output = combined_output(stdout, stderr) or f"Command timed out after {timeout}s."
             artifact = write_tool_output_artifact(state, call, "command-output", output, kind="command_output")
             context_artifact = write_context_tool_output(state, call, output, kind="shell_output")
+            context_read_path = model_readable_path(state, context_artifact)
             preview = visible_output(output, state)
             state.emit(
                 "command.timeout",
@@ -112,7 +113,7 @@ class ShellTool:
                     "failure_kind": "timeout",
                 },
                 metadata={"cwd": str(state.workspace.root), "command_normalized": cmd},
-                read_hints=read_hints(context_artifact, failure=True),
+                read_hints=read_hints(context_read_path, failure=True),
             )
         except RunCancelled:
             state.request_cancel(
@@ -124,6 +125,7 @@ class ShellTool:
             output = combined_output(stdout, stderr) or "Command cancelled."
             artifact = write_tool_output_artifact(state, call, "command-output", output, kind="command_output")
             context_artifact = write_context_tool_output(state, call, output, kind="shell_output")
+            context_read_path = model_readable_path(state, context_artifact)
             preview = visible_output(output, state)
             state.emit(
                 "command.cancelled",
@@ -165,12 +167,13 @@ class ShellTool:
                     "failure_kind": "unknown",
                 },
                 metadata={"cwd": str(state.workspace.root), "command_normalized": cmd},
-                read_hints=read_hints(context_artifact, failure=True),
+                read_hints=read_hints(context_read_path, failure=True),
             )
 
         output = combined_output(stdout, stderr) or f"Command exited {process.returncode}."
         artifact = write_tool_output_artifact(state, call, "command-output", output, kind="command_output")
         context_artifact = write_context_tool_output(state, call, output, kind="shell_output")
+        context_read_path = model_readable_path(state, context_artifact)
         preview = visible_output(output, state)
         ok = process.returncode == 0
         failure_kind = None if ok else "command_failed"
@@ -218,7 +221,7 @@ class ShellTool:
                 "stderr_chars": len(stderr),
                 "command_normalized": cmd,
             },
-            read_hints=read_hints(context_artifact, failure=not ok),
+            read_hints=read_hints(context_read_path, failure=not ok),
         )
 
 

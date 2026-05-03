@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import shlex
 from dataclasses import dataclass, field
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Literal
 
@@ -16,9 +17,9 @@ from agentd.tools import patch_paths, resolve_workspace_path
 class LocalPolicy:
     """Small deny-by-default policy for the built-in local tools."""
 
-    def __init__(self, *, allow_run_artifacts: bool = False) -> None:
+    def __init__(self, *, allow_run_artifacts: bool = False, config: PolicyConfig | None = None) -> None:
         self.allow_run_artifacts = allow_run_artifacts
-        self.config = default_policy_config()
+        self.config = config or default_policy_config()
 
     def evaluate(self, call: ToolCall, state: RunState) -> PolicyDecision:
         try:
@@ -71,38 +72,66 @@ class LocalPolicy:
                 return PolicyDecision.deny(reason, matched_rule=pattern, permission="bash")
         protected_write = _protected_tinyagent_write(cmd)
         if protected_write:
-            return PolicyDecision.deny(
-                f"shell write to protected .tinyagent evidence is denied: {protected_write}",
-                matched_rule="contextfs_write.deny",
+            return _decision_from_action(
+                _resolve_permission(self.config, "contextfs_write", protected_write),
+                call,
+                state,
+                reason=f"shell write to protected .tinyagent evidence is denied: {protected_write}",
                 permission="contextfs_write",
+                target=protected_write,
+                action_kind="workspace_escape",
+                risk="high",
+                command=cmd,
             )
         env_access = _env_file_access(cmd)
         if env_access:
-            return PolicyDecision.deny(
-                f"access to protected environment file is denied: {env_access}",
-                matched_rule="secrets.deny",
-                permission="read",
+            return _decision_from_action(
+                _resolve_permission(self.config, "secrets", env_access),
+                call,
+                state,
+                reason=f"access to protected environment file is denied: {env_access}",
+                permission="secrets",
+                target=env_access,
+                action_kind="workspace_escape",
+                risk="high",
+                command=cmd,
             )
         redirect_escape = _outside_redirect_target(cmd, state)
         if redirect_escape:
-            return PolicyDecision.needs_approval(
-                f"shell redirects outside workspace envelope: {redirect_escape}",
-                _approval_request(
-                    call,
-                    state,
-                    action_kind="workspace_escape",
-                    risk="high",
-                    args_preview=cmd,
-                    command=cmd,
-                ),
+            return _decision_from_action(
+                _resolve_permission(self.config, "external_directory", redirect_escape),
+                call,
+                state,
+                reason=f"shell redirects outside workspace envelope: {redirect_escape}",
+                permission="external_directory",
+                target=redirect_escape,
+                action_kind="workspace_escape",
+                risk="high",
+                command=cmd,
             )
         if _NETWORK_SHELL_PATTERN.search(lower):
-            return PolicyDecision.deny(
-                "network-looking shell command is denied by default",
-                matched_rule="network.deny",
+            return _decision_from_action(
+                _resolve_permission(self.config, "network", cmd),
+                call,
+                state,
+                reason="network-looking shell command is denied by default",
                 permission="network",
+                target=cmd,
+                action_kind="network",
+                risk="high",
+                command=cmd,
             )
-        return PolicyDecision.allow("shell command passed local denylist", matched_rule="bash.default_allow", permission="bash")
+        return _decision_from_action(
+            _resolve_permission(self.config, "bash", cmd),
+            call,
+            state,
+            reason="shell command passed local policy",
+            permission="bash",
+            target=cmd,
+            action_kind="shell",
+            risk="low",
+            command=cmd,
+        )
 
 
 PolicyAction = Literal["allow", "ask", "deny"]
@@ -122,6 +151,12 @@ class PolicyConfig:
     repeated_command_failure_limit: int = 2
 
 
+@dataclass(frozen=True)
+class ResolvedPolicyRule:
+    action: PolicyAction
+    matched_rule: str
+
+
 RISKY_SHELL_PATTERNS = (
     (r"\bsudo\b", "sudo is denied by default."),
     (r"\brm\b(?=[^;&|]*(?:-[^\s;&|]*r|--recursive))(?=[^;&|]*(?:-[^\s;&|]*f|--force))", "recursive force removal is denied by default."),
@@ -136,10 +171,12 @@ RISKY_SHELL_PATTERNS = (
 _NETWORK_SHELL_PATTERN = re.compile(r"\b(curl|wget|ssh|scp|sftp|rsync|nc|ncat|telnet)\b")
 _REDIRECT_PATTERN = re.compile(r"(?:^|[\s;&|])(?:>|>>|<)\s*(?P<path>[^()\s;&|]+)")
 _TINYAGENT_WRITE_PATTERN = re.compile(
-    r"(?:(?:>|>>)\s*(?P<redirect>\.tinyagent(?:/|\b)[^\s;&|]*)|"
-    r"\b(?:tee|mkdir|touch|rm|mv|cp)\b[^\n;&|]*(?P<command>\.tinyagent(?:/|\b)[^\s;&|]*))"
+    r"(?:(?:>|>>)\s*(?P<redirect>(?:\./)?\.tinyagent(?:/|\b)[^\s;&|]*)|"
+    r"\b(?:tee|mkdir|touch|rm|mv|cp)\b[^\n;&|]*(?P<command>(?:\./)?\.tinyagent(?:/|\b)[^\s;&|]*))"
 )
-_ENV_FILE_PATTERN = re.compile(r"(?P<path>(?:^|[\s'\"])\.env(?:\.[A-Za-z0-9_.-]+)?)(?:[\s'\"]|$)")
+_ENV_FILE_PATTERN = re.compile(
+    r"(?P<path>(?:^|[\s'\"(=])(?:\./)?(?:[A-Za-z0-9_.-]+/)*\.env(?:\.[A-Za-z0-9_.-]+)?)(?:[\s'\"),]|$)"
+)
 
 
 def _dirty_current_workspace(state: RunState) -> bool:
@@ -175,8 +212,58 @@ def _protected_tinyagent_write(cmd: str) -> str:
 
 
 def _env_file_access(cmd: str) -> str:
+    for word in _shell_words(cmd):
+        normalized = word.strip("'\"")
+        if _looks_like_env_path(normalized):
+            return normalized
     match = _ENV_FILE_PATTERN.search(cmd)
-    return match.group("path").strip() if match else ""
+    return match.group("path").strip(" '\"(=") if match else ""
+
+
+def _shell_words(cmd: str) -> list[str]:
+    try:
+        return shlex.split(cmd)
+    except ValueError:
+        return cmd.split()
+
+
+def _looks_like_env_path(value: str) -> bool:
+    parts = Path(value).parts
+    return any(part == ".env" or part.startswith(".env.") for part in parts)
+
+
+def _resolve_permission(config: PolicyConfig, permission: str, target: str) -> ResolvedPolicyRule:
+    action = config.default
+    matched_rule = f"{permission}.default_{action}"
+    for rule in config.rules:
+        if rule.permission == permission and fnmatch(target, rule.pattern):
+            action = rule.action
+            matched_rule = f"{permission}.{rule.action}"
+    return ResolvedPolicyRule(action=action, matched_rule=matched_rule)
+
+
+def _decision_from_action(
+    resolved: ResolvedPolicyRule,
+    call: ToolCall,
+    state: RunState,
+    *,
+    reason: str,
+    permission: str,
+    target: str,
+    action_kind: str,
+    risk: str,
+    command: str | None = None,
+) -> PolicyDecision:
+    if resolved.action == "allow":
+        return PolicyDecision.allow(reason, matched_rule=resolved.matched_rule, permission=permission)
+    if resolved.action == "ask":
+        return PolicyDecision.needs_approval(
+            reason,
+            _approval_request(call, state, action_kind=action_kind, risk=risk, args_preview=target, command=command),
+            matched_rule=resolved.matched_rule,
+            permission=permission,
+        )
+    return PolicyDecision.deny(reason, matched_rule=resolved.matched_rule, permission=permission)
 
 
 def _repeated_failed_command_count(state: RunState, cmd: str) -> int:
@@ -234,7 +321,10 @@ def default_policy_config() -> PolicyConfig:
         rules=(
             PolicyRule("network", "*", "deny"),
             PolicyRule("contextfs_write", ".tinyagent/**", "deny"),
+            PolicyRule("contextfs_write", "./.tinyagent/**", "deny"),
             PolicyRule("secrets", ".env*", "deny"),
+            PolicyRule("secrets", "./.env*", "deny"),
+            PolicyRule("secrets", "*/.env*", "deny"),
             PolicyRule("external_directory", "*", "ask"),
             PolicyRule("bash", "git status*", "allow"),
             PolicyRule("bash", "git diff*", "allow"),
@@ -243,5 +333,6 @@ def default_policy_config() -> PolicyConfig:
             PolicyRule("bash", "pytest *", "allow"),
             PolicyRule("bash", "uv run pytest*", "allow"),
             PolicyRule("bash", "npm test*", "allow"),
+            PolicyRule("bash", "*", "allow"),
         ),
     )
