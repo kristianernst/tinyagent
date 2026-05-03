@@ -30,7 +30,12 @@ def model_readable_path(state: "RunState", context_relative: str | Path) -> str:
 
 def write_context_tool_output(state: "RunState", call: "ToolCall", output: str, *, kind: str) -> str:
     sequence = len(state.tool_steps) + 1
-    tool_dir = "shell" if call.name == "shell" else "patch" if call.name == "apply_patch" else safe_artifact_name(call.name)
+    if call.name == "shell":
+        tool_dir = "shell"
+    elif call.name in {"apply_patch", "str_replace_edit", "write_file"}:
+        tool_dir = "patch"
+    else:
+        tool_dir = safe_artifact_name(call.name)
     path = Path(CONTEXT_DIR) / tool_dir / f"{sequence:04d}-{safe_artifact_name(call.id)}.txt"
     absolute = state.output_dir / path
     absolute.parent.mkdir(parents=True, exist_ok=True)

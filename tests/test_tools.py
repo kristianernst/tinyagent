@@ -12,6 +12,7 @@ import pytest
 
 from agentd.kernel import Kernel
 from agentd.models import FakeModelProvider
+from agentd.models import ModelSpec
 from agentd.output import MAX_UNTRACKED_DIFF_BYTES, capture_final_diff
 from agentd.policy import LocalPolicy
 from agentd.profiles import ApexCoderProfile
@@ -24,6 +25,8 @@ from agentd.tools import (
     ReadFileTool,
     SearchRepoTool,
     ShellTool,
+    StrReplaceEditTool,
+    WriteFileTool,
     all_tools,
     builtin_tools,
     default_tools,
@@ -574,6 +577,61 @@ def test_apply_patch_does_not_move_over_existing_file(tmp_path) -> None:
     assert (tmp_path / "target.txt").read_text() == "target\n"
 
 
+def test_str_replace_edit_requires_unique_match_and_updates_file(tmp_path) -> None:
+    (tmp_path / "hello.txt").write_text("hello\n")
+    state = RunState.create("edit", Workspace(tmp_path), run_id="run_str_replace")
+
+    result = StrReplaceEditTool().run(
+        ToolCall(name="str_replace_edit", args={"path": "hello.txt", "old_str": "hello", "new_str": "hi"}),
+        state,
+    )
+
+    assert result.ok is True
+    assert result.metadata["paths"] == ["hello.txt"]
+    assert (tmp_path / "hello.txt").read_text() == "hi\n"
+
+
+def test_str_replace_edit_rejects_non_unique_match(tmp_path) -> None:
+    (tmp_path / "hello.txt").write_text("x x\n")
+    state = RunState.create("edit", Workspace(tmp_path), run_id="run_str_replace_reject")
+
+    result = StrReplaceEditTool().run(
+        ToolCall(name="str_replace_edit", args={"path": "hello.txt", "old_str": "x", "new_str": "y"}),
+        state,
+    )
+
+    assert result.ok is False
+    assert "exactly once" in result.output
+    assert (tmp_path / "hello.txt").read_text() == "x x\n"
+
+
+def test_write_file_overwrites_small_workspace_file(tmp_path) -> None:
+    state = RunState.create("edit", Workspace(tmp_path), run_id="run_write_file")
+
+    result = WriteFileTool().run(ToolCall(name="write_file", args={"path": "generated.txt", "content": "hello\n"}), state)
+
+    assert result.ok is True
+    assert result.metadata["paths"] == ["generated.txt"]
+    assert (tmp_path / "generated.txt").read_text() == "hello\n"
+
+
+def test_write_file_rolls_back_if_atomic_write_fails(tmp_path, monkeypatch) -> None:
+    target = tmp_path / "hello.txt"
+    target.write_text("before\n")
+    state = RunState.create("edit", Workspace(tmp_path), run_id="run_write_file_rollback")
+
+    def fail_replace(src, dst):
+        del src, dst
+        raise OSError("replace failed")
+
+    monkeypatch.setattr("agentd.tools.builtins.edit.os.replace", fail_replace)
+    result = WriteFileTool().run(ToolCall(name="write_file", args={"path": "hello.txt", "content": "after\n"}), state)
+
+    assert result.ok is False
+    assert "replace failed" in result.output
+    assert target.read_text() == "before\n"
+
+
 def test_apply_patch_failed_hunk_does_not_mutate_file(tmp_path) -> None:
     state = RunState.create("test", Workspace(tmp_path), run_id="run_test")
     (tmp_path / "edit.txt").write_text("original\n")
@@ -679,10 +737,30 @@ def test_apex_profile_exposes_structured_inspection_edit_and_shell_by_default(tm
     assert [tool.name for tool in visible] == ["read_file", "search_repo", "apply_patch", "shell"]
 
 
+def test_apex_profile_selects_claude_like_edit_tool_from_model_spec(tmp_path) -> None:
+    state = RunState.create("test", Workspace(tmp_path), run_id="run_test")
+    state.model_spec = ModelSpec(provider="anthropic", model="claude", protocol="anthropic", edit_style="str_replace").to_json_dict()
+    tools = {tool.name: tool for tool in default_tools()}
+
+    visible = ApexCoderProfile().visible_tools(state, tools)
+
+    assert [tool.name for tool in visible] == ["read_file", "search_repo", "str_replace_edit", "shell"]
+
+
+def test_apex_profile_selects_generic_write_file_tool_from_model_spec(tmp_path) -> None:
+    state = RunState.create("test", Workspace(tmp_path), run_id="run_test")
+    state.model_spec = ModelSpec(provider="generic", model="text", edit_style="whole_file").to_json_dict()
+    tools = {tool.name: tool for tool in default_tools()}
+
+    visible = ApexCoderProfile().visible_tools(state, tools)
+
+    assert [tool.name for tool in visible] == ["read_file", "search_repo", "write_file", "shell"]
+
+
 def test_tool_collections_name_builtin_and_repo_groups() -> None:
-    assert [tool.name for tool in builtin_tools()] == ["shell", "apply_patch"]
+    assert [tool.name for tool in builtin_tools()] == ["shell", "apply_patch", "str_replace_edit", "write_file"]
     assert [tool.name for tool in repo_inspect_tools()] == ["read_file", "list_files", "search_repo"]
-    assert [tool.name for tool in all_tools()] == ["shell", "apply_patch", "read_file", "list_files", "search_repo"]
+    assert [tool.name for tool in all_tools()] == ["shell", "apply_patch", "str_replace_edit", "write_file", "read_file", "list_files", "search_repo"]
     assert [tool.name for tool in default_tools()] == [tool.name for tool in all_tools()]
     assert "finish" not in {tool.name for tool in default_tools()}
 
@@ -696,6 +774,8 @@ def test_tools_public_export_surface_stays_small() -> None:
         "ReadFileTool",
         "SearchRepoTool",
         "ShellTool",
+        "StrReplaceEditTool",
+        "WriteFileTool",
         "all_tools",
         "builtin_tools",
         "default_tools",
@@ -718,6 +798,7 @@ def test_apex_profile_visible_tools_are_overridable_for_ablations(tmp_path) -> N
     ("tool_name", "args"),
     [
         ("list_files", {}),
+        ("str_replace_edit", {"path": "hello.txt", "old_str": "hello", "new_str": "hi"}),
     ],
 )
 def test_apex_profile_blocks_registered_but_hidden_tools(tmp_path, tool_name, args) -> None:

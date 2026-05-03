@@ -123,9 +123,9 @@ def _collect_event_context(state: RunState, context_state: ContextState) -> None
             path = str(data.get("path", "."))
             query = str(data.get("query", ""))
             context_state.files_seen[path] = f"searched for {query!r}"
-        elif event.type == "patch.applied":
+        elif event.type in {"patch.applied", "file.edited"}:
             for path in data.get("paths", []):
-                context_state.files_changed[str(path)] = "changed by apply_patch"
+                context_state.files_changed[str(path)] = f"changed by {data.get('tool') or 'apply_patch'}"
         elif event.type in {"command.completed", "command.failed", "command.timeout"}:
             command = str(data.get("cmd", ""))
             if not command:
@@ -141,9 +141,9 @@ def _collect_event_context(state: RunState, context_state: ContextState) -> None
 def _collect_tool_context(state: RunState, context_state: ContextState) -> None:
     issues: list[str] = []
     for step in state.tool_steps:
-        if step.call.name == "apply_patch":
+        if step.call.name in {"apply_patch", "str_replace_edit", "write_file"}:
             for path in step.result.data.get("paths", []):
-                context_state.files_changed[str(path)] = "changed by apply_patch" if step.result.ok else "attempted apply_patch"
+                context_state.files_changed[str(path)] = f"changed by {step.call.name}" if step.result.ok else f"attempted {step.call.name}"
         if not step.result.ok:
             issues.append(f"{step.call.name} {step.call.id}: {_first_line(step.result.output)}")
     context_state.open_issues = issues[-8:]

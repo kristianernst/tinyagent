@@ -12,10 +12,14 @@ from agentd.model_stream import ModelDelta, assemble_model_deltas, parse_chat_co
 from agentd.models import (
     FakeModelProvider,
     ModelCapabilities,
+    ModelSpec,
     ProviderError,
 )
+from agentd.policy import default_policy
 from agentd.providers.openai_compat import OpenAICompatibleConfig, OpenAICompatibleProvider
-from agentd.state import Message, ModelResponse, PolicyDecision, RunState, ToolCall, ToolResult, Workspace
+from agentd.profiles import ApexCoderProfile
+from agentd.state import Message, ModelResponse, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, Workspace
+from agentd.tools import default_tools
 
 
 class SampleTool:
@@ -229,6 +233,68 @@ def test_kernel_fails_clearly_when_provider_does_not_support_tools(tmp_path) -> 
     assert state.failure_reason == "Model provider does not support tools."
     failed = next(event for event in state.events if event.type == "model.call.failed")
     assert failed.data["capabilities"]["supports_tools"] is False
+
+
+def test_model_spec_drives_context_budget_and_visible_tools(tmp_path) -> None:
+    class ClaudeLikeProvider:
+        name = "claude-like"
+        model_spec = ModelSpec(
+            provider="anthropic",
+            model="claude-test",
+            protocol="anthropic",
+            edit_style="str_replace",
+            capabilities=ModelCapabilities(context_window=20_000, max_output_tokens=2_000),
+        )
+
+        def __init__(self) -> None:
+            self.tools = []
+
+        def complete(self, messages, tools, state):
+            del messages, state
+            self.tools = [tool.name for tool in tools]
+            return ModelResponse(content="done", finish_reason="stop")
+
+    provider = ClaudeLikeProvider()
+    state = Kernel(
+        model=provider,
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=default_policy(),
+        workspace_mode="current",
+    ).run("use spec", workspace=tmp_path, run_id="run_model_spec")
+
+    assert state.failed is False
+    assert provider.tools == ["read_file", "search_repo", "str_replace_edit", "shell"]
+    assert state.model_spec["edit_style"] == "str_replace"
+    report_event = next(event for event in state.events if event.type == "context.report.written")
+    report = json.loads((state.output_dir / report_event.data["context_report_artifact"]).read_text())
+    assert report["budget"] == 18_000
+    assert state.context_token_estimate <= 18_000
+
+
+def test_model_spec_hidden_edit_tool_is_blocked(tmp_path) -> None:
+    class ClaudeLikeProvider:
+        name = "claude-like"
+        model_spec = ModelSpec(provider="anthropic", model="claude-test", protocol="anthropic", edit_style="str_replace")
+
+        def complete(self, messages, tools, state):
+            del messages, tools, state
+            return ModelResponse(tool_calls=(ToolCall(name="apply_patch", args={"patch": "*** Begin Patch\n*** End Patch"}),))
+
+    state = Kernel(
+        model=ClaudeLikeProvider(),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=AllowAllPolicy(),
+        workspace_mode="current",
+        budgets=RunBudgets(max_turns=1),
+    ).run("try hidden apply_patch", workspace=tmp_path, run_id="run_hidden_edit_spec")
+
+    result = state.tool_results[0]
+    assert result.ok is False
+    assert result.output == "Tool is not visible for this profile: apply_patch"
+    assert "str_replace_edit" in result.data["visible_tools"]
+    assert "apply_patch" not in result.data["visible_tools"]
 
 
 def test_openai_compatible_provider_sends_messages_tools_and_parses_tool_calls() -> None:

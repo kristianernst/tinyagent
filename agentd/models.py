@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from agentd.contracts import Tool
@@ -46,9 +46,45 @@ class ModelCapabilities:
 DEFAULT_MODEL_CAPABILITIES = ModelCapabilities()
 
 
+@dataclass(frozen=True)
+class ModelSpec:
+    provider: str
+    model: str
+    protocol: Literal["chat_completions", "responses", "anthropic", "gemini"] = "chat_completions"
+    edit_style: Literal["apply_patch", "str_replace", "whole_file"] = "apply_patch"
+    prompt_variant: str = "default"
+    tokenizer: str = "heuristic"
+    capabilities: ModelCapabilities = field(default_factory=lambda: DEFAULT_MODEL_CAPABILITIES)
+
+    def to_json_dict(self) -> dict[str, object]:
+        return {
+            "provider": self.provider,
+            "model": self.model,
+            "protocol": self.protocol,
+            "edit_style": self.edit_style,
+            "prompt_variant": self.prompt_variant,
+            "tokenizer": self.tokenizer,
+            "capabilities": self.capabilities.to_json_dict(),
+        }
+
+
 def model_capabilities(model: object) -> ModelCapabilities:
+    spec = getattr(model, "model_spec", None)
+    if isinstance(spec, ModelSpec):
+        return spec.capabilities
     capabilities = getattr(model, "capabilities", None)
     return capabilities if isinstance(capabilities, ModelCapabilities) else DEFAULT_MODEL_CAPABILITIES
+
+
+def model_spec(model: object) -> ModelSpec:
+    spec = getattr(model, "model_spec", None)
+    if isinstance(spec, ModelSpec):
+        return spec
+    capabilities = model_capabilities(model)
+    protocol = capabilities.tool_protocol if capabilities.tool_protocol in {"chat_completions", "responses"} else "chat_completions"
+    provider = str(getattr(model, "name", model.__class__.__name__))
+    model_name = str(getattr(model, "model", provider))
+    return ModelSpec(provider=provider, model=model_name, protocol=protocol, capabilities=capabilities)
 
 
 class FakeModelProvider:

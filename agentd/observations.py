@@ -25,7 +25,7 @@ class Observation:
 
 def extract_observations(call: ToolCall, result: ToolResult, state: RunState) -> list[Observation]:
     del state
-    if call.name == "apply_patch":
+    if call.name in {"apply_patch", "str_replace_edit", "write_file"}:
         return _patch_observations(call, result)
     if call.name == "shell":
         return _shell_observations(call, result)
@@ -113,7 +113,7 @@ def _patch_observations(call: ToolCall, result: ToolResult) -> list[Observation]
             Observation(
                 kind="file_changed",
                 subject=str(path),
-                summary=f"{path} changed by apply_patch.",
+                summary=f"{path} changed by {call.name}.",
                 refs=refs,
                 data={"path": str(path), "tool_call_id": call.id},
             )
