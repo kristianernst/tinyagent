@@ -17,7 +17,7 @@ PROFILE_ROOT = Path(__file__).resolve().parents[1] / "profiles"
 
 class ApexCoderProfile:
     name = "apex-coder"
-    DEFAULT_VISIBLE_TOOL_NAMES = ("shell", "apply_patch")
+    DEFAULT_VISIBLE_TOOL_NAMES = ("read_file", "search_repo", "apply_patch", "shell")
 
     def __init__(
         self,
@@ -189,13 +189,18 @@ def _requires_git_diff(state: RunState) -> bool:
 
 
 def _is_changed_file_inspection(step: ToolStep, edit_step: ToolStep) -> bool:
-    if step.call.name != "shell" or not step.result.ok:
+    if not step.result.ok:
+        return False
+    paths = [str(path).lower() for path in (edit_step.result.metadata.get("paths") or edit_step.result.data.get("paths") or [])]
+    if step.call.name == "read_file":
+        read_path = str(step.result.data.get("path") or step.call.args.get("path") or "").lower()
+        return bool(read_path and read_path in paths)
+    if step.call.name != "shell":
         return False
     cmd = str(step.call.args.get("cmd", "")).lower()
     if not any(token in cmd for token in ("cat ", "sed ", "rg ", "head ", "tail ", "python", "awk ")):
         return False
-    paths = edit_step.result.metadata.get("paths") or edit_step.result.data.get("paths") or []
-    return any(str(path).lower() in cmd for path in paths)
+    return any(path in cmd for path in paths)
 
 
 def _is_successful_verification(step: ToolStep) -> bool:

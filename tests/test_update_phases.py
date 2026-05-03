@@ -124,6 +124,8 @@ def test_observations_classify_patch_diff_verification_and_policy(tmp_path) -> N
     state = Kernel(
         model=FakeModelProvider(
             [
+                ModelResponse(tool_calls=(ToolCall(name="read_file", args={"path": "hello.py"}),)),
+                ModelResponse(tool_calls=(ToolCall(name="search_repo", args={"query": "test_ok"}),)),
                 ModelResponse(tool_calls=(ToolCall(name="apply_patch", args={"patch": patch}),)),
                 ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "git diff --no-index hello.py hello.py"}),)),
                 ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": f"{sys.executable} -m pytest hello.py"}),)),
@@ -138,6 +140,8 @@ def test_observations_classify_patch_diff_verification_and_policy(tmp_path) -> N
     ).run("record observations", workspace=tmp_path, run_id="run_observations_contract")
 
     kinds = [observation.kind for observation in state.observations]
+    assert "file_read" in kinds
+    assert "search_result" in kinds
     assert "patch_applied" in kinds
     assert "file_changed" in kinds
     assert "diff_seen" in kinds
@@ -239,7 +243,9 @@ def test_context_report_matches_final_model_request_after_hooks(tmp_path) -> Non
     report = json.loads((state.output_dir / started.data["context_report_artifact"]).read_text())
     request = json.loads((state.output_dir / started.data["logical_request_artifact"]).read_text())
     messages = [Message(role=message["role"], content=message["content"]) for message in request["messages"]]
-    expected_tokens = estimate_messages_tokens(messages) + estimate_tools_tokens(default_tools()[:1])
+    request_tool_names = {tool["name"] for tool in request["tools"]}
+    request_tools = [tool for tool in default_tools() if tool.name in request_tool_names]
+    expected_tokens = estimate_messages_tokens(messages) + estimate_tools_tokens(request_tools)
     assert report["token_estimate"] == expected_tokens
     assert request["messages"][-1]["content"] == "before model hook context"
 
@@ -317,6 +323,35 @@ def test_non_git_finish_gate_accepts_changed_file_inspection(tmp_path) -> None:
         policy=LocalPolicy(),
         workspace_mode="current",
     ).run("edit non-git", workspace=tmp_path, run_id="run_non_git_finish")
+
+    assert state.failed is False
+
+
+def test_non_git_finish_gate_accepts_read_file_changed_file_inspection(tmp_path) -> None:
+    (tmp_path / "hello.txt").write_text("hello\n")
+    patch = "\n".join(
+        [
+            "*** Begin Patch",
+            "*** Update File: hello.txt",
+            "@@",
+            "-hello",
+            "+hello updated",
+            "*** End Patch",
+        ]
+    )
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(name="apply_patch", args={"patch": patch}),)),
+                ModelResponse(tool_calls=(ToolCall(name="read_file", args={"path": "hello.txt"}),)),
+                ModelResponse(content="Done. Could not run verification in this environment.", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    ).run("edit non-git and inspect with read_file", workspace=tmp_path, run_id="run_non_git_read_file_finish")
 
     assert state.failed is False
 
@@ -450,6 +485,39 @@ def test_eval_metrics_count_policy_denial_once(tmp_path) -> None:
     metrics = extract_run_metrics(state.output_dir)
     assert metrics.policy_denials == 1
     assert metrics.tool_error_kinds["policy_denied"] == 1
+
+
+def test_eval_metrics_treat_structured_reads_as_pre_edit_inspection(tmp_path) -> None:
+    (tmp_path / "hello.txt").write_text("hello\n")
+    patch = "\n".join(
+        [
+            "*** Begin Patch",
+            "*** Update File: hello.txt",
+            "@@",
+            "-hello",
+            "+hello updated",
+            "*** End Patch",
+        ]
+    )
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(name="read_file", args={"path": "hello.txt"}),)),
+                ModelResponse(tool_calls=(ToolCall(name="apply_patch", args={"patch": patch}),)),
+                ModelResponse(content="done", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+        budgets=RunBudgets(max_turns=3),
+    ).run("read then edit", workspace=tmp_path, run_id="run_structured_inspection_metric")
+
+    metrics = extract_run_metrics(state.output_dir)
+    assert metrics.inspected_before_edit is True
+    assert metrics.diff_after_edit is False
+    assert metrics.verification_after_edit is False
 
 
 def test_noncritical_stable_context_respects_budget(tmp_path, monkeypatch) -> None:
