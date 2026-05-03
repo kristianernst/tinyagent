@@ -21,6 +21,7 @@ from agentd.run_control import CancelToken
 from agentd.state import ModelResponse, RunBudgets, RunState, ToolCall, ToolResult, Workspace
 from agentd.tools import (
     ApplyPatchTool,
+    ReadContextTool,
     ListFilesTool,
     ReadFileTool,
     SearchRepoTool,
@@ -73,6 +74,23 @@ def test_structured_inspection_tools_emit_artifact_metadata(tmp_path) -> None:
     assert search.data["output_artifact"] == search.artifact_path
     assert search.truncated is True
     assert search.read_hints
+
+
+def test_read_context_allows_recovery_files_and_blocks_raw_artifacts(tmp_path) -> None:
+    state = RunState.create("test", Workspace(tmp_path), run_id="run_context_reader")
+    state.output_dir.mkdir(parents=True)
+    refresh = __import__("agentd.contextfs", fromlist=["refresh_contextfs"]).refresh_contextfs
+    refresh(state)
+    (state.output_dir / "artifacts" / "model-response-0001.json").parent.mkdir(parents=True, exist_ok=True)
+    (state.output_dir / "artifacts" / "model-response-0001.json").write_text("{}\n")
+
+    index = ReadContextTool().run(ToolCall(name="read_context", args={"path": "context/INDEX.md"}), state)
+    raw_model = ReadContextTool().run(ToolCall(name="read_context", args={"path": "artifacts/model-response-0001.json"}), state)
+
+    assert index.ok is True
+    assert "context/task.md" in index.output
+    assert raw_model.ok is False
+    assert "not an allowed recovery file" in raw_model.output
 
 
 def test_read_file_and_apply_patch_protect_current_run_artifacts(tmp_path) -> None:
@@ -304,13 +322,24 @@ def test_kernel_shell_cancel_records_only_cancelled_tool_and_command_events(tmp_
         policy=LocalPolicy(),
     )
     state_box: dict[str, RunState] = {}
+    command_started = threading.Event()
+
+    class StartSink:
+        def emit(self, event) -> None:
+            if event.type == "command.started" and event.data.get("tool_call_id") == call.id:
+                command_started.set()
 
     def run_kernel() -> None:
-        state_box["state"] = kernel.run("run a cancellable shell command", workspace=tmp_path, cancel_token=token)
+        state_box["state"] = kernel.run(
+            "run a cancellable shell command",
+            workspace=tmp_path,
+            cancel_token=token,
+            event_sink=StartSink(),
+        )
 
     thread = threading.Thread(target=run_kernel)
     thread.start()
-    time.sleep(0.2)
+    assert command_started.wait(timeout=5) is True
     token.cancel("test cancellation")
     thread.join(timeout=5)
 
@@ -734,7 +763,7 @@ def test_apex_profile_exposes_structured_inspection_edit_and_shell_by_default(tm
 
     visible = ApexCoderProfile().visible_tools(state, tools)
 
-    assert [tool.name for tool in visible] == ["read_file", "search_repo", "apply_patch", "shell"]
+    assert [tool.name for tool in visible] == ["read_file", "read_context", "search_repo", "apply_patch", "shell"]
 
 
 def test_apex_profile_selects_claude_like_edit_tool_from_model_spec(tmp_path) -> None:
@@ -744,7 +773,7 @@ def test_apex_profile_selects_claude_like_edit_tool_from_model_spec(tmp_path) ->
 
     visible = ApexCoderProfile().visible_tools(state, tools)
 
-    assert [tool.name for tool in visible] == ["read_file", "search_repo", "str_replace_edit", "shell"]
+    assert [tool.name for tool in visible] == ["read_file", "read_context", "search_repo", "str_replace_edit", "shell"]
 
 
 def test_apex_profile_selects_generic_write_file_tool_from_model_spec(tmp_path) -> None:
@@ -754,13 +783,13 @@ def test_apex_profile_selects_generic_write_file_tool_from_model_spec(tmp_path) 
 
     visible = ApexCoderProfile().visible_tools(state, tools)
 
-    assert [tool.name for tool in visible] == ["read_file", "search_repo", "write_file", "shell"]
+    assert [tool.name for tool in visible] == ["read_file", "read_context", "search_repo", "write_file", "shell"]
 
 
 def test_tool_collections_name_builtin_and_repo_groups() -> None:
     assert [tool.name for tool in builtin_tools()] == ["shell", "apply_patch", "str_replace_edit", "write_file"]
     assert [tool.name for tool in repo_inspect_tools()] == ["read_file", "list_files", "search_repo"]
-    assert [tool.name for tool in all_tools()] == ["shell", "apply_patch", "str_replace_edit", "write_file", "read_file", "list_files", "search_repo"]
+    assert [tool.name for tool in all_tools()] == ["shell", "apply_patch", "str_replace_edit", "write_file", "read_file", "list_files", "search_repo", "read_context"]
     assert [tool.name for tool in default_tools()] == [tool.name for tool in all_tools()]
     assert "finish" not in {tool.name for tool in default_tools()}
 
@@ -771,6 +800,7 @@ def test_tools_public_export_surface_stays_small() -> None:
     assert sorted(tools.__all__) == [
         "ApplyPatchTool",
         "ListFilesTool",
+        "ReadContextTool",
         "ReadFileTool",
         "SearchRepoTool",
         "ShellTool",
@@ -830,7 +860,7 @@ def test_apex_profile_blocks_registered_but_hidden_tools(tmp_path, tool_name, ar
     assert result.data == {
         "blocked": True,
         "error_type": "ToolNotVisible",
-        "visible_tools": ["apply_patch", "read_file", "search_repo", "shell"],
+        "visible_tools": ["apply_patch", "read_context", "read_file", "search_repo", "shell"],
     }
     hidden_events = [event for event in state.events if event.data.get("tool_call_id") == hidden_call.id]
     assert [event.type for event in hidden_events] == [
@@ -1169,7 +1199,7 @@ def test_golden_trace_covers_context_artifacts_tool_args_shell_artifact_and_untr
     assert (state.output_dir / model_request.data["logical_request_artifact"]).exists()
     assert (state.output_dir / model_response.data["response_artifact"]).exists()
     logical_request = json.loads((state.output_dir / model_request.data["logical_request_artifact"]).read_text())
-    assert [tool["name"] for tool in logical_request["tools"]] == ["read_file", "search_repo", "apply_patch", "shell"]
+    assert [tool["name"] for tool in logical_request["tools"]] == ["read_file", "read_context", "search_repo", "apply_patch", "shell"]
     final_context = (state.output_dir / model_requests[-1].data["context_artifact"]).read_text()
     assert "Tool: shell" in final_context
     assert "created.txt" in final_context
