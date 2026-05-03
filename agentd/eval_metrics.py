@@ -48,6 +48,7 @@ def extract_run_metrics(run_path: Path) -> RunMetrics:
     finish_blocks = 0
     compactions = 0
     first_edit_seq: int | None = None
+    first_edit_tool_call_id: str | None = None
     pre_edit_inspection = False
     diff_after_edit = False
     verification_after_edit = False
@@ -95,12 +96,21 @@ def extract_run_metrics(run_path: Path) -> RunMetrics:
         elif event.type == "patch.applied" and event.data.get("ok", True):
             if first_edit_seq is None:
                 first_edit_seq = event.seq
+                first_edit_tool_call_id = _tool_call_id(event)
+        elif event.type == "workspace.mutation.detected":
+            if first_edit_seq is None:
+                first_edit_seq = event.seq
+                first_edit_tool_call_id = _tool_call_id(event)
         elif event.type == "observation.recorded":
             kind = str(event.data.get("kind") or "")
             if first_edit_seq is not None and event.seq > first_edit_seq:
-                if kind == "diff_seen":
+                data = event.data.get("data", {})
+                source = data.get("source") if isinstance(data, dict) else None
+                observation_tool_call_id = data.get("tool_call_id") if isinstance(data, dict) else None
+                is_separate_tool_step = first_edit_tool_call_id is None or observation_tool_call_id != first_edit_tool_call_id
+                if kind == "diff_seen" and source != "workspace_delta" and is_separate_tool_step:
                     diff_after_edit = True
-                if kind == "verification":
+                if kind == "verification" and is_separate_tool_step:
                     verification_after_edit = True
             if kind == "policy_block" and event.data.get("data", {}).get("failure_kind") == "progress_blocked":
                 progress_guard_interventions += 1
@@ -176,6 +186,11 @@ def _error_kind(event: Event) -> str:
         if nested.get("blocked"):
             return "policy_denied"
     return "unknown"
+
+
+def _tool_call_id(event: Event) -> str | None:
+    value = event.data.get("tool_call_id")
+    return value if isinstance(value, str) and value else None
 
 
 def _is_inspection_command(command: str) -> bool:

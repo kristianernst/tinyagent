@@ -1058,7 +1058,8 @@ def test_golden_trace_covers_context_artifacts_tool_args_shell_artifact_and_untr
                 )
             ),
             ModelResponse(tool_calls=(shell_call,)),
-            ModelResponse(content="done", finish_reason="stop"),
+            ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "git diff -- created.txt"}),)),
+            ModelResponse(content="done. Could not run verification in this environment.", finish_reason="stop"),
         ]
     )
     kernel = Kernel(
