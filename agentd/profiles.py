@@ -66,12 +66,20 @@ class ApexCoderProfile:
         content = response.content or ""
         edited_index = _latest_index(state.tool_steps, _is_successful_edit)
         if edited_index is not None:
-            diff_index = _latest_index(state.tool_steps, _is_diff_inspection)
-            if diff_index is None or diff_index < edited_index:
-                return FinishDecision.blocked(
-                    "finish blocked: inspect git diff after edits",
-                    "Before finalizing, inspect git diff after the latest edit.",
-                )
+            if _requires_git_diff(state):
+                diff_index = _latest_index(state.tool_steps, _is_diff_inspection)
+                if diff_index is None or diff_index < edited_index:
+                    return FinishDecision.blocked(
+                        "finish blocked: inspect git diff after edits",
+                        "Before finalizing, inspect git diff after the latest edit.",
+                    )
+            else:
+                file_inspection_index = _latest_index(state.tool_steps, lambda step: _is_changed_file_inspection(step, state.tool_steps[edited_index]))
+                if (file_inspection_index is None or file_inspection_index < edited_index) and not _mentions_diff_limitation(content):
+                    return FinishDecision.blocked(
+                        "finish blocked: inspect changed files after edits",
+                        "Before finalizing in this non-git workspace, inspect the changed file contents or explain that git diff is unavailable.",
+                    )
             verification_index = _latest_index(state.tool_steps, _is_successful_verification)
             if verification_index is None or verification_index < edited_index:
                 if not _mentions_verification_limitation(content):
@@ -134,6 +142,23 @@ def _is_diff_inspection(step: ToolStep) -> bool:
     return any(pattern in cmd for pattern in ("git diff", "git show"))
 
 
+def _requires_git_diff(state: RunState) -> bool:
+    envelope = state.workspace_envelope
+    if envelope is not None:
+        return envelope.dirty_state_before.is_git_repo
+    return (state.workspace.root / ".git").exists()
+
+
+def _is_changed_file_inspection(step: ToolStep, edit_step: ToolStep) -> bool:
+    if step.call.name != "shell" or not step.result.ok:
+        return False
+    cmd = str(step.call.args.get("cmd", "")).lower()
+    if not any(token in cmd for token in ("cat ", "sed ", "rg ", "head ", "tail ", "python", "awk ")):
+        return False
+    paths = edit_step.result.metadata.get("paths") or edit_step.result.data.get("paths") or []
+    return any(str(path).lower() in cmd for path in paths)
+
+
 def _is_successful_verification(step: ToolStep) -> bool:
     if step.call.name != "shell" or not step.result.ok:
         return False
@@ -146,6 +171,11 @@ def _is_successful_verification(step: ToolStep) -> bool:
 def _mentions_verification_limitation(content: str) -> bool:
     text = content.lower()
     return any(phrase in text for phrase in ("could not run", "unable to run", "did not run", "not run", "verification unavailable"))
+
+
+def _mentions_diff_limitation(content: str) -> bool:
+    text = content.lower()
+    return "git diff" in text and any(phrase in text for phrase in ("could not", "unable", "unavailable", "not a git", "non-git"))
 
 
 def _mentions_failure(content: str) -> bool:

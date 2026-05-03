@@ -196,7 +196,7 @@ def _outside_redirect_target(cmd: str, state: RunState) -> str:
             continue
         path = Path(raw).expanduser()
         if not path.is_absolute():
-            continue
+            path = state.workspace.root / path
         envelope = state.workspace_envelope
         if envelope is not None:
             if not envelope.contains(path):

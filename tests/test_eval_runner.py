@@ -93,6 +93,56 @@ def test_eval_suite_stops_after_cancelled_case_and_skips_validation(tmp_path) ->
     assert not (output_dir / "workspaces" / "run-second").exists()
 
 
+def test_eval_validation_runs_against_effective_worktree_workspace(tmp_path) -> None:
+    suite = tmp_path / "suite"
+    case = suite / "edit-file"
+    files = case / "files"
+    files.mkdir(parents=True)
+    (files / "hello.txt").write_text("hello\n")
+    validation = f"{sys.executable} -c \"from pathlib import Path; assert Path('hello.txt').read_text() == 'updated\\\\n'\""
+    (case / "task.json").write_text(
+        json.dumps(
+            {
+                "id": "edit-file",
+                "task": "Edit hello.txt to say updated.",
+                "validation_command": validation,
+            }
+        )
+    )
+    patch = "\n".join(
+        [
+            "*** Begin Patch",
+            "*** Update File: hello.txt",
+            "@@",
+            "-hello",
+            "+updated",
+            "*** End Patch",
+        ]
+    )
+    output_dir = tmp_path / "eval-worktree"
+
+    eval_run = run_eval_suite(
+        suite,
+        output_dir=output_dir,
+        model_factory=lambda _task: FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(name="apply_patch", args={"patch": patch}),)),
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "git diff -- hello.txt"}),)),
+                ModelResponse(content="Done. Could not run verification in this environment.", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=default_policy(),
+        workspace_mode="worktree",
+    )
+
+    result = eval_run.results[0]
+    assert result.success is True
+    assert result.validation_ok is True
+    assert Path(result.workspace_path) != output_dir / "workspaces" / "edit-file"
+
+
 def _write_suite(tmp_path: Path) -> Path:
     suite = tmp_path / "suite"
     case = suite / "read-file"

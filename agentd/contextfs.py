@@ -108,6 +108,7 @@ def _last_failure_text(state: "RunState") -> str:
         if step.result.ok:
             continue
         artifact = step.result.artifact_path or step.result.data.get("context_artifact") or step.result.data.get("output_artifact")
+        readable_artifact = model_readable_path(state, artifact) if artifact else "(none)"
         return "\n".join(
             [
                 "# Last Failure",
@@ -115,7 +116,7 @@ def _last_failure_text(state: "RunState") -> str:
                 f"tool: {step.call.name}",
                 f"call_id: {step.call.id}",
                 f"failure_kind: {step.result.failure_kind or step.result.data.get('failure_kind') or 'unknown'}",
-                f"artifact: {artifact or '(none)'}",
+                f"artifact: {readable_artifact}",
                 "",
                 "## Preview",
                 "",

@@ -187,6 +187,9 @@ class Kernel:
             messages = built_context.messages
             messages, visible_tools = self._before_model_call(state, messages, visible_tools)
             visible_tool_names = frozenset(tool.name for tool in visible_tools)
+            actual_token_estimate = estimate_messages_tokens(messages) + estimate_tools_tokens(visible_tools)
+            built_context = replace(built_context, messages=messages, token_estimate=actual_token_estimate)
+            state.context_token_estimate = actual_token_estimate
             state.emit(
                 "context.built",
                 {
@@ -818,6 +821,9 @@ class Kernel:
             state.finish_step("failed", data={"reason": str(exc)})
             if not state.failed and not state.cancelled:
                 state.fail(f"artifact finalization failed: {exc}")
+        finally:
+            index_path = refresh_contextfs(state)
+            state.emit("contextfs.index.updated", {"path": index_path, "phase": "finalization"})
 
     def _finalize_run(self, state: RunState) -> None:
         event_type = "run.cancelled" if state.cancelled else "run.failed" if state.failed else "run.completed"
@@ -848,6 +854,7 @@ class Kernel:
         if state.cancelled:
             state.status = "cancelled"
         state.emit(event_type, data)
+        refresh_contextfs(state)
 
     def _build_context(self, state: RunState, visible_tools: list[Tool]) -> BuiltContext:
         index_path = refresh_contextfs(state)
