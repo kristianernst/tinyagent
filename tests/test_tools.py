@@ -252,6 +252,20 @@ def test_shell_cancel_kills_command_and_records_cancelled(tmp_path) -> None:
     assert command.data["output_artifact"].startswith("artifacts/command-output-")
 
 
+def test_shell_records_execution_envelope_metadata(tmp_path) -> None:
+    state = RunState.create("envelope", Workspace(tmp_path), run_id="run_envelope")
+    result = ShellTool().run(ToolCall(name="shell", args={"cmd": "printf ok"}), state)
+
+    assert result.ok is True
+    envelope = result.metadata["execution_envelope"]
+    assert envelope["cwd"] == str(tmp_path)
+    assert envelope["env"] == "sanitized"
+    assert envelope["writable_roots"] == [str(tmp_path)]
+    assert envelope["process_group_cancellation"] is True
+    command = next(event for event in state.events if event.type == "command.started")
+    assert command.data["execution_envelope"] == envelope
+
+
 def test_kernel_shell_cancel_records_only_cancelled_tool_and_command_events(tmp_path) -> None:
     call = ToolCall(
         name="shell",
