@@ -15,7 +15,12 @@ from agentd.tools import patch_paths, resolve_workspace_path
 
 
 class LocalPolicy:
-    """Small deny-by-default policy for the built-in local tools."""
+    """Classifier-first local policy for permissive workspace bash.
+
+    This is not a sandbox. Network, secrets, ContextFS/evidence writes,
+    external redirects, repeated failures, and known destructive commands are
+    restricted before the default bash allow rule applies.
+    """
 
     def __init__(self, *, allow_run_artifacts: bool = False, config: PolicyConfig | None = None) -> None:
         self.allow_run_artifacts = allow_run_artifacts
@@ -96,6 +101,19 @@ class LocalPolicy:
                 risk="high",
                 command=cmd,
             )
+        protected_output_write = _protected_output_write(cmd, state)
+        if protected_output_write:
+            return _decision_from_action(
+                _resolve_permission(self.config, "run_artifact_write", protected_output_write),
+                call,
+                state,
+                reason=f"shell write to protected run evidence is denied: {protected_output_write}",
+                permission="run_artifact_write",
+                target=protected_output_write,
+                action_kind="workspace_escape",
+                risk="high",
+                command=cmd,
+            )
         redirect_escape = _outside_redirect_target(cmd, state)
         if redirect_escape:
             return _decision_from_action(
@@ -170,6 +188,8 @@ RISKY_SHELL_PATTERNS = (
 
 _NETWORK_SHELL_PATTERN = re.compile(r"\b(curl|wget|ssh|scp|sftp|rsync|nc|ncat|telnet)\b")
 _REDIRECT_PATTERN = re.compile(r"(?:^|[\s;&|])(?:>|>>|<)\s*(?P<path>[^()\s;&|]+)")
+_WRITE_REDIRECT_PATTERN = re.compile(r"(?:^|[\s;&|])(?:>|>>)\s*(?P<path>[^()\s;&|]+)")
+_FILE_MUTATION_COMMANDS = frozenset({"tee", "mkdir", "touch", "rm", "mv", "cp"})
 _TINYAGENT_WRITE_PATTERN = re.compile(
     r"(?:(?:>|>>)\s*(?P<redirect>(?:\./)?\.tinyagent(?:/|\b)[^\s;&|]*)|"
     r"\b(?:tee|mkdir|touch|rm|mv|cp)\b[^\n;&|]*(?P<command>(?:\./)?\.tinyagent(?:/|\b)[^\s;&|]*))"
@@ -206,6 +226,47 @@ def _outside_redirect_target(cmd: str, state: RunState) -> str:
     return ""
 
 
+def _protected_output_write(cmd: str, state: RunState) -> str:
+    for raw in _write_targets(cmd):
+        resolved = _resolve_shell_path(raw, state.workspace.root)
+        if _is_protected_output_path(resolved, state):
+            return raw
+    return ""
+
+
+def _write_targets(cmd: str) -> list[str]:
+    targets = [match.group("path").strip("'\"") for match in _WRITE_REDIRECT_PATTERN.finditer(cmd)]
+    words = _shell_words(cmd)
+    if not words:
+        return targets
+    command_names = {Path(word).name for word in words if not word.startswith("-")}
+    if command_names.isdisjoint(_FILE_MUTATION_COMMANDS):
+        return targets
+    targets.extend(word for word in words[1:] if not word.startswith("-"))
+    return targets
+
+
+def _resolve_shell_path(raw: str, cwd: Path) -> Path:
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = cwd / path
+    return path.resolve()
+
+
+def _is_protected_output_path(path: Path, state: RunState) -> bool:
+    output_dir = state.output_dir.resolve()
+    protected_dirs = (output_dir / "context", output_dir / "artifacts")
+    protected_files = {
+        output_dir / "events.jsonl",
+        output_dir / "final.md",
+        output_dir / "final.diff",
+        output_dir / "metrics.json",
+    }
+    if any(_is_relative_to(path, root.resolve()) for root in protected_dirs):
+        return True
+    return path in {file.resolve() for file in protected_files}
+
+
 def _protected_tinyagent_write(cmd: str) -> str:
     match = _TINYAGENT_WRITE_PATTERN.search(cmd)
     return (match.group("redirect") or match.group("command")) if match else ""
@@ -238,8 +299,16 @@ def _resolve_permission(config: PolicyConfig, permission: str, target: str) -> R
     for rule in config.rules:
         if rule.permission == permission and fnmatch(target, rule.pattern):
             action = rule.action
-            matched_rule = f"{permission}.{rule.action}"
+            matched_rule = f"{permission}:{rule.pattern}:{rule.action}"
     return ResolvedPolicyRule(action=action, matched_rule=matched_rule)
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
 
 
 def _decision_from_action(
@@ -322,6 +391,7 @@ def default_policy_config() -> PolicyConfig:
             PolicyRule("network", "*", "deny"),
             PolicyRule("contextfs_write", ".tinyagent/**", "deny"),
             PolicyRule("contextfs_write", "./.tinyagent/**", "deny"),
+            PolicyRule("run_artifact_write", "*", "deny"),
             PolicyRule("secrets", ".env*", "deny"),
             PolicyRule("secrets", "./.env*", "deny"),
             PolicyRule("secrets", "*/.env*", "deny"),

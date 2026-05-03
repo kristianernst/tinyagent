@@ -86,11 +86,6 @@ class Agent:
             if not task.done():
                 task.cancel()
 
-    async def resume(self, run_id: str) -> AsyncIterator[Event]:
-        async for event in self.run(f"Resume run {run_id}", run_id=run_id):
-            yield event
-
-
 class _QueueSink(EventSink):
     def __init__(self) -> None:
         self._queue: queue.Queue[Event] = queue.Queue()
