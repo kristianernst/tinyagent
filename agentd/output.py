@@ -173,6 +173,7 @@ def write_context_report_artifact(
     call_index: int,
     built_context,
     budget: int,
+    model_capabilities=None,
 ) -> str:
     return write_json_artifact(
         state,
@@ -181,6 +182,7 @@ def write_context_report_artifact(
             "request_id": f"model-call-{call_index:04d}",
             "token_estimate": built_context.token_estimate,
             "budget": budget,
+            "model_capabilities": model_capabilities.to_json_dict() if model_capabilities is not None else None,
             "context_plan": (
                 built_context.context_plan.to_json_dict()
                 if getattr(built_context, "context_plan", None) is not None

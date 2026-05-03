@@ -60,6 +60,7 @@ def test_toolresult_contextfs_and_context_report_contracts(tmp_path) -> None:
     report = json.loads((state.output_dir / report_event.data["context_report_artifact"]).read_text())
     assert any(item["id"] == "contextfs:index" for item in report["included"])
     assert report["context_plan"]["mode"] in {"explore", "finish"}
+    assert report["model_capabilities"]["supports_tools"] is True
 
 
 def test_transcript_records_model_tool_result_and_finish_gate(tmp_path) -> None:
