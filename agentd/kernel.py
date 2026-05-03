@@ -24,6 +24,7 @@ from agentd.output import (
     write_model_response_artifact,
     write_run_outputs,
 )
+from agentd.progress import ProgressGuard
 from agentd.run_control import CancelToken, RunCancelled
 from agentd.state import (
     ApprovalGrant,
@@ -66,6 +67,7 @@ class Kernel:
         sandbox_mode: SandboxMode = "none",
         hooks: Sequence[TinyHook] = (),
         hook_error_policy: HookErrorPolicy = "fail",
+        progress_guard: ProgressGuard | None = None,
     ) -> None:
         self.model = model
         self.profile = profile
@@ -81,6 +83,7 @@ class Kernel:
         self.sandbox_mode = sandbox_mode
         self.hooks = tuple(hooks)
         self.hook_error_policy = hook_error_policy
+        self.progress_guard = progress_guard or ProgressGuard()
 
     def run(
         self,
@@ -442,6 +445,25 @@ class Kernel:
                 failure_kind="policy_denied",
                 summary=f"Tool is not visible for this profile: {call.name}",
                 content_preview=f"Tool is not visible for this profile: {call.name}",
+            )
+            self._append_tool_step(state, call, result)
+            self._record_tool_result(state, call, result)
+            self._record_tool_blocked(state, call, result.output)
+            index_path = refresh_contextfs(state)
+            state.emit("contextfs.index.updated", {"path": index_path, "tool_call_id": call.id})
+            return
+
+        progress = self.progress_guard.before_tool_call(state, call)
+        if not progress.allow:
+            result = ToolResult(
+                tool_name=call.name,
+                call_id=call.id,
+                output=progress.reason,
+                ok=False,
+                data={"blocked": True, "progress_blocked": True, "failure_kind": "progress_blocked"},
+                failure_kind="progress_blocked",
+                summary=progress.reason,
+                content_preview=progress.reason,
             )
             self._append_tool_step(state, call, result)
             self._record_tool_result(state, call, result)
