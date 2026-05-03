@@ -61,6 +61,45 @@ def test_toolresult_contextfs_and_context_report_contracts(tmp_path) -> None:
     assert any(item["id"] == "contextfs:index" for item in report["included"])
 
 
+def test_transcript_records_model_tool_result_and_finish_gate(tmp_path) -> None:
+    (tmp_path / "hello.txt").write_text("hello\n")
+    patch = "\n".join(
+        [
+            "*** Begin Patch",
+            "*** Update File: hello.txt",
+            "@@",
+            "-hello",
+            "+hello updated",
+            "*** End Patch",
+        ]
+    )
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(id="call_patch", name="apply_patch", args={"patch": patch}),)),
+                ModelResponse(content="done", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    ).run("edit then finish too early", workspace=tmp_path, run_id="run_transcript_contract")
+
+    assert state.failed is True
+    state.transcript.validate_complete()
+    items = state.transcript.items
+    assert [item.kind for item in items].count("model_response") == 2
+    tool_call = next(item for item in items if item.kind == "tool_call")
+    tool_result = next(item for item in items if item.kind == "tool_result")
+    finish_gate = next(item for item in items if item.kind == "finish_gate")
+    assert tool_call.tool_call_id == "call_patch"
+    assert tool_result.tool_call_id == "call_patch"
+    assert tool_result.artifact_refs
+    assert "inspect changed files" in finish_gate.summary
+    assert state.transcript.to_json_dict()["pending_tool_call_ids"] == []
+
+
 def test_context_report_matches_final_model_request_after_hooks(tmp_path) -> None:
     class RequestHook:
         name = "request-hook"
