@@ -15,6 +15,7 @@ from agentd.workspace import Workspace, WorkspaceEnvelope
 
 if TYPE_CHECKING:
     from agentd.context import ContextState
+    from agentd.observations import Observation
     from agentd.transcript import Transcript
 
 
@@ -250,6 +251,7 @@ class RunState:
     context_token_estimate: int = 0
     compaction_count: int = 0
     transcript: Transcript = field(default_factory=_default_transcript)
+    observations: list[Observation] = field(default_factory=list)
     finish_gate_messages: list[str] = field(default_factory=list)
     parent_run_id: str | None = None
     parent_event_id: str | None = None
