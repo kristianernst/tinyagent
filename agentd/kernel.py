@@ -326,6 +326,16 @@ class Kernel:
                 call_index=model_call_index,
                 response=response,
             )
+            state.transcript.record_model_response(
+                item_id=f"transcript-model-response-{model_call_index:04d}",
+                turn_id=state.current_turn_id,
+                model_call_id=model_call_id,
+                provider=self.model.name,
+                content_length=len(response.content),
+                finish_reason=response.finish_reason,
+                tool_call_count=len(response.tool_calls),
+                response_artifact=response_artifact,
+            )
             state.emit(
                 "model.call.completed",
                 {
@@ -348,6 +358,12 @@ class Kernel:
                         state.finish(response.content)
                     else:
                         state.finish_gate_messages.append(decision.injected_message or decision.reason)
+                        state.transcript.record_finish_gate(
+                            item_id=f"transcript-finish-gate-{len(state.transcript.items) + 1:04d}",
+                            turn_id=state.current_turn_id,
+                            reason=decision.reason,
+                            injected_message=decision.injected_message,
+                        )
                         state.emit(
                             "finish.blocked",
                             {"reason": decision.reason, "injected_message": decision.injected_message},
@@ -374,6 +390,12 @@ class Kernel:
                     state.finish(candidate)
                 else:
                     state.finish_gate_messages.append(decision.injected_message or decision.reason)
+                    state.transcript.record_finish_gate(
+                        item_id=f"transcript-finish-gate-{len(state.transcript.items) + 1:04d}",
+                        turn_id=state.current_turn_id,
+                        reason=decision.reason,
+                        injected_message=decision.injected_message,
+                    )
                     state.emit(
                         "finish.blocked",
                         {"reason": decision.reason, "injected_message": decision.injected_message},
@@ -611,6 +633,31 @@ class Kernel:
         state.emit("tool.execution.completed" if result.ok else "tool.execution.failed", payload)
 
     def _append_tool_step(self, state: RunState, call: ToolCall, result: ToolResult) -> None:
+        artifact_refs = tuple(
+            ref
+            for ref in (
+                result.artifact_path,
+                result.data.get("context_artifact"),
+                result.data.get("output_artifact"),
+            )
+            if isinstance(ref, str) and ref
+        )
+        state.transcript.record_tool_result(
+            item_id=f"transcript-tool-result-{len(state.tool_steps) + 1:04d}",
+            turn_id=state.current_turn_id,
+            tool_call_id=result.call_id or call.id,
+            tool_name=result.tool_name or call.name,
+            ok=result.ok,
+            summary=result.summary or _first_line(result.output) or ("ok" if result.ok else "failed"),
+            failure_kind=result.failure_kind or result.data.get("failure_kind"),
+            artifact_refs=artifact_refs,
+            synthetic=bool(result.data.get("blocked") or result.data.get("progress_blocked")),
+            data={
+                "exit_code": result.exit_code,
+                "duration_ms": result.duration_ms,
+                "truncated": result.truncated,
+            },
+        )
         state.tool_steps.append(ToolStep(call=call, result=result))
 
     def _record_policy_decision(self, state: RunState, call: ToolCall, decision: PolicyDecision) -> None:
@@ -741,6 +788,14 @@ class Kernel:
                     "tool": call.name,
                     "args": _small_event_data(call.args),
                 },
+            )
+            state.transcript.record_tool_call(
+                item_id=f"transcript-tool-call-{len(state.transcript.items) + 1:04d}",
+                turn_id=state.current_turn_id,
+                model_call_id=model_call_id,
+                tool_call_id=call.id,
+                tool_name=call.name,
+                args=_small_event_data(call.args),
             )
 
     def _record_mutation_event(self, state: RunState, event_type: str, call: ToolCall, *, ok: bool | None = None) -> None:
@@ -920,6 +975,12 @@ class Kernel:
         )
         self._run_hooks(state, "before_compact", state)
         self.profile.compact(state)
+        state.transcript.record_compaction(
+            item_id=f"transcript-compaction-{state.compaction_count:04d}",
+            turn_id=state.current_turn_id,
+            compaction_count=state.compaction_count,
+            checkpoint_artifact=state.context_checkpoint_artifact or None,
+        )
         state.emit(
             "checkpoint.completed",
             {
@@ -1072,6 +1133,10 @@ def _small_event_data(data: dict[str, Any]) -> dict[str, Any]:
         "json_chars": len(encoded),
         "preview": encoded[:MAX_EVENT_DATA_CHARS],
     }
+
+
+def _first_line(text: str) -> str:
+    return text.strip().splitlines()[0][:240] if text.strip() else ""
 
 
 def _output_chars(result: ToolResult) -> int:
