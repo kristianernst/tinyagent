@@ -22,7 +22,10 @@ class ShellTool:
     name = "shell"
     schema = {
         "name": "shell",
-        "description": "Run a shell command with cwd set to the workspace root.",
+        "description": (
+            "Run a shell command with cwd set to the workspace root. Results include an execution_envelope "
+            "with read/write roots, network mode, git access, sandbox backend, and escalation hints."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -78,6 +81,7 @@ class ShellTool:
             context_artifact = write_context_tool_output(state, call, output, kind="shell_output")
             context_read_path = model_readable_path(state, context_artifact)
             preview = visible_output(output, state)
+            failure_data = _failure_data("timeout", capability="process", source="tool", recoverability="increase_timeout_or_simplify")
             state.emit(
                 "command.timeout",
                 {
@@ -91,6 +95,7 @@ class ShellTool:
                     "output_chars": len(output),
                     "duration_ms": _duration_ms(started),
                     "failure_kind": "timeout",
+                    **failure_data,
                     "execution_envelope": envelope.to_json_dict(),
                 },
             )
@@ -115,6 +120,7 @@ class ShellTool:
                     "output_chars": len(output),
                     "duration_ms": _duration_ms(started),
                     "failure_kind": "timeout",
+                    **failure_data,
                 },
                 metadata={"cwd": str(envelope.cwd), "command_normalized": cmd, "execution_envelope": envelope.to_json_dict()},
                 read_hints=read_hints(context_read_path, failure=True),
@@ -131,6 +137,7 @@ class ShellTool:
             context_artifact = write_context_tool_output(state, call, output, kind="shell_output")
             context_read_path = model_readable_path(state, context_artifact)
             preview = visible_output(output, state)
+            failure_data = _failure_data("user_aborted", capability="process", source="tool", recoverability="rerun_if_needed")
             state.emit(
                 "command.cancelled",
                 {
@@ -143,7 +150,8 @@ class ShellTool:
                     "output_chars": len(output),
                     "escalated": state.cancel_escalated,
                     "duration_ms": _duration_ms(started),
-                    "failure_kind": "unknown",
+                    "failure_kind": "user_aborted",
+                    **failure_data,
                     "execution_envelope": envelope.to_json_dict(),
                 },
                 visibility="user",
@@ -159,7 +167,7 @@ class ShellTool:
                 content_preview=preview,
                 artifact_path=context_artifact,
                 truncated=len(preview) < len(output),
-                failure_kind="unknown",
+                failure_kind="user_aborted",
                 data={
                     "cmd": cmd,
                     "cancelled": True,
@@ -169,7 +177,8 @@ class ShellTool:
                     "context_artifact": context_artifact,
                     "output_chars": len(output),
                     "duration_ms": _duration_ms(started),
-                    "failure_kind": "unknown",
+                    "failure_kind": "user_aborted",
+                    **failure_data,
                 },
                 metadata={"cwd": str(envelope.cwd), "command_normalized": cmd, "execution_envelope": envelope.to_json_dict()},
                 read_hints=read_hints(context_read_path, failure=True),
@@ -182,6 +191,7 @@ class ShellTool:
         preview = visible_output(output, state)
         ok = process.returncode == 0
         failure_kind = None if ok else "command_failed"
+        failure_data = _failure_data(failure_kind, capability="process", source="tool", recoverability="inspect_output")
         state.emit(
             "command.completed" if ok else "command.failed",
             {
@@ -197,6 +207,7 @@ class ShellTool:
                 "output_chars": len(output),
                 "duration_ms": _duration_ms(started),
                 "failure_kind": failure_kind,
+                **failure_data,
                 "execution_envelope": envelope.to_json_dict(),
             },
         )
@@ -220,6 +231,7 @@ class ShellTool:
                 "output_chars": len(output),
                 "duration_ms": _duration_ms(started),
                 "failure_kind": failure_kind,
+                **failure_data,
             },
             metadata={
                 "cwd": str(envelope.cwd),
@@ -274,3 +286,14 @@ def _signal_process_group(process: subprocess.Popen[str], sig: signal.Signals) -
 
 def _duration_ms(started: float) -> int:
     return int((time.monotonic() - started) * 1000)
+
+
+def _failure_data(failure_kind: str | None, *, capability: str, source: str, recoverability: str) -> dict[str, str]:
+    if not failure_kind:
+        return {}
+    return {
+        "failure_kind": failure_kind,
+        "capability": capability,
+        "source": source,
+        "recoverability": recoverability,
+    }

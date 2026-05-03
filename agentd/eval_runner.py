@@ -18,7 +18,7 @@ from agentd.kernel import Kernel
 from agentd.run_control import CancelToken
 from agentd.run_record import RunRecord, load_run_record
 from agentd.state import ApprovalMode
-from agentd.workspace import SandboxMode, WorkspaceMode
+from agentd.workspace import SandboxModeInput, WorkspaceMode
 
 ModelFactory = Callable[[str], ModelProvider]
 
@@ -92,7 +92,7 @@ def run_eval_suite(
     cancel_token: CancelToken | None = None,
     workspace_mode: WorkspaceMode = "current",
     approval_mode: ApprovalMode = "yolo",
-    sandbox_mode: SandboxMode = "none",
+    sandbox_mode: SandboxModeInput = "none",
 ) -> EvalRun:
     suite_path = suite_path.expanduser().resolve()
     output_dir = output_dir.expanduser().resolve()
@@ -230,7 +230,7 @@ def _run_case(
     cancel_token: CancelToken | None,
     workspace_mode: WorkspaceMode,
     approval_mode: ApprovalMode,
-    sandbox_mode: SandboxMode,
+    sandbox_mode: SandboxModeInput,
 ) -> EvalResult:
     case_dir = suite_path / case.id
     _prepare_workspace(case_dir, workspace_dir, setup_git=case.setup_git)

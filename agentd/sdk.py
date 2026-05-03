@@ -13,7 +13,7 @@ from agentd.hooks import TinyHook
 from agentd.kernel import Kernel
 from agentd.profiles import ApexCoderProfile
 from agentd.state import ApprovalMode, RunBudgets
-from agentd.workspace import SandboxMode, WorkspaceMode
+from agentd.workspace import SandboxModeInput, WorkspaceMode
 
 
 class Agent:
@@ -29,7 +29,7 @@ class Agent:
         budgets: RunBudgets | None = None,
         workspace_mode: WorkspaceMode = "auto",
         approval_mode: ApprovalMode = "yolo",
-        sandbox_mode: SandboxMode = "none",
+        sandbox_mode: SandboxModeInput = "none",
     ) -> None:
         self.workspace = Path(workspace)
         self.provider = provider

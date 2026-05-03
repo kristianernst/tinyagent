@@ -289,6 +289,8 @@ def _metrics(state: RunState) -> dict[str, Any]:
         "workspace_allowed_roots": [str(root) for root in envelope.allowed_roots] if envelope else [str(state.workspace.root)],
         "approval_mode": state.approval_mode,
         "sandbox_mode": envelope.sandbox_mode if envelope else "none",
+        "sandbox_backend": envelope.sandbox_backend if envelope else "none",
+        "network_mode": envelope.network_mode if envelope else "deny",
         "sandbox_enforced": envelope.sandbox_enforced if envelope else False,
         "finalization_attempted": state.finalization_attempted,
         "pending_approval_count": len(state.pending_approvals),

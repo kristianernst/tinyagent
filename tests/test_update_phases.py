@@ -6,6 +6,8 @@ import subprocess
 import sys
 from dataclasses import replace
 
+import pytest
+
 from agentd.context import BuiltContext, ContextConfig, estimate_messages_tokens, estimate_tools_tokens
 from agentd.contextfs import read_hints
 from agentd.eval_metrics import evaluate_thresholds, extract_run_metrics
@@ -863,7 +865,9 @@ def test_eval_metrics_count_policy_denial_once(tmp_path) -> None:
 
     metrics = extract_run_metrics(state.output_dir)
     assert metrics.policy_denials == 1
+    assert metrics.tool_error_count == 1
     assert metrics.tool_error_kinds["policy_denied"] == 1
+    assert "unknown" not in metrics.tool_error_kinds
 
 
 def test_eval_metrics_treat_structured_reads_as_pre_edit_inspection(tmp_path) -> None:
@@ -914,7 +918,7 @@ def test_noncritical_stable_context_respects_budget(tmp_path, monkeypatch) -> No
     assert any(exclusion.item_id == "project:instructions" for exclusion in built.excluded)
 
 
-def test_worktree_sandbox_mode_records_enforced_boundary(tmp_path) -> None:
+def test_deprecated_worktree_sandbox_alias_maps_to_workspace_mode(tmp_path) -> None:
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
     (tmp_path / "hello.txt").write_text("hello\n")
     subprocess.run(["git", "add", "hello.txt"], cwd=tmp_path, check=True, capture_output=True, text=True)
@@ -932,13 +936,116 @@ def test_worktree_sandbox_mode_records_enforced_boundary(tmp_path) -> None:
         tools=default_tools(),
         policy=LocalPolicy(),
         sandbox_mode="worktree",
-    ).run("use worktree sandbox", workspace=tmp_path, run_id="run_worktree_sandbox")
+    ).run("use worktree alias", workspace=tmp_path, run_id="run_worktree_sandbox")
 
     assert state.workspace.root != tmp_path.resolve()
     assert state.output_dir == tmp_path.resolve() / ".tinyagent" / "runs" / "run_worktree_sandbox"
     boundary = next(event for event in state.events if event.type == "workspace.boundary")
-    assert boundary.data["sandbox_mode"] == "worktree"
-    assert boundary.data["sandbox_enforced"] is True
+    assert boundary.data["mode"] == "worktree"
+    assert boundary.data["effective_mode"] == "worktree"
+    assert boundary.data["sandbox_mode"] == "none"
+    assert boundary.data["sandbox_backend"] == "none"
+    assert boundary.data["sandbox_alias"] == "worktree"
+    assert boundary.data["sandbox_enforced"] is False
+
+
+def test_container_sandbox_mode_fails_setup_until_backend_exists(tmp_path) -> None:
+    kernel = Kernel(
+        model=FakeModelProvider([ModelResponse(content="done", finish_reason="stop")]),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        sandbox_mode="container",
+    )
+
+    with pytest.raises(ValueError, match="requires a sandbox backend"):
+        kernel.run("use container sandbox", workspace=tmp_path, run_id="run_container_sandbox")
+
+
+def test_shell_execution_envelope_exposes_sandbox_contract(tmp_path) -> None:
+    state = RunState.create("contract", Workspace(tmp_path), run_id="run_shell_contract")
+    result = ShellTool().run(ToolCall(name="shell", args={"cmd": "printf ok"}), state)
+
+    envelope = result.metadata["execution_envelope"]
+    assert envelope["read_roots"] == [str(tmp_path)]
+    assert str(tmp_path) in envelope["writable_roots"]
+    assert str(state.output_dir / "home") in envelope["writable_roots"]
+    assert envelope["network_mode"] == "deny"
+    assert envelope["sandbox_backend"] == "none"
+    assert envelope["sandbox_enforced"] is False
+    assert "escalation_hint" in envelope
+
+
+def test_policy_and_sandbox_denials_have_distinct_failure_dimensions(tmp_path) -> None:
+    network_call = ToolCall(name="shell", args={"cmd": "curl https://example.com"})
+    policy_state = Kernel(
+        model=FakeModelProvider([ModelResponse(tool_calls=(network_call,)), ModelResponse(content="blocked", finish_reason="stop")]),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    ).run("deny network", workspace=tmp_path, run_id="run_policy_dimensions")
+
+    policy_result = policy_state.tool_results[0]
+    assert policy_result.failure_kind == "policy_denied"
+    assert policy_result.data["capability"] == "network"
+    assert policy_result.data["source"] == "policy"
+    assert any(observation.kind == "policy_block" and observation.data["source"] == "policy" for observation in policy_state.observations)
+
+    class SandboxBlockingHook:
+        name = "sandbox-blocking-hook"
+
+        def before_tool_call(self, state, call, decision):
+            del state, decision
+            return ToolResult(
+                tool_name=call.name,
+                call_id=call.id,
+                output="sandbox blocked command: network denied. Request approval or choose an offline path.",
+                ok=False,
+                data={
+                    "blocked": True,
+                    "failure_kind": "sandbox_blocked",
+                    "capability": "network",
+                    "source": "sandbox",
+                    "recoverability": "request_approval",
+                },
+                failure_kind="sandbox_blocked",
+            )
+
+    sandbox_state = Kernel(
+        model=FakeModelProvider([ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "printf x"}),)), ModelResponse(content="blocked", finish_reason="stop")]),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=AllowAllPolicy(),
+        hooks=[SandboxBlockingHook()],
+        workspace_mode="current",
+    ).run("synthetic sandbox block", workspace=tmp_path, run_id="run_sandbox_dimensions")
+
+    sandbox_result = sandbox_state.tool_results[0]
+    assert sandbox_result.failure_kind == "sandbox_blocked"
+    assert sandbox_result.data["source"] == "sandbox"
+    assert any(observation.kind == "sandbox_block" and observation.data["source"] == "sandbox" for observation in sandbox_state.observations)
+
+
+def test_approval_denial_preserves_original_capability(tmp_path) -> None:
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "printf x > ../outside.txt"}),)),
+                ModelResponse(content="blocked", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        approval_mode="yolo",
+        workspace_mode="current",
+    ).run("deny workspace escape approval", workspace=tmp_path, run_id="run_approval_capability")
+
+    result = state.tool_results[0]
+    assert result.failure_kind == "policy_denied"
+    assert result.data["capability"] == "external_directory"
+    assert result.data["source"] == "policy"
 
 
 def test_final_contextfs_raw_history_includes_run_completion(tmp_path) -> None:
