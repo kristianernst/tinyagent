@@ -6,7 +6,7 @@ import json
 from collections.abc import Iterable, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from agentd.context import BuiltContext, estimate_messages_tokens, estimate_tools_tokens, message_text
@@ -42,6 +42,7 @@ from agentd.tools.builtins.shell import shell_preflight
 from agentd.workspace import SandboxMode, WorkspaceMode, prepare_workspace
 
 MAX_EVENT_DATA_CHARS = 4_000
+HookErrorPolicy = Literal["fail", "record"]
 
 
 class Kernel:
@@ -63,6 +64,7 @@ class Kernel:
         workspace_mode: WorkspaceMode = "auto",
         sandbox_mode: SandboxMode = "none",
         hooks: Sequence[TinyHook] = (),
+        hook_error_policy: HookErrorPolicy = "fail",
     ) -> None:
         self.model = model
         self.profile = profile
@@ -77,6 +79,7 @@ class Kernel:
         self.workspace_mode = workspace_mode
         self.sandbox_mode = sandbox_mode
         self.hooks = tuple(hooks)
+        self.hook_error_policy = hook_error_policy
 
     def run(
         self,
@@ -102,12 +105,15 @@ class Kernel:
             run_id=resolved_run_id,
             sandbox_mode=sandbox_mode or self.sandbox_mode,
         )
+        resolved_output_dir = output_dir
+        if resolved_output_dir is None:
+            resolved_output_dir = prepared_workspace.envelope.original_root / ".tinyagent" / "runs" / resolved_run_id
         state = RunState.create(
             task,
             prepared_workspace.workspace,
             budgets=self.budgets,
             run_id=resolved_run_id,
-            output_dir=output_dir,
+            output_dir=resolved_output_dir,
             parent_run_id=parent_run_id,
             parent_event_id=parent_event_id,
             branch_name=branch_name,
@@ -115,40 +121,40 @@ class Kernel:
         state.workspace_envelope = prepared_workspace.envelope
         state.approval_mode = approval_mode or self.approval_mode
         state.status = "running"
-        self._run_hooks(state, "on_run_start", state)
         if cancel_token is not None:
             state.cancel_token = cancel_token
         use_stream = self.stream if stream is None else stream
         state.stream_sink = event_sink if event_sink is not None else self.event_sink
-        state.emit(
-            "run.started",
-            {
-                "task": task,
-                "workspace_root": str(state.workspace.root),
-                "original_workspace_root": (
-                    str(state.workspace_envelope.original_root)
-                    if state.workspace_envelope
-                    else str(Path(workspace).expanduser().resolve())
-                ),
-                "budgets": state.budgets.to_json_dict(),
-                "stream": use_stream,
-                "workspace_mode": state.workspace_envelope.mode if state.workspace_envelope else (workspace_mode or self.workspace_mode),
-                "approval_mode": state.approval_mode,
-                "sandbox_mode": state.workspace_envelope.sandbox_mode if state.workspace_envelope else (sandbox_mode or self.sandbox_mode),
-                "sandbox_enforced": bool(state.workspace_envelope.sandbox_enforced) if state.workspace_envelope else False,
-                "parent_run_id": state.parent_run_id,
-                "parent_event_id": state.parent_event_id,
-                "branch_name": state.branch_name,
-            },
-        )
-        self._emit_workspace_boundary(state, prepared_workspace.worktree_created)
-        if "shell" in self.tools:
-            state.shell_preflight = shell_preflight()
-            state.emit("shell.preflight.completed", state.shell_preflight)
-        index_path = refresh_contextfs(state)
-        state.emit("contextfs.index.updated", {"path": index_path, "phase": "startup"})
 
         try:
+            self._run_hooks(state, "on_run_start", state)
+            state.emit(
+                "run.started",
+                {
+                    "task": task,
+                    "workspace_root": str(state.workspace.root),
+                    "original_workspace_root": (
+                        str(state.workspace_envelope.original_root)
+                        if state.workspace_envelope
+                        else str(Path(workspace).expanduser().resolve())
+                    ),
+                    "budgets": state.budgets.to_json_dict(),
+                    "stream": use_stream,
+                    "workspace_mode": state.workspace_envelope.mode if state.workspace_envelope else (workspace_mode or self.workspace_mode),
+                    "approval_mode": state.approval_mode,
+                    "sandbox_mode": state.workspace_envelope.sandbox_mode if state.workspace_envelope else (sandbox_mode or self.sandbox_mode),
+                    "sandbox_enforced": bool(state.workspace_envelope.sandbox_enforced) if state.workspace_envelope else False,
+                    "parent_run_id": state.parent_run_id,
+                    "parent_event_id": state.parent_event_id,
+                    "branch_name": state.branch_name,
+                },
+            )
+            self._emit_workspace_boundary(state, prepared_workspace.worktree_created)
+            if "shell" in self.tools:
+                state.shell_preflight = shell_preflight()
+                state.emit("shell.preflight.completed", state.shell_preflight)
+            index_path = refresh_contextfs(state)
+            state.emit("contextfs.index.updated", {"path": index_path, "phase": "startup"})
             state.raise_if_cancelled()
             state.start_turn("turn-0001")
             self._run_loop(state, stream=use_stream)
@@ -456,6 +462,30 @@ class Kernel:
             return
         if isinstance(hook_result, ToolCall):
             call = hook_result
+            try:
+                decision = self.policy.evaluate(call, state)
+            except Exception as exc:
+                decision = PolicyDecision.deny(f"Policy engine error after hook mutation: {exc}")
+            self._record_policy_decision(state, call, decision)
+            tool = self.tools.get(call.name)
+            if tool is None or call.name not in visible_tool_names:
+                reason = f"Hook mutated tool call to unavailable or hidden tool: {call.name}"
+                result = ToolResult(
+                    tool_name=call.name,
+                    call_id=call.id,
+                    output=reason,
+                    ok=False,
+                    data={"blocked": True, "error_type": "HookMutatedToolNotVisible"},
+                    failure_kind="policy_denied",
+                    summary=reason,
+                    content_preview=reason,
+                )
+                self._append_tool_step(state, call, result)
+                self._record_tool_result(state, call, result)
+                self._record_tool_blocked(state, call, result.output)
+                index_path = refresh_contextfs(state)
+                state.emit("contextfs.index.updated", {"path": index_path, "tool_call_id": call.id})
+                return
         if decision.kind == "needs_approval":
             decision = self._resolve_approval(state, call, decision)
             if decision.kind == "deny":
@@ -912,6 +942,7 @@ class Kernel:
                 decision = method(state, response, decision)
             except Exception as exc:
                 state.emit("hook.failed", {"hook": name, "method": "before_finish", "reason": str(exc)}, visibility="user")
+                self._handle_hook_error(state, name, "before_finish", exc)
             else:
                 state.emit("hook.completed", {"hook": name, "method": "before_finish"})
         return decision
@@ -927,6 +958,7 @@ class Kernel:
                 method(*args)
             except Exception as exc:
                 state.emit("hook.failed", {"hook": name, "method": method_name, "reason": str(exc)}, visibility="user")
+                self._handle_hook_error(state, name, method_name, exc)
             else:
                 state.emit("hook.completed", {"hook": name, "method": method_name})
 
@@ -942,6 +974,7 @@ class Kernel:
                 current = method(state, current)
             except Exception as exc:
                 state.emit("hook.failed", {"hook": name, "method": "on_context", "reason": str(exc)}, visibility="user")
+                self._handle_hook_error(state, name, "on_context", exc)
             else:
                 state.emit("hook.completed", {"hook": name, "method": "on_context"})
         return current
@@ -958,6 +991,7 @@ class Kernel:
                 current = method(state, current)
             except Exception as exc:
                 state.emit("hook.failed", {"hook": name, "method": "after_model_response", "reason": str(exc)}, visibility="user")
+                self._handle_hook_error(state, name, "after_model_response", exc)
             else:
                 state.emit("hook.completed", {"hook": name, "method": "after_model_response"})
         return current
@@ -978,6 +1012,7 @@ class Kernel:
                     current_tools = list(returned[1])
             except Exception as exc:
                 state.emit("hook.failed", {"hook": name, "method": "before_model_call", "reason": str(exc)}, visibility="user")
+                self._handle_hook_error(state, name, "before_model_call", exc)
             else:
                 state.emit("hook.completed", {"hook": name, "method": "before_model_call"})
         return current_messages, current_tools
@@ -995,6 +1030,7 @@ class Kernel:
                 current = returned if returned is not None else current
             except Exception as exc:
                 state.emit("hook.failed", {"hook": name, "method": "before_tool_call", "reason": str(exc)}, visibility="user")
+                self._handle_hook_error(state, name, "before_tool_call", exc)
             else:
                 state.emit("hook.completed", {"hook": name, "method": "before_tool_call"})
             if isinstance(current, ToolResult):
@@ -1013,9 +1049,17 @@ class Kernel:
                 current = method(state, current)
             except Exception as exc:
                 state.emit("hook.failed", {"hook": name, "method": "after_tool_result", "reason": str(exc)}, visibility="user")
+                self._handle_hook_error(state, name, "after_tool_result", exc)
             else:
                 state.emit("hook.completed", {"hook": name, "method": "after_tool_result"})
         return current
+
+    def _handle_hook_error(self, state: RunState, hook_name: str, method_name: str, exc: Exception) -> None:
+        if self.hook_error_policy == "record":
+            return
+        reason = f"hook {hook_name}.{method_name} failed: {exc}"
+        state.fail(reason)
+        raise RuntimeError(reason) from exc
 
 
 def _small_event_data(data: dict[str, Any]) -> dict[str, Any]:

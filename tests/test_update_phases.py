@@ -7,6 +7,7 @@ import sys
 from dataclasses import replace
 
 from agentd.context import BuiltContext, ContextConfig, estimate_messages_tokens, estimate_tools_tokens
+from agentd.contextfs import read_hints
 from agentd.eval_metrics import evaluate_thresholds, extract_run_metrics
 from agentd.kernel import Kernel
 from agentd.models import FakeModelProvider
@@ -214,7 +215,7 @@ def test_declarative_policy_metadata_and_repeated_command_guard(tmp_path) -> Non
     network = policy.evaluate(ToolCall(name="shell", args={"cmd": "curl https://example.com"}), state)
     assert network.kind == "deny"
     assert network.permission == "network"
-    assert network.matched_rule == "network.deny"
+    assert network.matched_rule == "network:*:deny"
 
     failed = ToolResult(tool_name="shell", output="failed", ok=False)
     cmd = "false"
@@ -238,6 +239,7 @@ def test_declarative_policy_metadata_and_repeated_command_guard(tmp_path) -> Non
     )
     assert allowed_network.kind == "allow"
     assert allowed_network.permission == "network"
+    assert allowed_network.matched_rule == "network:*:allow"
 
 
 def test_policy_blocks_relative_redirect_workspace_escape(tmp_path) -> None:
@@ -246,6 +248,26 @@ def test_policy_blocks_relative_redirect_workspace_escape(tmp_path) -> None:
 
     assert decision.kind == "needs_approval"
     assert decision.permission == "external_directory"
+
+
+def test_policy_blocks_output_dir_evidence_writes_outside_workspace(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output_dir = tmp_path / "run-output"
+    state = RunState.create("policy", Workspace(workspace), run_id="run_policy_output", output_dir=output_dir)
+    target = output_dir / "context" / "history" / "raw.jsonl"
+
+    decision = LocalPolicy().evaluate(ToolCall(name="shell", args={"cmd": f"printf x > {target}"}), state)
+
+    assert decision.kind == "deny"
+    assert decision.permission == "run_artifact_write"
+
+
+def test_contextfs_read_hints_quote_paths_with_spaces() -> None:
+    hints = read_hints("/tmp/tiny agent/context/output file.txt", failure=True)
+
+    assert hints[0] == "tail -120 '/tmp/tiny agent/context/output file.txt'"
+    assert hints[1] == 'rg "FAILED|ERROR|Traceback|AssertionError" \'/tmp/tiny agent/context/output file.txt\''
 
 
 def test_policy_blocks_common_env_path_variants(tmp_path) -> None:
@@ -312,6 +334,7 @@ def test_worktree_sandbox_mode_records_enforced_boundary(tmp_path) -> None:
     ).run("use worktree sandbox", workspace=tmp_path, run_id="run_worktree_sandbox")
 
     assert state.workspace.root != tmp_path.resolve()
+    assert state.output_dir == tmp_path.resolve() / ".tinyagent" / "runs" / "run_worktree_sandbox"
     boundary = next(event for event in state.events if event.type == "workspace.boundary")
     assert boundary.data["sandbox_mode"] == "worktree"
     assert boundary.data["sandbox_enforced"] is True
@@ -356,6 +379,58 @@ def test_hook_can_inject_context_and_block_tool(tmp_path) -> None:
     assert any(event.type == "tool.execution.blocked" for event in state.events)
     first_context = next(event for event in state.events if event.type == "model.call.started")
     assert "hook context" in (state.output_dir / first_context.data["context_artifact"]).read_text()
+
+
+def test_hook_mutated_tool_call_is_rechecked_by_policy(tmp_path) -> None:
+    class MutatingHook:
+        name = "mutating-hook"
+
+        def before_tool_call(self, state: RunState, call: ToolCall, decision: PolicyDecision) -> ToolCall:
+            assert decision.allowed is True
+            return ToolCall(name="shell", args={"cmd": "curl https://example.com"}, id=call.id)
+
+    call = ToolCall(name="shell", args={"cmd": "git diff -- README.md"})
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(call,)),
+                ModelResponse(content="Network command was denied by policy.", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        hooks=[MutatingHook()],
+        workspace_mode="current",
+    ).run("mutate tool", workspace=tmp_path, run_id="run_hook_policy_recheck")
+
+    assert state.failed is False
+    assert "command.started" not in [event.type for event in state.events]
+    decisions = [event for event in state.events if event.type == "policy.evaluated"]
+    assert [decision.data["kind"] for decision in decisions] == ["allow", "deny"]
+    assert decisions[-1].data["permission"] == "network"
+
+
+def test_hook_failure_fails_closed_by_default(tmp_path) -> None:
+    class FailingHook:
+        name = "failing-hook"
+
+        def before_model_call(self, state: RunState, messages, tools):
+            raise RuntimeError("mandatory hook failed")
+
+    state = Kernel(
+        model=FakeModelProvider([ModelResponse(content="should not run", finish_reason="stop")]),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        hooks=[FailingHook()],
+        workspace_mode="current",
+    ).run("hook failure", workspace=tmp_path, run_id="run_hook_fail_closed")
+
+    assert state.failed is True
+    assert "mandatory hook failed" in (state.failure_reason or "")
+    assert any(event.type == "hook.failed" for event in state.events)
+    assert not any(event.type == "model.call.started" for event in state.events)
 
 
 def test_sdk_streams_same_durable_events_as_run_log(tmp_path) -> None:

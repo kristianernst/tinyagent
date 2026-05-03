@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -48,9 +49,10 @@ def write_context_tool_output(state: "RunState", call: "ToolCall", output: str, 
 
 
 def read_hints(path: str, *, failure: bool = False) -> list[str]:
-    hints = [f"tail -120 {path}"]
+    quoted = shlex.quote(path)
+    hints = [f"tail -120 {quoted}"]
     if failure:
-        hints.append(f"rg \"FAILED|ERROR|Traceback|AssertionError\" {path}")
+        hints.append(f"rg \"FAILED|ERROR|Traceback|AssertionError\" {quoted}")
     return hints
 
 
