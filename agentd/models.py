@@ -93,9 +93,10 @@ class FakeModelProvider:
     name = "fake"
     capabilities = ModelCapabilities()
 
-    def __init__(self, responses: Sequence[ModelResponse]) -> None:
+    def __init__(self, responses: Sequence[ModelResponse], *, model: str = "fake") -> None:
         self.responses = list(responses)
         self.calls = 0
+        self.model = model
 
     def complete(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState) -> ModelResponse:
         del messages, tools, state
