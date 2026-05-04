@@ -139,6 +139,30 @@ def test_observations_classify_patch_diff_verification_and_policy(tmp_path) -> N
     assert any(event.type == "observation.recorded" for event in state.events)
 
 
+def test_progress_guard_blocks_repeated_failed_command_before_policy_retry(tmp_path) -> None:
+    repeated = ToolCall(name="shell", args={"cmd": "false"})
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(repeated,)),
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "false"}),)),
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "false"}),)),
+                ModelResponse(content="Command retry was blocked after repeated failures.", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    ).run("avoid repeated failures", workspace=tmp_path, run_id="run_progress_guard_contract")
+
+    assert state.failed is False
+    blocked = state.tool_steps[-1].result
+    assert blocked.failure_kind == "progress_blocked"
+    assert blocked.data["progress_blocked"] is True
+    assert any(observation.kind == "policy_block" for observation in state.observations)
+
+
 def test_context_report_matches_final_model_request_after_hooks(tmp_path) -> None:
     class RequestHook:
         name = "request-hook"
