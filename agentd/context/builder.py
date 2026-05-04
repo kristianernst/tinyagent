@@ -65,7 +65,11 @@ class ContextBuilder:
             Message(role=item.role, content=item.text, meta={"context_layer": item.source, "context_item_id": item.id})
             for item in included
         ]
-        static_context_chars = sum(len(message_text(message)) for message in messages if message.meta.get("context_layer") != "recent_tool_steps")
+        static_context_chars = sum(
+            len(message_text(message))
+            for message in messages
+            if message.meta.get("context_layer") != "recent_tool_steps"
+        )
         tool_context_chars = len(recent_tools)
         return BuiltContext(
             messages=messages,

@@ -57,6 +57,14 @@ class EvalResult:
     artifact_bytes_written: int = 0
     compaction_count: int = 0
     repeated_tool_call_count: int = 0
+    inspected_before_edit: bool = False
+    diff_after_edit: bool = False
+    verification_after_edit: bool = False
+    progress_guard_interventions: int = 0
+    output_truncation_count: int = 0
+    large_output_artifact_count: int = 0
+    recent_tool_context_chars: int = 0
+    harness_findings: list[str] | None = None
     failure_reason: str = ""
     validation_output_path: str = ""
 
@@ -160,6 +168,7 @@ def render_eval_report(eval_run: EvalRun) -> str:
         f"tool_errors: {sum(result.tool_error_count for result in eval_run.results)}",
         f"policy_denials: {sum(result.policy_denials for result in eval_run.results)}",
         f"finish_gate_blocks: {sum(result.finish_gate_blocks for result in eval_run.results)}",
+        f"progress_guard_interventions: {sum(result.progress_guard_interventions for result in eval_run.results)}",
         "",
         "| Case | Success | Run | Validation | Turns | Tools | Errors | Policy | Finish blocks | Diff chars |",
         "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
@@ -179,6 +188,14 @@ def render_eval_report(eval_run: EvalRun) -> str:
         lines.extend(["", "## Error Kinds"])
         for kind, count in sorted(error_counts.items()):
             lines.append(f"- {kind}: {count}")
+    finding_counts: dict[str, int] = {}
+    for result in eval_run.results:
+        for finding in result.harness_findings or []:
+            finding_counts[finding] = finding_counts.get(finding, 0) + 1
+    if finding_counts:
+        lines.extend(["", "## Harness Findings"])
+        for finding, count in sorted(finding_counts.items()):
+            lines.append(f"- {finding}: {count}")
     failures = [result for result in eval_run.results if not result.success]
     if failures:
         lines.extend(["", "## Failures"])
@@ -339,6 +356,14 @@ def _result_from_record(
         artifact_bytes_written=metrics.artifact_bytes_written,
         compaction_count=metrics.compaction_count,
         repeated_tool_call_count=metrics.repeated_tool_call_count,
+        inspected_before_edit=metrics.inspected_before_edit,
+        diff_after_edit=metrics.diff_after_edit,
+        verification_after_edit=metrics.verification_after_edit,
+        progress_guard_interventions=metrics.progress_guard_interventions,
+        output_truncation_count=metrics.output_truncation_count,
+        large_output_artifact_count=metrics.large_output_artifact_count,
+        recent_tool_context_chars=metrics.recent_tool_context_chars,
+        harness_findings=metrics.harness_findings,
         failure_reason=record.failure_reason,
         validation_output_path=validation_output_path,
     )

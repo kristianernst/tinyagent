@@ -35,6 +35,7 @@ from agentd.state import (
     ApprovalResolution,
     FinishDecision,
     Message,
+    ModelResponse,
     PolicyDecision,
     RunBudgets,
     RunState,
@@ -148,9 +149,13 @@ class Kernel:
                     ),
                     "budgets": state.budgets.to_json_dict(),
                     "stream": use_stream,
-                    "workspace_mode": state.workspace_envelope.mode if state.workspace_envelope else (workspace_mode or self.workspace_mode),
+                    "workspace_mode": (
+                        state.workspace_envelope.mode if state.workspace_envelope else (workspace_mode or self.workspace_mode)
+                    ),
                     "approval_mode": state.approval_mode,
-                    "sandbox_mode": state.workspace_envelope.sandbox_mode if state.workspace_envelope else (sandbox_mode or self.sandbox_mode),
+                    "sandbox_mode": (
+                        state.workspace_envelope.sandbox_mode if state.workspace_envelope else (sandbox_mode or self.sandbox_mode)
+                    ),
                     "sandbox_enforced": bool(state.workspace_envelope.sandbox_enforced) if state.workspace_envelope else False,
                     "parent_run_id": state.parent_run_id,
                     "parent_event_id": state.parent_event_id,

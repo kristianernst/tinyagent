@@ -141,6 +141,10 @@ def test_eval_validation_runs_against_effective_worktree_workspace(tmp_path) -> 
     assert result.success is True
     assert result.validation_ok is True
     assert Path(result.workspace_path) != output_dir / "workspaces" / "edit-file"
+    assert result.diff_after_edit is True
+    assert result.verification_after_edit is False
+    assert "verification_after_edit_missing" in (result.harness_findings or [])
+    assert "## Harness Findings" in (output_dir / "report.md").read_text()
 
 
 def _write_suite(tmp_path: Path) -> Path:
