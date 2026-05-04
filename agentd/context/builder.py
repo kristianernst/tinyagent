@@ -236,7 +236,7 @@ def _select_recent_tool_indexes(
         len(steps) - 1,
         _latest_index(steps, lambda step: not step.result.ok),
         _latest_index(steps, _is_diff_or_status_step),
-        _latest_index(steps, lambda step: step.call.name == "apply_patch"),
+        _latest_index(steps, lambda step: step.call.name in {"apply_patch", "str_replace_edit", "write_file"}),
         _latest_index(steps, _is_test_step),
     }
     if plan.mode in {"debug", "verify", "finish"}:

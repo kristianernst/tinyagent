@@ -16,7 +16,7 @@ from agentd.events import EventSink, json_safe
 from agentd.extensions import Extension, ExtensionHost
 from agentd.hooks import TinyHook
 from agentd.model_stream import complete_model_call
-from agentd.models import model_capabilities
+from agentd.models import model_spec
 from agentd.observations import Observation, extract_observations
 from agentd.output import (
     capture_final_diff,
@@ -131,6 +131,7 @@ class Kernel:
             branch_name=branch_name,
         )
         state.workspace_envelope = prepared_workspace.envelope
+        state.model_spec = model_spec(self.model).to_json_dict()
         state.approval_mode = approval_mode or self.approval_mode
         state.status = "running"
         if cancel_token is not None:
@@ -202,7 +203,8 @@ class Kernel:
                 return
 
             visible_tools = list(self.profile.visible_tools(state, self.tools))
-            capabilities = model_capabilities(self.model)
+            spec = model_spec(self.model)
+            capabilities = spec.capabilities
             if visible_tools and not capabilities.supports_tools:
                 state.emit(
                     "model.call.failed",
@@ -232,6 +234,7 @@ class Kernel:
                 {
                     "message_count": len(messages),
                     "visible_tools": [tool.name for tool in visible_tools],
+                    "model_spec": spec.to_json_dict(),
                     "token_estimate": built_context.token_estimate,
                     "static_context_chars": built_context.static_context_chars,
                     "tool_context_chars": built_context.tool_context_chars,
@@ -250,7 +253,7 @@ class Kernel:
                 call_index=model_call_index,
                 built_context=built_context,
                 budget=_context_budget(self.profile, state, capabilities),
-                model_capabilities=model_capabilities(self.model),
+                model_capabilities=capabilities,
             )
             state.emit(
                 "context.report.written",
@@ -912,7 +915,7 @@ class Kernel:
             )
 
     def _record_mutation_event(self, state: RunState, event_type: str, call: ToolCall, *, ok: bool | None = None) -> None:
-        if call.name not in {"apply_patch", "shell"}:
+        if call.name not in {"apply_patch", "str_replace_edit", "write_file", "shell"}:
             return
         data: dict[str, Any] = {
             "tool_call_id": call.id,

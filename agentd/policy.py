@@ -38,7 +38,7 @@ class LocalPolicy:
                 case "search_repo":
                     resolve_workspace_path(state, call.args.get("path", "."), allow_run_artifacts=self.allow_run_artifacts)
                     return PolicyDecision.allow("search_repo path is inside workspace")
-                case "apply_patch":
+                case "apply_patch" | "str_replace_edit" | "write_file":
                     return self._evaluate_patch(call, state)
                 case "shell":
                     return self._evaluate_shell(call, state)
@@ -47,6 +47,18 @@ class LocalPolicy:
         return PolicyDecision.deny(f"Unknown tool for policy: {call.name}")
 
     def _evaluate_patch(self, call: ToolCall, state: RunState) -> PolicyDecision:
+        if call.name in {"str_replace_edit", "write_file"}:
+            path = call.args.get("path")
+            if not path:
+                return PolicyDecision.deny("Edit tool requires a path.", permission="filesystem")
+            resolve_workspace_path(state, path, allow_run_artifacts=self.allow_run_artifacts)
+            if _dirty_current_workspace(state):
+                return PolicyDecision.needs_approval(
+                    "edit would mutate a dirty current workspace",
+                    _approval_request(call, state, action_kind="dirty_mutation", risk="medium"),
+                    permission="filesystem",
+                )
+            return PolicyDecision.allow("edit path is inside workspace", permission="filesystem")
         patch = str(call.args.get("patch", ""))
         paths = patch_paths(patch)
         if not paths:

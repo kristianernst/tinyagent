@@ -22,6 +22,17 @@ class ContextConfig:
     def effective_compact_at_tokens(self) -> int:
         return min(self.compact_at_tokens, max(1, self.model_context_window - self.reserve_output_tokens))
 
+    def with_model_budget(self, *, context_window: int, max_output_tokens: int) -> ContextConfig:
+        return ContextConfig(
+            project_instruction_max_chars=self.project_instruction_max_chars,
+            max_recent_tool_tokens=self.max_recent_tool_tokens,
+            compact_after_tool_steps=self.compact_after_tool_steps,
+            model_context_window=context_window,
+            compact_at_tokens=min(self.compact_at_tokens, max(1, context_window - max_output_tokens)),
+            reserve_output_tokens=max_output_tokens,
+            shell=self.shell,
+        )
+
 
 @dataclass(frozen=True)
 class ContextPlan:

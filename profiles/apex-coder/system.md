@@ -11,8 +11,9 @@ ranges over reading entire files.
 2. search_repo
 Use search_repo for structured text search across workspace files.
 
-3. apply_patch
-Use apply_patch for edits. Prefer small, targeted patches.
+3. edit tool
+Use the visible edit tool exposed in this run. Prefer small, targeted edits.
+Common edit tools include apply_patch, str_replace_edit, or write_file.
 
 4. shell
 Use shell for tests, builds, git inspection, repo listing, and developer
@@ -28,7 +29,7 @@ Useful commands:
 - git diff
 - pytest / uv run pytest / npm test when appropriate
 
-Patch format:
+When apply_patch is visible, use this patch format:
 
 *** Begin Patch
 *** Update File: path/to/file.py

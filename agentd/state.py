@@ -236,6 +236,7 @@ class RunState:
     final_output: str = ""
     final_diff: str = ""
     workspace_envelope: WorkspaceEnvelope | None = None
+    model_spec: dict[str, Any] = field(default_factory=dict)
     approval_mode: ApprovalMode = "yolo"
     pending_approvals: dict[str, ApprovalRequest] = field(default_factory=dict)
     approval_grants: dict[str, ApprovalGrant] = field(default_factory=dict)

@@ -48,7 +48,7 @@ class ApexCoderProfile:
         )
 
     def build_context(self, state: RunState) -> BuiltContext:
-        return ContextBuilder(system_prompt=self.system_prompt(), config=self.context_config).build(
+        return ContextBuilder(system_prompt=self.system_prompt(), config=self._context_config_for_state(state)).build(
             state,
             plan=self.plan_next_context(state),
         )
@@ -89,7 +89,8 @@ class ApexCoderProfile:
         return self.build_context(state).messages
 
     def visible_tools(self, state: RunState, all_tools: Mapping[str, Tool]) -> Sequence[Tool]:
-        return [all_tools[name] for name in self.visible_tool_names if name in all_tools]
+        tool_names = _visible_tool_names_for_state(state, self.visible_tool_names)
+        return [all_tools[name] for name in tool_names if name in all_tools]
 
     def should_continue(self, state: RunState) -> bool:
         return not state.done
@@ -160,7 +161,17 @@ class ApexCoderProfile:
         return state.context_token_estimate >= self.context_config.effective_compact_at_tokens
 
     def compact(self, state: RunState) -> None:
-        compact_state(state, self.context_config)
+        compact_state(state, self._context_config_for_state(state))
+
+    def _context_config_for_state(self, state: RunState) -> ContextConfig:
+        capabilities = (state.model_spec or {}).get("capabilities")
+        if not isinstance(capabilities, dict):
+            return self.context_config
+        context_window = capabilities.get("context_window")
+        max_output_tokens = capabilities.get("max_output_tokens")
+        if not isinstance(context_window, int) or not isinstance(max_output_tokens, int):
+            return self.context_config
+        return self.context_config.with_model_budget(context_window=context_window, max_output_tokens=max_output_tokens)
 
 
 def _latest_index(steps: list[ToolStep], predicate) -> int | None:
@@ -170,13 +181,26 @@ def _latest_index(steps: list[ToolStep], predicate) -> int | None:
     return None
 
 
+def _visible_tool_names_for_state(state: RunState, configured: Sequence[str]) -> tuple[str, ...]:
+    if tuple(configured) != ApexCoderProfile.DEFAULT_VISIBLE_TOOL_NAMES:
+        return tuple(configured)
+    edit_style = str((state.model_spec or {}).get("edit_style") or "apply_patch")
+    match edit_style:
+        case "str_replace":
+            return ("read_file", "search_repo", "str_replace_edit", "shell")
+        case "whole_file":
+            return ("read_file", "search_repo", "write_file", "shell")
+        case _:
+            return ApexCoderProfile.DEFAULT_VISIBLE_TOOL_NAMES
+
+
 def _is_successful_mutation(step: ToolStep) -> bool:
     delta = step.result.metadata.get("workspace_delta") or step.result.data.get("workspace_delta") or {}
     if isinstance(delta, dict) and delta.get("mutated"):
         return True
     if not step.result.ok:
         return False
-    return step.call.name == "apply_patch" and step.result.ok
+    return step.call.name in {"apply_patch", "str_replace_edit", "write_file"} and step.result.ok
 
 
 def _is_diff_inspection(step: ToolStep) -> bool:

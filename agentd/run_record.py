@@ -114,7 +114,7 @@ def load_run_record(run_path: Path) -> RunRecord:
         event_count=int(metrics.get("event_count") or (events[-1].seq if events else 0)),
         artifact_count=sum(1 for event in events if event.type == "artifact.created"),
         command_count=len(commands),
-        patch_count=sum(1 for event in events if event.type == "patch.applied"),
+        patch_count=sum(1 for event in events if event.type in {"patch.applied", "file.edited"}),
         model_calls=model_calls,
         tool_calls=tool_calls,
         commands=commands,
