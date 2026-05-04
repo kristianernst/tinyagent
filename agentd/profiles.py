@@ -55,7 +55,7 @@ class ApexCoderProfile:
 
     def plan_next_context(self, state: RunState) -> ContextPlan:
         kinds = [observation.kind for observation in state.observations]
-        edited_index = _latest_index(state.tool_steps, _is_successful_edit)
+        edited_index = _latest_index(state.tool_steps, _is_successful_mutation)
         verification_index = _latest_index(state.tool_steps, _is_successful_verification)
         diff_index = _latest_index(state.tool_steps, _is_diff_inspection)
         latest_failed = _latest_index(state.tool_steps, lambda step: not step.result.ok)
@@ -99,11 +99,11 @@ class ApexCoderProfile:
 
     def before_finish(self, state: RunState, response: ModelResponse) -> FinishDecision:
         content = response.content or ""
-        edited_index = _latest_index(state.tool_steps, _is_successful_edit)
+        edited_index = _latest_index(state.tool_steps, _is_successful_mutation)
         if edited_index is not None:
             if _requires_git_diff(state):
                 diff_index = _latest_index(state.tool_steps, _is_diff_inspection)
-                if diff_index is None or diff_index < edited_index:
+                if diff_index is None or diff_index <= edited_index:
                     return FinishDecision.blocked(
                         "finish blocked: inspect git diff after edits",
                         "Before finalizing, inspect git diff after the latest edit.",
@@ -113,7 +113,7 @@ class ApexCoderProfile:
                     state.tool_steps,
                     lambda step: _is_changed_file_inspection(step, state.tool_steps[edited_index]),
                 )
-                if (file_inspection_index is None or file_inspection_index < edited_index) and not _mentions_diff_limitation(content):
+                if (file_inspection_index is None or file_inspection_index <= edited_index) and not _mentions_diff_limitation(content):
                     return FinishDecision.blocked(
                         "finish blocked: inspect changed files after edits",
                         "Before finalizing in this non-git workspace, inspect changed files "
@@ -170,7 +170,12 @@ def _latest_index(steps: list[ToolStep], predicate) -> int | None:
     return None
 
 
-def _is_successful_edit(step: ToolStep) -> bool:
+def _is_successful_mutation(step: ToolStep) -> bool:
+    delta = step.result.metadata.get("workspace_delta") or step.result.data.get("workspace_delta") or {}
+    if isinstance(delta, dict) and delta.get("mutated"):
+        return True
+    if not step.result.ok:
+        return False
     return step.call.name == "apply_patch" and step.result.ok
 
 
@@ -191,7 +196,7 @@ def _requires_git_diff(state: RunState) -> bool:
 def _is_changed_file_inspection(step: ToolStep, edit_step: ToolStep) -> bool:
     if not step.result.ok:
         return False
-    paths = [str(path).lower() for path in (edit_step.result.metadata.get("paths") or edit_step.result.data.get("paths") or [])]
+    paths = _changed_paths_for_step(edit_step)
     if step.call.name == "read_file":
         read_path = str(step.result.data.get("path") or step.call.args.get("path") or "").lower()
         return bool(read_path and read_path in paths)
@@ -201,6 +206,15 @@ def _is_changed_file_inspection(step: ToolStep, edit_step: ToolStep) -> bool:
     if not any(token in cmd for token in ("cat ", "sed ", "rg ", "head ", "tail ", "python", "awk ")):
         return False
     return any(path in cmd for path in paths)
+
+
+def _changed_paths_for_step(step: ToolStep) -> list[str]:
+    paths = step.result.metadata.get("paths") or step.result.data.get("paths") or []
+    if not paths:
+        delta = step.result.metadata.get("workspace_delta") or step.result.data.get("workspace_delta") or {}
+        if isinstance(delta, dict):
+            paths = delta.get("paths") or []
+    return [str(path).lower() for path in paths]
 
 
 def _is_successful_verification(step: ToolStep) -> bool:

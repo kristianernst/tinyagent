@@ -17,7 +17,7 @@ from agentd.extensions import Extension, ExtensionHost
 from agentd.hooks import TinyHook
 from agentd.model_stream import complete_model_call
 from agentd.models import model_capabilities
-from agentd.observations import extract_observations
+from agentd.observations import Observation, extract_observations
 from agentd.output import (
     capture_final_diff,
     write_context_report_artifact,
@@ -45,6 +45,7 @@ from agentd.state import (
 )
 from agentd.tools.builtins.shell import shell_preflight
 from agentd.workspace import SandboxMode, WorkspaceMode, prepare_workspace
+from agentd.workspace_delta import WorkspaceDeltaObserver
 
 MAX_EVENT_DATA_CHARS = 4_000
 HookErrorPolicy = Literal["fail", "record"]
@@ -72,6 +73,7 @@ class Kernel:
         extensions: Sequence[Extension] = (),
         hook_error_policy: HookErrorPolicy = "fail",
         progress_guard: ProgressGuard | None = None,
+        workspace_delta_observer: WorkspaceDeltaObserver | None = None,
     ) -> None:
         extension_host = ExtensionHost(extensions)
         self.model = model
@@ -89,6 +91,7 @@ class Kernel:
         self.hooks = (*tuple(hooks), *extension_host.hooks())
         self.hook_error_policy = hook_error_policy
         self.progress_guard = progress_guard or ProgressGuard()
+        self.workspace_delta_observer = workspace_delta_observer or WorkspaceDeltaObserver()
 
     def run(
         self,
@@ -579,6 +582,8 @@ class Kernel:
         tool_execution_id = f"tool-exec-{call.id}"
         self._record_mutation_event(state, "workspace.mutation.planned", call)
         self._record_mutation_event(state, "workspace.mutation.started", call)
+        state.emit("workspace.delta.started", {"tool_call_id": call.id, "tool": call.name})
+        before_delta = self.workspace_delta_observer.snapshot(state)
         state.emit("tool.execution.started", {"tool_call_id": call.id, "tool_execution_id": tool_execution_id, "tool": call.name})
         state.start_step("tool_execution", tool_execution_id, data={"tool_call_id": call.id, "tool": call.name})
         try:
@@ -613,8 +618,19 @@ class Kernel:
         result = self._after_tool_result(state, result)
         if not result.call_id:
             result = replace(result, call_id=call.id)
+        after_delta = self.workspace_delta_observer.snapshot(state)
+        workspace_delta = self.workspace_delta_observer.diff(state, before_delta, after_delta, call)
+        if workspace_delta.mutated:
+            result.metadata["workspace_delta"] = workspace_delta.to_json_dict()
+            result.data["workspace_delta"] = workspace_delta.to_json_dict()
+        else:
+            result.metadata["workspace_delta"] = workspace_delta.to_json_dict()
         self._append_tool_step(state, call, result)
         self._record_tool_result(state, call, result)
+        if workspace_delta.mutated:
+            self._record_workspace_delta(state, call, result, workspace_delta)
+        else:
+            state.emit("workspace.delta.completed", {"tool_call_id": call.id, "tool": call.name, "mutated": False, "ok": result.ok})
         index_path = refresh_contextfs(state)
         state.emit("contextfs.index.updated", {"path": index_path, "tool_call_id": call.id})
         if result.data.get("cancelled"):
@@ -626,6 +642,35 @@ class Kernel:
         self._record_mutation_event(state, "workspace.mutation.completed", call, ok=result.ok)
         if result.data.get("cancelled"):
             state.request_cancel(str(result.data.get("reason") or state.cancel_reason or "cancelled"))
+
+    def _record_workspace_delta(self, state: RunState, call: ToolCall, result: ToolResult, delta) -> None:
+        payload = {"tool_call_id": call.id, "tool": call.name, "ok": result.ok, "failure_kind": result.failure_kind, **delta.to_json_dict()}
+        state.emit("workspace.delta.completed", payload)
+        state.emit("workspace.mutation.detected", payload, visibility="user", artifact_refs=[delta.diff_artifact] if delta.diff_artifact else [])
+        if delta.diff_artifact:
+            state.emit("diff.snapshot", {"tool_call_id": call.id, "path": delta.diff_artifact, "paths": list(delta.paths)})
+        for path in delta.paths:
+            state.emit("file.changed", {"tool_call_id": call.id, "tool": call.name, "path": path})
+            state.observations.append(
+                Observation(
+                    kind="file_changed",
+                    subject=path,
+                    summary=f"{path} changed by {call.name}.",
+                    refs=(delta.diff_artifact,) if delta.diff_artifact else (),
+                    data={"path": path, "tool_call_id": call.id, "source": "workspace_delta"},
+                )
+            )
+            state.emit("observation.recorded", state.observations[-1].to_json_dict(), artifact_refs=list(state.observations[-1].refs))
+        state.observations.append(
+            Observation(
+                kind="diff_seen",
+                subject=call.id,
+                summary=f"Workspace delta captured after {call.name}.",
+                refs=(delta.diff_artifact,) if delta.diff_artifact else (),
+                data={"paths": list(delta.paths), "tool_call_id": call.id, "source": "workspace_delta"},
+            )
+        )
+        state.emit("observation.recorded", state.observations[-1].to_json_dict(), artifact_refs=list(state.observations[-1].refs))
 
     def _record_tool_result(self, state: RunState, call: ToolCall, result: ToolResult) -> None:
         if result.data.get("cancelled"):
@@ -706,6 +751,7 @@ class Kernel:
         )
         state.tool_steps.append(ToolStep(call=call, result=result))
         for observation in extract_observations(call, result, state):
+            observation.data.setdefault("tool_call_id", call.id)
             state.observations.append(observation)
             state.emit(
                 "observation.recorded",

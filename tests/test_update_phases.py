@@ -298,6 +298,385 @@ def test_finish_gate_blocks_edit_without_diff_or_verification(tmp_path) -> None:
     assert "inspect changed files" in blocked.data["reason"]
 
 
+def test_workspace_delta_detects_shell_mutation_and_blocks_early_finish(tmp_path) -> None:
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": f"{sys.executable} -c \"open('generated.txt', 'w').write('x')\""}),)),
+                ModelResponse(content="done", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    ).run("generate a file", workspace=tmp_path, run_id="run_shell_delta")
+
+    assert any(event.type == "workspace.mutation.detected" for event in state.events)
+    assert any(event.type == "file.changed" and event.data["path"] == "generated.txt" for event in state.events)
+    assert any(observation.kind == "file_changed" and observation.subject == "generated.txt" for observation in state.observations)
+    blocked = next(event for event in state.events if event.type == "finish.blocked")
+    assert "inspect changed files" in blocked.data["reason"]
+
+
+def test_workspace_delta_shell_mutation_read_file_inspection_can_finish(tmp_path) -> None:
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": f"{sys.executable} -c \"open('generated.txt', 'w').write('x')\""}),)),
+                ModelResponse(tool_calls=(ToolCall(name="read_file", args={"path": "generated.txt"}),)),
+                ModelResponse(content="Done. Could not run verification in this environment.", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    ).run("generate and inspect a file", workspace=tmp_path, run_id="run_shell_delta_read_file")
+
+    assert state.failed is False
+
+
+def test_workspace_delta_ignores_contextfs_writes_for_read_only_tools(tmp_path) -> None:
+    (tmp_path / "hello.txt").write_text("hello\n")
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(name="read_file", args={"path": "hello.txt"}),)),
+                ModelResponse(content="done", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    ).run("read only", workspace=tmp_path, run_id="run_read_only_delta")
+
+    assert state.failed is False
+    assert not any(event.type == "workspace.mutation.detected" for event in state.events)
+
+
+def test_workspace_delta_detects_edit_to_existing_untracked_git_file(tmp_path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    (tmp_path / "notes.txt").write_text("before\n")
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": f"{sys.executable} -c \"open('notes.txt', 'w').write('after')\""}),)),
+                ModelResponse(content="done", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    ).run("edit existing untracked file", workspace=tmp_path, run_id="run_untracked_delta")
+
+    assert any(event.type == "file.changed" and event.data["path"] == "notes.txt" for event in state.events)
+    mutation = next(event for event in state.events if event.type == "workspace.mutation.detected")
+    artifact = mutation.artifact_refs[0]
+    assert "Modified pre-existing untracked file" in (state.output_dir / artifact).read_text()
+
+
+def test_workspace_delta_does_not_attribute_preexisting_dirty_git_files(tmp_path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    (tmp_path / "dirty.txt").write_text("dirty before\n")
+    (tmp_path / "new.txt").write_text("new before\n")
+    subprocess.run(["git", "add", "dirty.txt"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-c", "user.email=tinyagent@example.test", "-c", "user.name=tinyagent", "commit", "-m", "init"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (tmp_path / "dirty.txt").write_text("dirty after\n")
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": f"{sys.executable} -c \"open('new.txt', 'w').write('new after')\""}),)),
+                ModelResponse(content="done", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    ).run("edit only new file", workspace=tmp_path, run_id="run_dirty_attribution")
+
+    changed = [event.data["path"] for event in state.events if event.type == "file.changed"]
+    assert "new.txt" in changed
+    assert "dirty.txt" not in changed
+
+
+def test_workspace_delta_detects_clean_to_clean_git_checkout(tmp_path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    (tmp_path / "mode.txt").write_text("one\n")
+    subprocess.run(["git", "add", "mode.txt"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-c", "user.email=tinyagent@example.test", "-c", "user.name=tinyagent", "commit", "-m", "one"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    trunk = subprocess.run(["git", "branch", "--show-current"], cwd=tmp_path, check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(["git", "checkout", "-b", "other"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    (tmp_path / "mode.txt").write_text("two\n")
+    subprocess.run(["git", "add", "mode.txt"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-c", "user.email=tinyagent@example.test", "-c", "user.name=tinyagent", "commit", "-m", "two"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(["git", "checkout", trunk], cwd=tmp_path, check=True, capture_output=True, text=True)
+
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "git checkout other"}),)),
+                ModelResponse(content="Switched branches.", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    ).run("checkout branch", workspace=tmp_path, run_id="run_clean_checkout_delta")
+
+    assert any(event.type == "file.changed" and event.data["path"] == "mode.txt" for event in state.events)
+
+
+def test_workspace_delta_handles_non_git_to_git_transition(tmp_path) -> None:
+    (tmp_path / "keep.txt").write_text("keep\n")
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(
+                    tool_calls=(
+                        ToolCall(
+                            name="shell",
+                            args={"cmd": f"git init && {sys.executable} -c \"open('created.txt', 'w').write('created')\""},
+                        ),
+                    )
+                ),
+                ModelResponse(tool_calls=(ToolCall(name="read_file", args={"path": "created.txt"}),)),
+                ModelResponse(content="Done. Could not run verification in this environment.", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    ).run("initialize git and create a file", workspace=tmp_path, run_id="run_git_transition_delta")
+
+    changed = [event.data["path"] for event in state.events if event.type == "file.changed"]
+    assert "created.txt" in changed
+    assert "keep.txt" not in changed
+
+
+def test_workspace_delta_detects_pure_git_init_transition(tmp_path) -> None:
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "git init"}),)),
+                ModelResponse(content="done", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    ).run("initialize git only", workspace=tmp_path, run_id="run_pure_git_init_delta")
+
+    mutation = next(event for event in state.events if event.type == "workspace.mutation.detected")
+    assert mutation.data["paths"] == []
+    assert "non-git -> git" in (state.output_dir / mutation.artifact_refs[0]).read_text()
+    assert any("inspect changed files" in event.data["reason"] for event in state.events if event.type == "finish.blocked")
+
+
+def test_workspace_delta_detects_pure_git_removal_transition(tmp_path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "rm -rf .git"}),)),
+                ModelResponse(content="done", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=AllowAllPolicy(),
+        workspace_mode="current",
+    ).run("remove git metadata", workspace=tmp_path, run_id="run_pure_git_remove_delta")
+
+    mutation = next(event for event in state.events if event.type == "workspace.mutation.detected")
+    assert mutation.data["paths"] == []
+    assert "git -> non-git" in (state.output_dir / mutation.artifact_refs[0]).read_text()
+
+
+def test_workspace_delta_detects_git_mode_only_mutation(tmp_path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    (tmp_path / "tracked.sh").write_text("#!/bin/sh\necho hi\n")
+    subprocess.run(["git", "add", "tracked.sh"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-c", "user.email=tinyagent@example.test", "-c", "user.name=tinyagent", "commit", "-m", "init"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "chmod +x tracked.sh"}),)),
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "git diff --summary -- tracked.sh"}),)),
+                ModelResponse(content="Done. Could not run verification in this environment.", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    ).run("chmod a tracked file", workspace=tmp_path, run_id="run_mode_delta")
+
+    assert any(event.type == "file.changed" and event.data["path"] == "tracked.sh" for event in state.events)
+
+
+def test_workspace_delta_detects_git_index_only_mutation(tmp_path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    (tmp_path / "tracked.txt").write_text("one\n")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-c", "user.email=tinyagent@example.test", "-c", "user.name=tinyagent", "commit", "-m", "init"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (tmp_path / "tracked.txt").write_text("two\n")
+
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "git add tracked.txt"}),)),
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "git diff --cached -- tracked.txt"}),)),
+                ModelResponse(content="Done. Could not run verification in this environment.", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    ).run("stage a dirty file", workspace=tmp_path, run_id="run_index_delta")
+
+    assert any(event.type == "file.changed" and event.data["path"] == "tracked.txt" for event in state.events)
+
+
+def test_workspace_delta_detects_existing_untracked_directory_file_change(tmp_path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    (tmp_path / "notes").mkdir()
+    (tmp_path / "notes" / "draft.txt").write_text("before\n")
+
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(
+                    tool_calls=(
+                        ToolCall(
+                            name="shell",
+                            args={"cmd": f"{sys.executable} -c \"open('notes/draft.txt', 'w').write('after')\""},
+                        ),
+                    )
+                ),
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "git diff -- notes/draft.txt"}),)),
+                ModelResponse(content="Done. Could not run verification in this environment.", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    ).run("edit a file inside an existing untracked dir", workspace=tmp_path, run_id="run_untracked_dir_delta")
+
+    assert any(event.type == "file.changed" and event.data["path"] == "notes/draft.txt" for event in state.events)
+
+
+def test_workspace_delta_ignores_common_generated_artifacts(tmp_path) -> None:
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": f"{sys.executable} -c \"open('.coverage', 'w').write('data')\""}),)),
+                ModelResponse(content="done", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    ).run("write generated test artifact", workspace=tmp_path, run_id="run_generated_artifact_delta")
+
+    assert state.failed is False
+    assert not any(event.type == "workspace.mutation.detected" for event in state.events)
+
+
+def test_failed_shell_mutation_still_requires_mutation_gates(tmp_path) -> None:
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": f"{sys.executable} -c \"open('failed.txt', 'w').write('x'); raise SystemExit(1)\""}),)),
+                ModelResponse(content="Command failed.", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    ).run("failed mutation", workspace=tmp_path, run_id="run_failed_mutation")
+
+    blocked = [event.data["reason"] for event in state.events if event.type == "finish.blocked"]
+    assert any("inspect changed files" in reason for reason in blocked)
+
+
+def test_eval_metrics_do_not_count_same_mutating_shell_diff_as_post_edit(tmp_path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    (tmp_path / "tracked.txt").write_text("one\n")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-c", "user.email=tinyagent@example.test", "-c", "user.name=tinyagent", "commit", "-m", "init"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(
+                    tool_calls=(
+                        ToolCall(
+                            name="shell",
+                            args={"cmd": f"{sys.executable} -c \"open('tracked.txt', 'w').write('two')\"; git diff -- tracked.txt"},
+                        ),
+                    )
+                ),
+                ModelResponse(content="done", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    ).run("mutate and inspect in one shell command", workspace=tmp_path, run_id="run_same_command_diff_metric")
+
+    metrics = extract_run_metrics(state.output_dir)
+    assert metrics.diff_after_edit is False
+
+
 def test_non_git_finish_gate_accepts_changed_file_inspection(tmp_path) -> None:
     (tmp_path / "hello.txt").write_text("hello\n")
     patch = "\n".join(
