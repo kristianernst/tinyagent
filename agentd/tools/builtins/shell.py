@@ -10,9 +10,10 @@ import time
 from typing import Any
 
 from agentd.contextfs import model_readable_path, read_hints, write_context_tool_output
+from agentd.execution import build_execution_envelope
 from agentd.run_control import RunCancelled
 from agentd.state import RunState, ToolCall, ToolResult
-from agentd.tools.core import combined_output, error_result, tool_env, visible_output, write_tool_output_artifact
+from agentd.tools.core import combined_output, error_result, visible_output, write_tool_output_artifact
 
 SHELL_PREFLIGHT_COMMANDS = ("rg", "git", "python3", "python", "sed")
 
@@ -42,25 +43,27 @@ class ShellTool:
         except ValueError as exc:
             return error_result(self.name, call, exc)
         timeout = min(max(requested_timeout, 1), state.budgets.max_shell_timeout_seconds)
+        envelope = build_execution_envelope(state, timeout_seconds=timeout)
         state.emit(
             "command.started",
             {
                 "tool_call_id": call.id,
                 "cmd": cmd,
-                "cwd": str(state.workspace.root),
+                "cwd": str(envelope.cwd),
                 "timeout_seconds": timeout,
                 "env": "sanitized",
+                "execution_envelope": envelope.to_json_dict(),
             },
         )
         try:
             process = subprocess.Popen(
                 cmd,
-                cwd=state.workspace.root,
+                cwd=envelope.cwd,
                 shell=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                env=tool_env(state),
+                env=envelope.env,
                 start_new_session=True,
             )
         except OSError as exc:
@@ -88,6 +91,7 @@ class ShellTool:
                     "output_chars": len(output),
                     "duration_ms": _duration_ms(started),
                     "failure_kind": "timeout",
+                    "execution_envelope": envelope.to_json_dict(),
                 },
             )
             return ToolResult(
@@ -112,7 +116,7 @@ class ShellTool:
                     "duration_ms": _duration_ms(started),
                     "failure_kind": "timeout",
                 },
-                metadata={"cwd": str(state.workspace.root), "command_normalized": cmd},
+                metadata={"cwd": str(envelope.cwd), "command_normalized": cmd, "execution_envelope": envelope.to_json_dict()},
                 read_hints=read_hints(context_read_path, failure=True),
             )
         except RunCancelled:
@@ -140,6 +144,7 @@ class ShellTool:
                     "escalated": state.cancel_escalated,
                     "duration_ms": _duration_ms(started),
                     "failure_kind": "unknown",
+                    "execution_envelope": envelope.to_json_dict(),
                 },
                 visibility="user",
             )
@@ -166,7 +171,7 @@ class ShellTool:
                     "duration_ms": _duration_ms(started),
                     "failure_kind": "unknown",
                 },
-                metadata={"cwd": str(state.workspace.root), "command_normalized": cmd},
+                metadata={"cwd": str(envelope.cwd), "command_normalized": cmd, "execution_envelope": envelope.to_json_dict()},
                 read_hints=read_hints(context_read_path, failure=True),
             )
 
@@ -192,6 +197,7 @@ class ShellTool:
                 "output_chars": len(output),
                 "duration_ms": _duration_ms(started),
                 "failure_kind": failure_kind,
+                "execution_envelope": envelope.to_json_dict(),
             },
         )
         return ToolResult(
@@ -216,10 +222,11 @@ class ShellTool:
                 "failure_kind": failure_kind,
             },
             metadata={
-                "cwd": str(state.workspace.root),
+                "cwd": str(envelope.cwd),
                 "stdout_chars": len(stdout),
                 "stderr_chars": len(stderr),
                 "command_normalized": cmd,
+                "execution_envelope": envelope.to_json_dict(),
             },
             read_hints=read_hints(context_read_path, failure=not ok),
         )
