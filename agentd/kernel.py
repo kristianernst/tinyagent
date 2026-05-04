@@ -170,7 +170,7 @@ class Kernel:
             )
             self._emit_workspace_boundary(state, prepared_workspace.worktree_created)
             if "shell" in self.tools:
-                state.shell_preflight = shell_preflight()
+                state.shell_preflight = shell_preflight(state)
                 state.emit("shell.preflight.completed", state.shell_preflight)
             index_path = refresh_contextfs(state)
             state.emit("contextfs.index.updated", {"path": index_path, "phase": "startup"})

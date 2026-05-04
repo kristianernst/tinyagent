@@ -7,8 +7,11 @@ import shutil
 import signal
 import subprocess
 import time
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
+from agentd.container_sandbox import ContainerSandboxConfig, build_container_command
 from agentd.contextfs import model_readable_path, read_hints, write_context_tool_output
 from agentd.execution import build_execution_envelope
 from agentd.run_control import RunCancelled
@@ -16,6 +19,14 @@ from agentd.state import RunState, ToolCall, ToolResult
 from agentd.tools.core import combined_output, error_result, visible_output, write_tool_output_artifact
 
 SHELL_PREFLIGHT_COMMANDS = ("rg", "git", "python3", "python", "sed")
+
+
+@dataclass(frozen=True)
+class _ProcessLaunch:
+    args: str | list[str]
+    shell: bool
+    container_backend: str = ""
+    cidfile: Path | None = None
 
 
 class ShellTool:
@@ -59,10 +70,11 @@ class ShellTool:
             },
         )
         try:
+            launch = _popen_command(cmd, envelope, call.id)
             process = subprocess.Popen(
-                cmd,
+                launch.args,
                 cwd=envelope.cwd,
-                shell=True,
+                shell=launch.shell,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -75,6 +87,7 @@ class ShellTool:
         try:
             stdout, stderr = _communicate_with_cancel(process, state, timeout)
         except subprocess.TimeoutExpired:
+            _terminate_container(launch)
             stdout, stderr = _terminate_process_group(process)
             output = combined_output(stdout, stderr) or f"Command timed out after {timeout}s."
             artifact = write_tool_output_artifact(state, call, "command-output", output, kind="command_output")
@@ -131,6 +144,7 @@ class ShellTool:
                 source="sigint" if state.cancel_token.reason == "sigint" else "harness",
                 escalate=state.cancel_token.escalated,
             )
+            _terminate_container(launch)
             stdout, stderr = _terminate_process_group(process)
             output = combined_output(stdout, stderr) or "Command cancelled."
             artifact = write_tool_output_artifact(state, call, "command-output", output, kind="command_output")
@@ -257,12 +271,66 @@ def _communicate_with_cancel(process: subprocess.Popen[str], state: RunState, ti
             continue
 
 
-def shell_preflight() -> dict[str, Any]:
+def shell_preflight(state: RunState | None = None) -> dict[str, Any]:
     paths = {name: shutil.which(name) for name in SHELL_PREFLIGHT_COMMANDS}
+    sandboxed = bool(state and state.workspace_envelope and state.workspace_envelope.sandbox_enforced)
     return {
         "commands": {name: path is not None for name, path in paths.items()},
         "python_available": paths["python3"] is not None or paths["python"] is not None,
+        "scope": "host" if not sandboxed else "host-preflight-for-container",
+        "authoritative": not sandboxed,
     }
+
+
+def _popen_command(cmd: str, envelope, call_id: str = "shell") -> _ProcessLaunch:
+    if not envelope.sandbox_enforced or envelope.sandbox_backend not in {"docker", "podman"}:
+        return _ProcessLaunch(args=cmd, shell=True)
+    if envelope.container_home_host is None:
+        raise OSError("container sandbox home directory is not configured")
+    envelope.container_home_host.mkdir(parents=True, exist_ok=True)
+    cid_dir = envelope.container_home_host.parent / "container-cids"
+    cid_dir.mkdir(parents=True, exist_ok=True)
+    cidfile = cid_dir / f"{_safe_name(call_id)}.cid"
+    try:
+        cidfile.unlink()
+    except FileNotFoundError:
+        pass
+    config = ContainerSandboxConfig(
+        backend=envelope.sandbox_backend,
+        image=envelope.container_image,
+        workspace_host=envelope.cwd,
+        home_host=envelope.container_home_host,
+        cidfile_host=cidfile,
+        network_mode=envelope.network_mode,
+        uid=os.getuid(),
+        gid=os.getgid(),
+    )
+    return _ProcessLaunch(
+        args=build_container_command(config, cmd),
+        shell=False,
+        container_backend=envelope.sandbox_backend,
+        cidfile=cidfile,
+    )
+
+
+def _terminate_container(launch: _ProcessLaunch) -> None:
+    if not launch.container_backend or launch.cidfile is None:
+        return
+    try:
+        container_id = launch.cidfile.read_text().strip()
+    except OSError:
+        return
+    if not container_id:
+        return
+    for args in (["kill", container_id], ["rm", "-f", container_id]):
+        try:
+            subprocess.run([launch.container_backend, *args], capture_output=True, text=True, timeout=5, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+
+
+def _safe_name(value: str) -> str:
+    return "".join(char if char.isalnum() or char in "._-" else "-" for char in value) or "shell"
 
 
 def _terminate_process_group(process: subprocess.Popen[str]) -> tuple[str, str]:
