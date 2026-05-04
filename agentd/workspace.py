@@ -9,7 +9,10 @@ from pathlib import Path
 from typing import Literal
 
 WorkspaceMode = Literal["auto", "worktree", "current"]
-SandboxMode = Literal["none", "worktree"]
+SandboxMode = Literal["none", "container", "native"]
+SandboxModeInput = Literal["none", "worktree", "container", "native"]
+NetworkMode = Literal["deny", "ask", "allow"]
+SandboxBackend = Literal["none", "docker", "podman", "seatbelt", "landlock_seccomp", "wsl2"]
 
 
 @dataclass(frozen=True)
@@ -59,7 +62,10 @@ class WorkspaceEnvelope:
     dirty_state_before: DirtyState = field(default_factory=DirtyState)
     allowed_roots: tuple[Path, ...] = ()
     sandbox_mode: SandboxMode = "none"
+    sandbox_backend: SandboxBackend = "none"
+    network_mode: NetworkMode = "ask"
     sandbox_enforced: bool = False
+    sandbox_alias: str | None = None
 
     def to_json_dict(self) -> dict[str, object]:
         return {
@@ -72,7 +78,10 @@ class WorkspaceEnvelope:
             "dirty_state_before": self.dirty_state_before.to_json_dict(),
             "allowed_roots": [str(root) for root in self.allowed_roots],
             "sandbox_mode": self.sandbox_mode,
+            "sandbox_backend": self.sandbox_backend,
+            "network_mode": self.network_mode,
             "sandbox_enforced": self.sandbox_enforced,
+            "sandbox_alias": self.sandbox_alias,
         }
 
     def contains(self, path: Path) -> bool:
@@ -98,7 +107,7 @@ def prepare_workspace(
     *,
     mode: WorkspaceMode,
     run_id: str,
-    sandbox_mode: SandboxMode = "none",
+    sandbox_mode: SandboxModeInput = "none",
 ) -> PreparedWorkspace:
     original_root = root.expanduser().resolve()
     if not original_root.exists() or not original_root.is_dir():
@@ -109,8 +118,16 @@ def prepare_workspace(
     effective_root = original_root
     worktree_path: Path | None = None
     worktree_created = False
+    requested_sandbox_mode = sandbox_mode
+    sandbox_alias: str | None = None
+    if sandbox_mode == "worktree":
+        sandbox_alias = "worktree"
+        sandbox_mode = "none"
+        mode = "worktree"
+    if sandbox_mode in {"container", "native"}:
+        raise ValueError(f"sandbox-mode={sandbox_mode} requires a sandbox backend; no backend is configured yet")
 
-    use_worktree = sandbox_mode == "worktree" or mode == "worktree" or (mode == "auto" and dirty.is_git_repo and dirty.has_head and dirty.clean)
+    use_worktree = mode == "worktree" or (mode == "auto" and dirty.is_git_repo and dirty.has_head and dirty.clean)
     if use_worktree:
         if not dirty.is_git_repo or not dirty.has_head:
             raise ValueError("workspace-mode=worktree requires a git workspace with HEAD")
@@ -133,7 +150,10 @@ def prepare_workspace(
         dirty_state_before=dirty,
         allowed_roots=(effective_root,),
         sandbox_mode=sandbox_mode,
-        sandbox_enforced=sandbox_mode == "worktree" and effective_mode == "worktree",
+        sandbox_backend="none",
+        network_mode="deny",
+        sandbox_enforced=False,
+        sandbox_alias=sandbox_alias or (requested_sandbox_mode if requested_sandbox_mode != sandbox_mode else None),
     )
     return PreparedWorkspace(workspace=Workspace(effective_root), envelope=envelope, worktree_created=worktree_created)
 

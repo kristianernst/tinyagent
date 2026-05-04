@@ -33,8 +33,8 @@ def extract_observations(call: ToolCall, result: ToolResult, state: RunState) ->
         return _read_file_observations(call, result)
     if call.name == "search_repo":
         return _search_repo_observations(call, result)
-    if result.data.get("blocked") or (result.failure_kind or result.data.get("failure_kind")) == "policy_denied":
-        return [_policy_block_observation(call, result)]
+    if result.data.get("blocked") or (result.failure_kind or result.data.get("failure_kind")) in {"policy_denied", "sandbox_blocked"}:
+        return [_block_observation(call, result)]
     if not result.ok:
         return [_command_failure_observation(call, result)]
     return []
@@ -45,7 +45,7 @@ def _shell_observations(call: ToolCall, result: ToolResult) -> list[Observation]
     refs = _result_refs(result)
     observations: list[Observation] = []
     if _is_policy_block(result):
-        observations.append(_policy_block_observation(call, result))
+        observations.append(_block_observation(call, result))
         return observations
     if _is_diff_command(cmd) and result.ok:
         observations.append(
@@ -87,7 +87,7 @@ def _patch_observations(call: ToolCall, result: ToolResult) -> list[Observation]
     paths = result.metadata.get("paths") or result.data.get("paths") or []
     observations: list[Observation] = []
     if _is_policy_block(result):
-        return [_policy_block_observation(call, result)]
+        return [_block_observation(call, result)]
     if not result.ok:
         observations.append(
             Observation(
@@ -123,7 +123,7 @@ def _patch_observations(call: ToolCall, result: ToolResult) -> list[Observation]
 
 def _read_file_observations(call: ToolCall, result: ToolResult) -> list[Observation]:
     if _is_policy_block(result):
-        return [_policy_block_observation(call, result)]
+        return [_block_observation(call, result)]
     if not result.ok:
         return [_command_failure_observation(call, result)]
     path = str(result.data.get("path") or call.args.get("path") or "")
@@ -148,7 +148,7 @@ def _read_file_observations(call: ToolCall, result: ToolResult) -> list[Observat
 
 def _search_repo_observations(call: ToolCall, result: ToolResult) -> list[Observation]:
     if _is_policy_block(result):
-        return [_policy_block_observation(call, result)]
+        return [_block_observation(call, result)]
     if not result.ok:
         return [_command_failure_observation(call, result)]
     query = str(result.data.get("query") or call.args.get("query") or "")
@@ -172,14 +172,23 @@ def _search_repo_observations(call: ToolCall, result: ToolResult) -> list[Observ
     ]
 
 
-def _policy_block_observation(call: ToolCall, result: ToolResult) -> Observation:
+def _block_observation(call: ToolCall, result: ToolResult) -> Observation:
+    failure_kind = result.failure_kind or result.data.get("failure_kind")
+    kind = "sandbox_block" if failure_kind == "sandbox_blocked" or result.data.get("source") == "sandbox" else "policy_block"
     permission = str(result.data.get("permission") or result.data.get("matched_rule") or result.failure_kind or "policy")
     return Observation(
-        kind="policy_block",
+        kind=kind,
         subject=call.name,
         summary=result.summary or _first_line(result.output) or "Tool call blocked.",
         refs=_result_refs(result),
-        data={"permission": permission, "tool_call_id": call.id},
+        data={
+            "permission": permission,
+            "tool_call_id": call.id,
+            "failure_kind": failure_kind,
+            "capability": result.data.get("capability") or permission,
+            "source": result.data.get("source") or "policy",
+            "recoverability": result.data.get("recoverability") or "choose_alternative",
+        },
     )
 
 
@@ -194,6 +203,9 @@ def _command_failure_observation(call: ToolCall, result: ToolResult, *, cmd: str
             "cmd": subject,
             "exit_code": result.exit_code,
             "failure_kind": result.failure_kind or result.data.get("failure_kind"),
+            "capability": result.data.get("capability"),
+            "source": result.data.get("source"),
+            "recoverability": result.data.get("recoverability"),
         },
     )
 

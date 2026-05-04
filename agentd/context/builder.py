@@ -124,6 +124,8 @@ def render_environment_context(state: RunState, config: ContextConfig | None = N
             f"  workspace_effective_mode: {envelope.effective_mode if envelope else 'current'}",
             f"  approval_mode: {state.approval_mode}",
             f"  sandbox_mode: {envelope.sandbox_mode if envelope else 'none'}",
+            f"  sandbox_backend: {envelope.sandbox_backend if envelope else 'none'}",
+            f"  network_mode: {envelope.network_mode if envelope else 'deny'}",
             f"  sandbox_enforced: {bool(envelope.sandbox_enforced) if envelope else False}",
             "  shell_env: sanitized",
             f"  writable_root: {state.workspace.root}",

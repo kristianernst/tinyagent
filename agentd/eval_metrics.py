@@ -62,7 +62,7 @@ def extract_run_metrics(run_path: Path) -> RunMetrics:
         elif event.type in {"tool.execution.completed", "tool.execution.failed", "tool.execution.blocked", "tool.execution.cancelled"}:
             if event.data.get("output_truncated"):
                 truncations += 1
-        if event.type in {"tool.execution.failed", "tool.execution.blocked", "tool.execution.cancelled"}:
+        if event.type in {"tool.execution.failed", "tool.execution.cancelled"}:
             kind = _error_kind(event)
             tool_error_kinds[kind] += 1
             if kind == "sandbox_blocked":

@@ -44,7 +44,7 @@ from agentd.state import (
     ToolStep,
 )
 from agentd.tools.builtins.shell import shell_preflight
-from agentd.workspace import SandboxMode, WorkspaceMode, prepare_workspace
+from agentd.workspace import SandboxModeInput, WorkspaceMode, prepare_workspace
 from agentd.workspace_delta import WorkspaceDeltaObserver
 
 MAX_EVENT_DATA_CHARS = 4_000
@@ -68,7 +68,7 @@ class Kernel:
         event_sink: EventSink | None = None,
         approval_mode: ApprovalMode = "yolo",
         workspace_mode: WorkspaceMode = "auto",
-        sandbox_mode: SandboxMode = "none",
+        sandbox_mode: SandboxModeInput = "none",
         hooks: Sequence[TinyHook] = (),
         extensions: Sequence[Extension] = (),
         hook_error_policy: HookErrorPolicy = "fail",
@@ -105,7 +105,7 @@ class Kernel:
         cancel_token: CancelToken | None = None,
         workspace_mode: WorkspaceMode | None = None,
         approval_mode: ApprovalMode | None = None,
-        sandbox_mode: SandboxMode | None = None,
+        sandbox_mode: SandboxModeInput | None = None,
         parent_run_id: str | None = None,
         parent_event_id: str | None = None,
         branch_name: str | None = None,
@@ -159,6 +159,8 @@ class Kernel:
                     "sandbox_mode": (
                         state.workspace_envelope.sandbox_mode if state.workspace_envelope else (sandbox_mode or self.sandbox_mode)
                     ),
+                    "sandbox_backend": state.workspace_envelope.sandbox_backend if state.workspace_envelope else "none",
+                    "network_mode": state.workspace_envelope.network_mode if state.workspace_envelope else "deny",
                     "sandbox_enforced": bool(state.workspace_envelope.sandbox_enforced) if state.workspace_envelope else False,
                     "parent_run_id": state.parent_run_id,
                     "parent_event_id": state.parent_event_id,
@@ -562,12 +564,13 @@ class Kernel:
             if decision.kind == "deny":
                 self._record_policy_decision(state, call, decision)
         if not decision.allowed:
+            data = _blocked_result_data(decision)
             result = ToolResult(
                 tool_name=call.name,
                 call_id=call.id,
                 output=decision.reason or "Policy denied tool call.",
                 ok=False,
-                data={"blocked": True},
+                data=data,
                 failure_kind="policy_denied",
                 summary=decision.reason or "Policy denied tool call.",
                 content_preview=decision.reason or "Policy denied tool call.",
@@ -719,6 +722,10 @@ class Kernel:
         failure_kind = result.failure_kind or result.data.get("failure_kind")
         if failure_kind:
             payload["failure_kind"] = failure_kind
+        for key in ("capability", "source", "recoverability"):
+            value = result.data.get(key)
+            if value:
+                payload[key] = value
         if result.read_hints:
             payload["read_hints"] = result.read_hints
         state.emit("tool.execution.completed" if result.ok else "tool.execution.failed", payload)
@@ -773,6 +780,9 @@ class Kernel:
                 "approval_id": approval_id,
                 "matched_rule": decision.matched_rule,
                 "permission": decision.permission,
+                "capability": decision.permission,
+                "source": "policy",
+                "recoverability": "request_approval" if decision.kind == "needs_approval" else "choose_alternative",
             },
         )
 
@@ -849,7 +859,11 @@ class Kernel:
                     scope="run",
                 )
             return PolicyDecision.allow(resolution.reason or "approved")
-        return PolicyDecision.deny(resolution.reason or f"approval {resolution.decision}")
+        return PolicyDecision.deny(
+            resolution.reason or f"approval {resolution.decision}",
+            matched_rule=decision.matched_rule,
+            permission=decision.permission,
+        )
 
     def _record_model_tool_calls(
         self,
@@ -1024,6 +1038,8 @@ class Kernel:
             "workspace_effective_mode": state.workspace_envelope.effective_mode if state.workspace_envelope else None,
             "approval_mode": state.approval_mode,
             "sandbox_mode": state.workspace_envelope.sandbox_mode if state.workspace_envelope else "none",
+            "sandbox_backend": state.workspace_envelope.sandbox_backend if state.workspace_envelope else "none",
+            "network_mode": state.workspace_envelope.network_mode if state.workspace_envelope else "deny",
             "sandbox_enforced": state.workspace_envelope.sandbox_enforced if state.workspace_envelope else False,
             "finalization_attempted": state.finalization_attempted,
         }
@@ -1241,6 +1257,19 @@ def _first_line(text: str) -> str:
 def _output_chars(result: ToolResult) -> int:
     value = result.data.get("output_chars")
     return value if isinstance(value, int) else len(result.output)
+
+
+def _blocked_result_data(decision: PolicyDecision) -> dict[str, object]:
+    capability = decision.permission or "unknown"
+    return {
+        "blocked": True,
+        "failure_kind": "policy_denied",
+        "capability": capability,
+        "source": "policy",
+        "recoverability": "request_approval" if decision.kind == "needs_approval" else "choose_alternative",
+        "permission": capability,
+        "matched_rule": decision.matched_rule,
+    }
 
 
 def _context_budget(profile: Profile, state: RunState, capabilities=None) -> int:

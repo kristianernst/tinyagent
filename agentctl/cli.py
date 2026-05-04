@@ -40,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--workspace", default=".")
     run_parser.add_argument("--workspace-mode", choices=["auto", "worktree", "current"], default="auto")
     run_parser.add_argument("--approval-mode", choices=["never", "on-request", "yolo"], default="yolo")
-    run_parser.add_argument("--sandbox-mode", choices=["none", "worktree"], default="none")
+    run_parser.add_argument("--sandbox-mode", choices=["none", "container", "native", "worktree"], default="none")
     run_parser.add_argument("--run-id")
     run_parser.add_argument("--output-dir", type=Path)
     run_parser.add_argument(
@@ -73,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument("--thresholds", type=Path)
     eval_parser.add_argument("--workspace-mode", choices=["auto", "worktree", "current"], default="current")
     eval_parser.add_argument("--approval-mode", choices=["never", "on-request", "yolo"], default="yolo")
-    eval_parser.add_argument("--sandbox-mode", choices=["none", "worktree"], default="none")
+    eval_parser.add_argument("--sandbox-mode", choices=["none", "container", "native", "worktree"], default="none")
     eval_parser.add_argument(
         "--stream",
         choices=["off", "text", "jsonl"],

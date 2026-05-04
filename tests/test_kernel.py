@@ -434,15 +434,14 @@ def test_denied_tool_call_gets_finished_event_and_counts_requested_call(tmp_path
     assert state.failed is True
     assert state.failure_reason == "Run exceeded max_turns budget."
     assert state.tool_call_count == 1
-    assert state.tool_results == [
-        ToolResult(
-            tool_name="noop",
-            output="noop denied",
-            call_id=denied_call.id,
-            ok=False,
-            data={"blocked": True},
-        )
-    ]
+    result = state.tool_results[0]
+    assert result.tool_name == "noop"
+    assert result.output == "noop denied"
+    assert result.call_id == denied_call.id
+    assert result.ok is False
+    assert result.failure_kind == "policy_denied"
+    assert result.data["blocked"] is True
+    assert result.data["source"] == "policy"
     assert "tool.execution.started" not in event_types(state)
     tool_finished = next(event for event in state.events if event.type == "tool.execution.failed")
     assert tool_finished.data["tool_call_id"] == denied_call.id
@@ -451,7 +450,9 @@ def test_denied_tool_call_gets_finished_event_and_counts_requested_call(tmp_path
     assert tool_finished.data["output"] == "noop denied"
     assert tool_finished.data["output_chars"] == len("noop denied")
     assert tool_finished.data["output_truncated"] is False
-    assert tool_finished.data["data"] == {"blocked": True}
+    assert tool_finished.data["data"]["blocked"] is True
+    assert tool_finished.data["data"]["source"] == "policy"
+    assert tool_finished.data["failure_kind"] == "policy_denied"
 
 
 def test_approval_mode_never_fails_closed_and_blocks_execution(tmp_path) -> None:

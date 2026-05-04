@@ -281,7 +281,8 @@ def test_shell_records_execution_envelope_metadata(tmp_path) -> None:
     envelope = result.metadata["execution_envelope"]
     assert envelope["cwd"] == str(tmp_path)
     assert envelope["env"] == "sanitized"
-    assert envelope["writable_roots"] == [str(tmp_path)]
+    assert str(tmp_path) in envelope["writable_roots"]
+    assert str(state.output_dir / "home") in envelope["writable_roots"]
     assert envelope["process_group_cancellation"] is True
     command = next(event for event in state.events if event.type == "command.started")
     assert command.data["execution_envelope"] == envelope
@@ -441,7 +442,10 @@ def test_shell_timeout_terminates_process_group_children(tmp_path) -> None:
     assert "command.cancelled" not in [event.type for event in state.events]
     command_finished = command_completed_events[0]
     assert command_finished.data["timeout"] is True
+    assert command_finished.data["capability"] == "process"
+    assert command_finished.data["source"] == "tool"
     assert command_finished.data["output_artifact"] == result.data["output_artifact"]
+    assert result.data["capability"] == "process"
 
 
 def test_search_repo_rg_uses_sanitized_environment(tmp_path, monkeypatch) -> None:
