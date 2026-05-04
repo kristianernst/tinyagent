@@ -32,6 +32,12 @@ class RecordingModel:
         return self.responses.pop(0)
 
 
+class AllowAllPolicy:
+    def evaluate(self, call, state):
+        del call, state
+        return PolicyDecision.allow()
+
+
 def test_toolresult_contextfs_and_context_report_contracts(tmp_path) -> None:
     call = ToolCall(name="shell", args={"cmd": f"{sys.executable} -c \"print('x' * 80)\""})
     kernel = Kernel(
@@ -162,6 +168,51 @@ def test_progress_guard_blocks_repeated_failed_command_before_policy_retry(tmp_p
     assert blocked.failure_kind == "progress_blocked"
     assert blocked.data["progress_blocked"] is True
     assert any(observation.kind == "policy_block" for observation in state.observations)
+
+
+def test_extension_host_injects_context_and_registers_visible_tool(tmp_path) -> None:
+    class ExtensionHook:
+        name = "extension-hook"
+
+        def on_context(self, state: RunState, context: BuiltContext) -> BuiltContext:
+            del state
+            return replace(context, messages=[*context.messages, Message(role="user", content="extension context")])
+
+    class ExtensionTool:
+        name = "ext_tool"
+        schema = {"name": "ext_tool", "parameters": {"type": "object", "properties": {}}}
+
+        def run(self, call, state):
+            del call, state
+            return ToolResult(tool_name=self.name, output="extension tool ok")
+
+    class Extension:
+        name = "test-extension"
+
+        def hooks(self):
+            return [ExtensionHook()]
+
+        def tools(self):
+            return [ExtensionTool()]
+
+    model = RecordingModel(
+        [
+            ModelResponse(tool_calls=(ToolCall(name="ext_tool"),)),
+            ModelResponse(content="done", finish_reason="stop"),
+        ]
+    )
+    state = Kernel(
+        model=model,
+        profile=ApexCoderProfile(visible_tool_names=("ext_tool",)),
+        tools=[],
+        policy=AllowAllPolicy(),
+        extensions=[Extension()],
+        workspace_mode="current",
+    ).run("use extension", workspace=tmp_path, run_id="run_extension_host_contract")
+
+    assert state.failed is False
+    assert model.messages[0][-1].content == "extension context"
+    assert state.tool_steps[0].result.output == "extension tool ok"
 
 
 def test_context_report_matches_final_model_request_after_hooks(tmp_path) -> None:

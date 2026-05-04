@@ -13,6 +13,7 @@ from agentd.context import BuiltContext, estimate_messages_tokens, estimate_tool
 from agentd.contextfs import refresh_contextfs
 from agentd.contracts import ApprovalHandler, Executor, LocalExecutor, ModelProvider, PolicyEngine, Profile, Tool
 from agentd.events import EventSink, json_safe
+from agentd.extensions import Extension, ExtensionHost
 from agentd.hooks import TinyHook
 from agentd.model_stream import complete_model_call
 from agentd.models import model_capabilities
@@ -67,12 +68,14 @@ class Kernel:
         workspace_mode: WorkspaceMode = "auto",
         sandbox_mode: SandboxMode = "none",
         hooks: Sequence[TinyHook] = (),
+        extensions: Sequence[Extension] = (),
         hook_error_policy: HookErrorPolicy = "fail",
         progress_guard: ProgressGuard | None = None,
     ) -> None:
+        extension_host = ExtensionHost(extensions)
         self.model = model
         self.profile = profile
-        self.tools = {tool.name: tool for tool in tools}
+        self.tools = {tool.name: tool for tool in (*tools, *extension_host.tools())}
         self.policy = policy
         self.approval_handler = approval_handler
         self.executor = executor or LocalExecutor()
@@ -82,7 +85,7 @@ class Kernel:
         self.approval_mode = approval_mode
         self.workspace_mode = workspace_mode
         self.sandbox_mode = sandbox_mode
-        self.hooks = tuple(hooks)
+        self.hooks = (*tuple(hooks), *extension_host.hooks())
         self.hook_error_policy = hook_error_policy
         self.progress_guard = progress_guard or ProgressGuard()
 
