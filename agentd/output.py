@@ -181,6 +181,11 @@ def write_context_report_artifact(
             "request_id": f"model-call-{call_index:04d}",
             "token_estimate": built_context.token_estimate,
             "budget": budget,
+            "context_plan": (
+                built_context.context_plan.to_json_dict()
+                if getattr(built_context, "context_plan", None) is not None
+                else None
+            ),
             "contextfs_index_path": built_context.contextfs_index_path,
             "included": [
                 {

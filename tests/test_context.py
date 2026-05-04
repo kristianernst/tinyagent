@@ -104,6 +104,7 @@ def test_apex_context_layers_environment_agents_task_and_budgeted_tools(tmp_path
         "environment",
         "project_instructions",
         "task",
+        "context_plan",
         "working_state",
         "recent_tool_steps",
     ]
@@ -116,6 +117,7 @@ def test_apex_context_layers_environment_agents_task_and_budgeted_tools(tmp_path
     assert "sandbox_mode: none" in environment
     assert "Prefer rg before grep." in built.messages[2].content
     assert built.messages[3].content == "Task:\ninspect and patch"
+    assert "mode: debug" in built.messages[4].content
     recent = built.messages[-1].content
     assert "failed command" in recent
     assert "git status --short" in recent

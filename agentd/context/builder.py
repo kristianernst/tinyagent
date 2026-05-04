@@ -9,7 +9,7 @@ from typing import Any
 
 from agentd.context.checkpoint import artifact_refs_from_tool_steps, is_test_command_text
 from agentd.context.instructions import load_project_instructions
-from agentd.context.types import BuiltContext, ContextConfig, ContextExclusion, ContextItem, ProjectInstructions
+from agentd.context.types import BuiltContext, ContextConfig, ContextExclusion, ContextItem, ContextPlan, ProjectInstructions
 from agentd.contracts import Tool
 from agentd.events import json_safe
 from agentd.state import Message, RunState, ToolStep
@@ -25,20 +25,27 @@ class ContextBuilder:
         self.system_prompt = system_prompt
         self.config = config or ContextConfig()
 
-    def build(self, state: RunState) -> BuiltContext:
+    def build(self, state: RunState, plan: ContextPlan | None = None) -> BuiltContext:
+        plan = plan or ContextPlan()
         project_instructions = load_project_instructions(state.workspace.root, self.config)
         environment = render_environment_context(state, self.config)
         project = render_project_instructions(project_instructions)
         task = f"Task:\n{state.task}"
+        context_plan = render_context_plan(plan)
+        observations = render_observations(state, plan)
         finish_gate = render_finish_gate_messages(state)
         contextfs_index_path, contextfs_index = render_contextfs_index(state)
         checkpoint = render_context_checkpoint(state)
-        recent_tools = render_recent_tool_steps(state, self.config)
+        recent_tools = render_recent_tool_steps(state, self.config, plan)
         candidates = [
             _item("system:profile", "system", self.system_prompt, "system_prompt", 1000, stable=True),
             _item("environment:current", "user", environment, "environment", 850, stable=True),
             _item("project:instructions", "user", project, "project_instructions", 800, stable=True),
             _item("task:current", "user", task, "task", 950, stable=True),
+            _item("context:plan", "user", context_plan, "context_plan", 875, stable=True),
+            _item("context:observations", "user", observations, "observations", 870, stable=True)
+            if observations
+            else None,
             _item("contextfs:index", "user", contextfs_index, "contextfs_index", 900, stable=True)
             if contextfs_index
             else None,
@@ -70,6 +77,7 @@ class ContextBuilder:
             included=included,
             excluded=excluded,
             contextfs_index_path=contextfs_index_path,
+            context_plan=plan,
         )
 
 
@@ -145,6 +153,36 @@ def render_context_checkpoint(state: RunState) -> str:
     return "Previous checkpoint:\nNo checkpoint yet."
 
 
+def render_context_plan(plan: ContextPlan) -> str:
+    lines = [
+        "Context plan:",
+        f"- mode: {plan.mode}",
+        f"- reason: {plan.reason}",
+    ]
+    if plan.pinned_observation_kinds:
+        lines.append(f"- pinned observations: {', '.join(sorted(plan.pinned_observation_kinds))}")
+    if plan.recent_tail_budget is not None:
+        lines.append(f"- recent tool token budget: {plan.recent_tail_budget}")
+    return "\n".join(lines)
+
+
+def render_observations(state: RunState, plan: ContextPlan) -> str:
+    observations = state.observations[-20:]
+    if plan.pinned_observation_kinds:
+        pinned = [observation for observation in observations if observation.kind in plan.pinned_observation_kinds]
+        tail = [observation for observation in observations if observation.kind not in plan.pinned_observation_kinds][-8:]
+        observations = [*pinned, *tail]
+    else:
+        observations = observations[-12:]
+    if not observations:
+        return ""
+    lines = ["Recent observations:"]
+    for observation in observations:
+        refs = f" refs={', '.join(observation.refs)}" if observation.refs else ""
+        lines.append(f"- {observation.kind}: {observation.summary}{refs}")
+    return "\n".join(lines)
+
+
 def render_contextfs_index(state: RunState) -> tuple[str | None, str]:
     relative = "context/INDEX.md"
     path = state.output_dir / relative
@@ -161,15 +199,16 @@ def render_finish_gate_messages(state: RunState) -> str:
     return "\n".join(lines)
 
 
-def render_recent_tool_steps(state: RunState, config: ContextConfig | None = None) -> str:
+def render_recent_tool_steps(state: RunState, config: ContextConfig | None = None, plan: ContextPlan | None = None) -> str:
     config = config or ContextConfig()
+    plan = plan or ContextPlan()
     steps = _tool_steps_since_checkpoint(state)
     if not steps:
         label = "None since the last checkpoint." if state.context_checkpoint else "None yet."
         return f"Recent tool results:\n{label}"
 
     rendered = [_render_tool_step(step, state) for step in steps]
-    selected_indexes = _select_recent_tool_indexes(steps, rendered, config)
+    selected_indexes = _select_recent_tool_indexes(steps, rendered, config, plan, state)
     sections = ["Recent tool results after latest checkpoint:" if state.context_checkpoint else "Recent tool results:"]
     for index in selected_indexes:
         sections.append(rendered[index])
@@ -180,7 +219,13 @@ def _tool_steps_since_checkpoint(state: RunState) -> list[ToolStep]:
     return state.tool_steps[state.context_checkpoint_tool_step_count :]
 
 
-def _select_recent_tool_indexes(steps: Sequence[ToolStep], rendered: Sequence[str], config: ContextConfig) -> list[int]:
+def _select_recent_tool_indexes(
+    steps: Sequence[ToolStep],
+    rendered: Sequence[str],
+    config: ContextConfig,
+    plan: ContextPlan,
+    state: RunState,
+) -> list[int]:
     mandatory = {
         len(steps) - 1,
         _latest_index(steps, lambda step: not step.result.ok),
@@ -188,9 +233,11 @@ def _select_recent_tool_indexes(steps: Sequence[ToolStep], rendered: Sequence[st
         _latest_index(steps, lambda step: step.call.name == "apply_patch"),
         _latest_index(steps, _is_test_step),
     }
+    if plan.mode in {"debug", "verify", "finish"}:
+        mandatory.update(_observation_tool_indexes(steps, state, plan.pinned_observation_kinds))
     selected = {index for index in mandatory if index is not None and index >= 0}
     token_count = sum(estimate_tokens(rendered[index]) for index in selected)
-    budget = max(config.max_recent_tool_tokens, 0)
+    budget = max(plan.recent_tail_budget if plan.recent_tail_budget is not None else config.max_recent_tool_tokens, 0)
 
     for index in range(len(steps) - 1, -1, -1):
         if index in selected:
@@ -200,6 +247,33 @@ def _select_recent_tool_indexes(steps: Sequence[ToolStep], rendered: Sequence[st
             selected.add(index)
             token_count += next_tokens
     return sorted(selected)
+
+
+def _observation_tool_indexes(steps: Sequence[ToolStep], state: RunState, kinds: frozenset[str]) -> set[int]:
+    indexes: set[int] = set()
+    if not kinds:
+        return indexes
+    for observation in state.observations:
+        if observation.kind not in kinds:
+            continue
+        refs = set(observation.refs)
+        call_id = observation.data.get("tool_call_id")
+        for index, step in enumerate(steps):
+            if call_id and step.call.id == call_id:
+                indexes.add(index)
+                continue
+            step_refs = {
+                ref
+                for ref in (
+                    step.result.artifact_path,
+                    step.result.data.get("context_artifact"),
+                    step.result.data.get("output_artifact"),
+                )
+                if isinstance(ref, str)
+            }
+            if refs & step_refs:
+                indexes.add(index)
+    return indexes
 
 
 def _latest_index(steps: Sequence[ToolStep], predicate: Any) -> int | None:
