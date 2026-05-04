@@ -6,7 +6,8 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from agentd.contracts import Tool
-from agentd.eval_runner import load_eval_cases, render_eval_report, run_eval_suite
+from agentd.config import VariantSpec
+from agentd.eval_runner import load_eval_cases, render_eval_comparison, render_eval_report, run_eval_comparison, run_eval_suite
 from agentd.models import FakeModelProvider
 from agentd.policy import default_policy
 from agentd.profiles import ApexCoderProfile
@@ -145,6 +146,277 @@ def test_eval_validation_runs_against_effective_worktree_workspace(tmp_path) -> 
     assert result.verification_after_edit is False
     assert "verification_after_edit_missing" in (result.harness_findings or [])
     assert "## Harness Findings" in (output_dir / "report.md").read_text()
+
+
+def test_eval_comparison_runs_fake_variants_and_writes_metadata(tmp_path) -> None:
+    suite = _write_suite(tmp_path)
+    baseline = tmp_path / "baseline.toml"
+    contextfs = tmp_path / "contextfs.toml"
+    baseline.write_text('provider = "fake"\nmodel = "baseline"\nvisible_tools = ["read_file", "search_repo", "apply_patch", "shell"]\n')
+    contextfs.write_text('provider = "fake"\nmodel = "contextfs"\nvisible_tools = ["read_file", "read_context", "search_repo", "apply_patch", "shell"]\n')
+    output_dir = tmp_path / "compare-output"
+
+    comparison = run_eval_comparison(
+        suite,
+        output_dir=output_dir,
+        variants=[VariantSpec.parse(f"baseline={baseline}"), VariantSpec.parse(f"contextfs={contextfs}")],
+        model_factory=lambda _config, task: FakeModelProvider(_fake_eval_responses(task)),
+        profile_factory=lambda config: ApexCoderProfile(visible_tool_names=config.visible_tools or None),
+        tools_factory=lambda _config: default_tools(),
+        policy_factory=lambda _config: default_policy(),
+    )
+    report = render_eval_comparison(comparison)
+
+    assert [run.variant_name for run in comparison.variants] == ["baseline", "contextfs"]
+    assert "Tinyagent Eval Comparison" in report
+    assert "config_hash" in report
+    assert "visible_tools: read_file, read_context, search_repo, apply_patch, shell" in report
+    assert comparison.variants[0].results[0].run_id == "baseline-read-file"
+    assert (output_dir / "comparison.md").exists()
+    assert (output_dir / "comparison.json").exists()
+    variant_metadata = json.loads((output_dir / "baseline" / "variant.json").read_text())
+    assert variant_metadata["suite_hash"]
+    assert "git_dirty" in variant_metadata
+    assert "git_untracked_hash" in variant_metadata
+
+
+def test_eval_comparison_passes_model_config_to_variant_factory(tmp_path) -> None:
+    suite = _write_suite(tmp_path)
+    baseline = tmp_path / "baseline.toml"
+    alternate = tmp_path / "alternate.toml"
+    baseline.write_text('provider = "fake"\nmodel = "baseline"\n')
+    alternate.write_text('provider = "fake"\nmodel = "alternate"\n')
+
+    def model_for_config(config, task):
+        if config.model == "alternate":
+            return FakeModelProvider(_fake_eval_responses(task), model=config.model)
+        bad_patch = "\n".join(
+            [
+                "*** Begin Patch",
+                "*** Update File: hello.txt",
+                "@@",
+                "-hello",
+                "+bad",
+                "*** End Patch",
+            ]
+        )
+        return FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(name="apply_patch", args={"patch": bad_patch}),)),
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "git diff -- hello.txt"}),)),
+                ModelResponse(content="done", finish_reason="stop"),
+            ],
+            model=config.model,
+        )
+
+    comparison = run_eval_comparison(
+        suite,
+        output_dir=tmp_path / "compare-models",
+        variants=[VariantSpec.parse(f"baseline={baseline}"), VariantSpec.parse(f"alternate={alternate}")],
+        model_factory=model_for_config,
+        profile_factory=lambda config: ApexCoderProfile(visible_tool_names=config.visible_tools or None),
+        tools_factory=lambda _config: default_tools(),
+        policy_factory=lambda _config: default_policy(),
+    )
+
+    assert [run.results[0].success for run in comparison.variants] == [False, True]
+
+
+def test_eval_compare_cli_runs_fake_variants(tmp_path, capsys) -> None:
+    from agentctl.cli import main
+
+    suite = _write_suite(tmp_path)
+    config = tmp_path / "variant.toml"
+    config.write_text('provider = "fake"\nmodel = "fake-variant"\n')
+    output_dir = tmp_path / "cli-compare"
+
+    exit_code = main(["eval", "compare", str(suite), "--variant", f"fake={config}", "--output-dir", str(output_dir)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "Tinyagent Eval Comparison" in captured.out
+    assert "fake" in captured.out
+    assert (output_dir / "comparison.md").exists()
+
+
+def test_eval_compare_default_output_dir_preserves_timestamp(tmp_path) -> None:
+    from agentctl.cli import _default_eval_compare_output_dir
+
+    suite = tmp_path / "suite"
+    output_dir = _default_eval_compare_output_dir(suite)
+
+    assert output_dir.name.startswith("suite-")
+    assert output_dir.name.endswith("-compare")
+    assert output_dir.parent == Path(".tinyagent") / "evals"
+
+
+def test_eval_compare_cli_exits_nonzero_for_threshold_failure(tmp_path, capsys) -> None:
+    from agentctl.cli import main
+
+    suite = _write_suite(tmp_path)
+    config = tmp_path / "variant.toml"
+    thresholds = tmp_path / "thresholds.json"
+    config.write_text('provider = "fake"\n')
+    thresholds.write_text(json.dumps({"min_solve_rate": 1.1}))
+
+    exit_code = main(["eval", "compare", str(suite), "--variant", f"fake={config}", "--thresholds", str(thresholds)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "threshold failed: fake: solve_rate" in captured.out
+
+
+def test_eval_compare_cli_returns_130_for_sigint_cancellation(tmp_path, monkeypatch) -> None:
+    import agentctl.cli as cli
+    from agentd.eval_runner import EvalComparison
+
+    suite = _write_suite(tmp_path)
+
+    def cancel_comparison(suite_path, *, output_dir, variants, model_factory, profile_factory, tools_factory, policy_factory, cancel_token, **kwargs):
+        del output_dir, variants, model_factory, profile_factory, tools_factory, policy_factory, kwargs
+        cancel_token.cancel("sigint")
+        return EvalComparison(suite_path=suite_path, output_dir=tmp_path / "cancelled", variants=[])
+
+    monkeypatch.setattr(cli, "run_eval_comparison", cancel_comparison)
+
+    assert cli.main(["eval", "compare", str(suite), "--variant", "fake"]) == 130
+
+
+def test_eval_comparison_rejects_unsafe_variant_names(tmp_path) -> None:
+    config = tmp_path / "variant.toml"
+    config.write_text('provider = "fake"\n')
+
+    try:
+        VariantSpec.parse(f"../escape={config}")
+    except ValueError as exc:
+        assert "Variant names" in str(exc)
+    else:
+        raise AssertionError("expected unsafe variant name to be rejected")
+
+
+def test_eval_comparison_rejects_unsupported_config_fields(tmp_path) -> None:
+    suite = _write_suite(tmp_path)
+    config = tmp_path / "variant.toml"
+    config.write_text('provider = "fake"\n[context]\nmode = "full"\n')
+
+    try:
+        run_eval_comparison(
+            suite,
+            output_dir=tmp_path / "compare-output",
+            variants=[VariantSpec.parse(f"bad={config}")],
+            model_factory=lambda _config, task: FakeModelProvider(_fake_eval_responses(task)),
+            profile_factory=lambda config: ApexCoderProfile(visible_tool_names=config.visible_tools or None),
+            tools_factory=lambda _config: default_tools(),
+            policy_factory=lambda _config: default_policy(),
+        )
+    except ValueError as exc:
+        assert "Unsupported eval config fields: context" in str(exc)
+    else:
+        raise AssertionError("expected unsupported config field to be rejected")
+
+
+def test_eval_comparison_rejects_unknown_config_fields(tmp_path) -> None:
+    config = tmp_path / "variant.toml"
+    config.write_text('provider = "fake"\ntypo = true\n')
+
+    try:
+        VariantSpec.parse(f"bad={config}")
+    except ValueError as exc:
+        assert "Unknown eval config fields: typo" in str(exc)
+    else:
+        raise AssertionError("expected unknown config field to be rejected")
+
+
+def test_eval_config_rejects_invalid_visible_tools_type(tmp_path) -> None:
+    config = tmp_path / "variant.toml"
+    config.write_text('provider = "fake"\nvisible_tools = "read_file"\n')
+
+    try:
+        VariantSpec.parse(f"bad={config}")
+    except ValueError as exc:
+        assert "visible_tools must be a list of strings" in str(exc)
+    else:
+        raise AssertionError("expected invalid visible_tools type to be rejected")
+
+
+def test_openai_compatible_compare_config_without_model_uses_environment(tmp_path, monkeypatch) -> None:
+    from agentctl.cli import _model_for
+
+    config = tmp_path / "variant.toml"
+    config.write_text('provider = "openai-compatible"\n')
+    variant = VariantSpec.parse(f"openai={config}")
+    monkeypatch.setenv("TINYAGENT_MODEL_API_KEY", "test-key")
+    monkeypatch.setenv("TINYAGENT_MODEL_NAME", "env-model")
+
+    provider = _model_for(variant.config.provider, "task", model_name=variant.config.model or None)
+
+    assert variant.config.model == ""
+    assert provider.config.model == "env-model"
+
+
+def test_eval_comparison_rejects_on_request_approval_mode(tmp_path) -> None:
+    suite = _write_suite(tmp_path)
+    config = tmp_path / "variant.toml"
+    config.write_text('provider = "fake"\napproval_mode = "on-request"\n')
+
+    try:
+        run_eval_comparison(
+            suite,
+            output_dir=tmp_path / "compare-output",
+            variants=[VariantSpec.parse(f"bad={config}")],
+            model_factory=lambda _config, task: FakeModelProvider(_fake_eval_responses(task)),
+            profile_factory=lambda config: ApexCoderProfile(visible_tool_names=config.visible_tools or None),
+            tools_factory=lambda _config: default_tools(),
+            policy_factory=lambda _config: default_policy(),
+        )
+    except ValueError as exc:
+        assert "approval_mode=on-request is not supported for eval compare" in str(exc)
+    else:
+        raise AssertionError("expected on-request approval mode to be rejected")
+
+
+def test_eval_comparison_stops_after_cancelled_variant(tmp_path) -> None:
+    suite = _write_cancelling_suite(tmp_path)
+    token = CancelToken()
+
+    comparison = run_eval_comparison(
+        suite,
+        output_dir=tmp_path / "compare-cancelled",
+        variants=[VariantSpec.parse("first"), VariantSpec.parse("second")],
+        model_factory=lambda _config, _task: FakeModelProvider([ModelResponse(tool_calls=(ToolCall(name="cancel"),))]),
+        profile_factory=lambda _config: AllToolsProfile(),
+        tools_factory=lambda _config: [CancellingTool()],
+        policy_factory=lambda _config: AllowAllPolicy(),
+        cancel_token=token,
+    )
+
+    assert [run.variant_name for run in comparison.variants] == ["first"]
+    assert comparison.variants[0].results[0].status == "cancelled"
+
+
+def test_eval_cases_reject_duplicate_and_unsafe_ids(tmp_path) -> None:
+    suite = tmp_path / "suite"
+    first = suite / "first"
+    second = suite / "second"
+    first.mkdir(parents=True)
+    second.mkdir()
+    (first / "task.json").write_text(json.dumps({"id": "dup", "task": "one"}))
+    (second / "task.json").write_text(json.dumps({"id": "dup", "task": "two"}))
+
+    try:
+        load_eval_cases(suite)
+    except ValueError as exc:
+        assert "Duplicate eval case id: dup" in str(exc)
+    else:
+        raise AssertionError("expected duplicate eval case id to be rejected")
+
+    (second / "task.json").write_text(json.dumps({"id": "../escape", "task": "two"}))
+    try:
+        load_eval_cases(suite)
+    except ValueError as exc:
+        assert "Invalid eval case id: ../escape" in str(exc)
+    else:
+        raise AssertionError("expected unsafe eval case id to be rejected")
 
 
 def _write_suite(tmp_path: Path) -> Path:

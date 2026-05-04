@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import re
 import shutil
 import subprocess
 from collections.abc import Callable
@@ -11,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from agentd.config import RunConfig, VariantSpec
 from agentd.contracts import ModelProvider, PolicyEngine, Profile, Tool
 from agentd.eval_metrics import evaluate_thresholds, extract_run_metrics
 from agentd.events import EventSink
@@ -21,6 +24,8 @@ from agentd.state import ApprovalMode
 from agentd.workspace import SandboxModeInput, WorkspaceMode
 
 ModelFactory = Callable[[str], ModelProvider]
+VariantModelFactory = Callable[[RunConfig, str], ModelProvider]
+CASE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
 @dataclass(frozen=True)
@@ -30,6 +35,7 @@ class EvalCase:
     validation_command: str = ""
     timeout_seconds: int = 60
     setup_git: bool = True
+    case_dir: Path = Path()
 
 
 @dataclass(frozen=True)
@@ -67,6 +73,7 @@ class EvalResult:
     harness_findings: list[str] | None = None
     failure_reason: str = ""
     validation_output_path: str = ""
+    validation_attempted: bool = False
 
     def to_json_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -77,6 +84,8 @@ class EvalRun:
     suite_path: Path
     output_dir: Path
     results: list[EvalResult]
+    variant_name: str = ""
+    variant_metadata: dict[str, Any] | None = None
 
 
 def run_eval_suite(
@@ -93,6 +102,9 @@ def run_eval_suite(
     workspace_mode: WorkspaceMode = "current",
     approval_mode: ApprovalMode = "yolo",
     sandbox_mode: SandboxModeInput = "none",
+    variant_name: str = "",
+    variant_metadata: dict[str, Any] | None = None,
+    run_id_prefix: str = "",
 ) -> EvalRun:
     suite_path = suite_path.expanduser().resolve()
     output_dir = output_dir.expanduser().resolve()
@@ -123,22 +135,35 @@ def run_eval_suite(
             workspace_mode=workspace_mode,
             approval_mode=approval_mode,
             sandbox_mode=sandbox_mode,
+            run_id_prefix=run_id_prefix,
         )
         results.append(result)
         if result.status == "cancelled":
             break
-    _write_results(output_dir, suite_path=suite_path, results=results)
-    return EvalRun(suite_path=suite_path, output_dir=output_dir, results=results)
+    _write_results(output_dir, suite_path=suite_path, results=results, variant_name=variant_name, variant_metadata=variant_metadata)
+    return EvalRun(
+        suite_path=suite_path,
+        output_dir=output_dir,
+        results=results,
+        variant_name=variant_name,
+        variant_metadata=variant_metadata,
+    )
 
 
 def load_eval_cases(suite_path: Path) -> list[EvalCase]:
     cases: list[EvalCase] = []
+    seen_ids: set[str] = set()
     for case_dir in sorted(path for path in suite_path.iterdir() if path.is_dir()):
         spec_path = case_dir / "task.json"
         if not spec_path.exists():
             continue
         spec = json.loads(spec_path.read_text())
         case_id = str(spec.get("id") or case_dir.name)
+        if not CASE_ID_PATTERN.fullmatch(case_id):
+            raise ValueError(f"Invalid eval case id: {case_id}")
+        if case_id in seen_ids:
+            raise ValueError(f"Duplicate eval case id: {case_id}")
+        seen_ids.add(case_id)
         task = str(spec["task"])
         cases.append(
             EvalCase(
@@ -147,6 +172,7 @@ def load_eval_cases(suite_path: Path) -> list[EvalCase]:
                 validation_command=str(spec.get("validation_command") or ""),
                 timeout_seconds=int(spec.get("timeout_seconds") or 60),
                 setup_git=bool(spec.get("setup_git", True)),
+                case_dir=case_dir,
             )
         )
     if not cases:
@@ -170,9 +196,24 @@ def render_eval_report(eval_run: EvalRun) -> str:
         f"finish_gate_blocks: {sum(result.finish_gate_blocks for result in eval_run.results)}",
         f"progress_guard_interventions: {sum(result.progress_guard_interventions for result in eval_run.results)}",
         "",
-        "| Case | Success | Run | Validation | Turns | Tools | Errors | Policy | Finish blocks | Diff chars |",
-        "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
+    if eval_run.variant_name or eval_run.variant_metadata:
+        metadata = eval_run.variant_metadata or {}
+        lines.extend(
+            [
+                f"variant: {eval_run.variant_name or metadata.get('name', '')}",
+                f"config_hash: {metadata.get('config_hash', '')}",
+                f"git_sha: {metadata.get('git_sha', '')}",
+                f"branch: {metadata.get('branch', '')}",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "| Case | Success | Status | Validation | Turns | Tools | Errors | Policy | Finish blocks | Diff chars |",
+            "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
     for result in eval_run.results:
         lines.append(
             "| "
@@ -209,9 +250,148 @@ def check_eval_thresholds(eval_run: EvalRun, threshold_path: Path) -> list[str]:
     return evaluate_thresholds([result.to_json_dict() for result in eval_run.results], threshold_path)
 
 
+def check_eval_comparison_thresholds(comparison: "EvalComparison", threshold_path: Path) -> list[str]:
+    failures: list[str] = []
+    for run in comparison.variants:
+        for failure in check_eval_thresholds(run, threshold_path):
+            failures.append(f"{run.variant_name}: {failure}")
+    return failures
+
+
 def default_eval_output_dir(suite_path: Path) -> Path:
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     return Path(".tinyagent") / "evals" / f"{suite_path.name}-{timestamp}"
+
+
+@dataclass(frozen=True)
+class EvalComparison:
+    suite_path: Path
+    output_dir: Path
+    variants: list[EvalRun]
+
+
+def run_eval_comparison(
+    suite_path: Path,
+    *,
+    output_dir: Path,
+    variants: list[VariantSpec],
+    model_factory: VariantModelFactory,
+    profile_factory: Callable[[RunConfig], Profile],
+    tools_factory: Callable[[RunConfig], list[Tool]],
+    policy_factory: Callable[[RunConfig], PolicyEngine],
+    stream: bool = False,
+    event_sink: EventSink | None = None,
+    cancel_token: CancelToken | None = None,
+) -> EvalComparison:
+    output_dir = output_dir.expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    runs: list[EvalRun] = []
+    seen_names: set[str] = set()
+    for variant in variants:
+        if cancel_token is not None and cancel_token.cancelled:
+            break
+        if variant.name in seen_names:
+            raise ValueError(f"Duplicate eval variant name: {variant.name}")
+        seen_names.add(variant.name)
+        variant_dir = output_dir / variant.name
+        config = variant.config
+        config.validate_supported_eval_compare()
+        suite_path_resolved = suite_path.expanduser().resolve()
+        metadata = {
+            **variant.metadata(),
+            "suite_path": str(suite_path_resolved),
+            "suite_hash": _suite_hash(suite_path_resolved),
+        }
+        run = run_eval_suite(
+            suite_path,
+            output_dir=variant_dir,
+            model_factory=lambda task, config=config: model_factory(config, task),
+            profile=profile_factory(config),
+            tools=tools_factory(config),
+            policy=policy_factory(config),
+            stream=stream,
+            event_sink=event_sink,
+            cancel_token=cancel_token,
+            workspace_mode=config.workspace_mode,  # type: ignore[arg-type]
+            approval_mode=config.approval_mode,  # type: ignore[arg-type]
+            sandbox_mode=config.sandbox_mode,  # type: ignore[arg-type]
+            variant_name=variant.name,
+            variant_metadata=metadata,
+            run_id_prefix=variant.name,
+        )
+        runs.append(run)
+        if cancel_token is not None and cancel_token.cancelled:
+            break
+        if run.results and run.results[-1].status == "cancelled":
+            break
+    comparison = EvalComparison(suite_path=suite_path, output_dir=output_dir, variants=runs)
+    _write_comparison(output_dir, comparison)
+    return comparison
+
+
+def render_eval_comparison(comparison: EvalComparison) -> str:
+    lines = [
+        "# Tinyagent Eval Comparison",
+        "",
+        f"suite: {comparison.suite_path}",
+        f"output_dir: {comparison.output_dir}",
+        "",
+        "| Variant | Solve rate | Validation rate | Tools | Errors | Policy | Sandbox | Finish blocks | Compactions | Config | Git |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
+    ]
+    for run in comparison.variants:
+        summary = _variant_summary(run)
+        metadata = run.variant_metadata or {}
+        lines.append(
+            "| "
+            f"{run.variant_name} | {summary['solve_rate']:.3f} | {summary['validation_rate']:.3f} | "
+            f"{summary['tool_calls']} | {summary['tool_errors']} | {summary['policy_denials']} | "
+            f"{summary['sandbox_blocks']} | {summary['finish_gate_blocks']} | {summary['compactions']} | "
+            f"{metadata.get('config_hash', '')} | {str(metadata.get('git_sha', ''))[:12]} |"
+        )
+    if len(comparison.variants) >= 2:
+        base = _variant_summary(comparison.variants[0])
+        lines.extend(["", "## Deltas"])
+        for run in comparison.variants[1:]:
+            current = _variant_summary(run)
+            lines.append(
+                f"- {run.variant_name}: solve_rate {current['solve_rate'] - base['solve_rate']:+.3f}, "
+                f"tool_errors {current['tool_errors'] - base['tool_errors']:+d}, "
+                f"finish_blocks {current['finish_gate_blocks'] - base['finish_gate_blocks']:+d}"
+            )
+    finding_counts: dict[str, int] = {}
+    for run in comparison.variants:
+        for result in run.results:
+            for finding in result.harness_findings or []:
+                finding_counts[finding] = finding_counts.get(finding, 0) + 1
+    if finding_counts:
+        lines.extend(["", "## Harness Categories"])
+        for finding, count in sorted(finding_counts.items()):
+            lines.append(f"- {finding}: {count}")
+    lines.extend(["", "## Metadata"])
+    for run in comparison.variants:
+        metadata = run.variant_metadata or {}
+        config = metadata.get("config", {})
+        lines.extend(
+            [
+                f"### {run.variant_name}",
+                f"- provider: {config.get('provider', '')}",
+                f"- model: {config.get('model', '')}",
+                f"- profile: {config.get('profile', '')}",
+                f"- visible_tools: {', '.join(config.get('visible_tools', []) or [])}",
+                f"- workspace_mode: {config.get('workspace_mode', '')}",
+                f"- sandbox_mode: {config.get('sandbox_mode', '')}",
+                f"- config_hash: {metadata.get('config_hash', '')}",
+                f"- config_file_hash: {metadata.get('config_file_hash', '')}",
+                f"- suite_hash: {metadata.get('suite_hash', '')}",
+                f"- git_sha: {metadata.get('git_sha', '')}",
+                f"- branch: {metadata.get('branch', '')}",
+                f"- git_dirty: {str(metadata.get('git_dirty', False)).lower()}",
+                f"- git_diff_hash: {metadata.get('git_diff_hash', '')}",
+                f"- git_untracked_hash: {metadata.get('git_untracked_hash', '')}",
+            ]
+        )
+    return "\n".join(lines) + "\n"
 
 
 def _run_case(
@@ -231,8 +411,9 @@ def _run_case(
     workspace_mode: WorkspaceMode,
     approval_mode: ApprovalMode,
     sandbox_mode: SandboxModeInput,
+    run_id_prefix: str,
 ) -> EvalResult:
-    case_dir = suite_path / case.id
+    case_dir = case.case_dir or suite_path / case.id
     _prepare_workspace(case_dir, workspace_dir, setup_git=case.setup_git)
     kernel = Kernel(
         model=model_factory(case.task),
@@ -245,10 +426,11 @@ def _run_case(
         approval_mode=approval_mode,
         sandbox_mode=sandbox_mode,
     )
+    run_id = f"{run_id_prefix}-{case.id}" if run_id_prefix else case.id
     state = kernel.run(
         case.task,
         workspace=workspace_dir,
-        run_id=case.id,
+        run_id=run_id,
         output_dir=run_dir,
         cancel_token=cancel_token,
         workspace_mode=workspace_mode,
@@ -258,10 +440,12 @@ def _run_case(
     record = load_run_record(run_dir)
     metrics = extract_run_metrics(run_dir)
     validation_exit_code = None
-    validation_ok = True
+    validation_ok = not case.validation_command
+    validation_attempted = False
     validation_output_path = ""
     validation_workspace = state.workspace.root
     if case.validation_command and record.status == "completed":
+        validation_attempted = True
         validation_exit_code, validation_output_path = _run_validation(case, validation_workspace, validation_dir)
         validation_ok = validation_exit_code == 0
     elif case.validation_command:
@@ -276,6 +460,7 @@ def _run_case(
         validation_ok=validation_ok,
         validation_exit_code=validation_exit_code,
         validation_output_path=validation_output_path,
+        validation_attempted=validation_attempted,
     )
 
 
@@ -331,6 +516,7 @@ def _result_from_record(
     validation_ok: bool,
     validation_exit_code: int | None,
     validation_output_path: str,
+    validation_attempted: bool,
 ) -> EvalResult:
     return EvalResult(
         case_id=case.id,
@@ -366,18 +552,90 @@ def _result_from_record(
         harness_findings=metrics.harness_findings,
         failure_reason=record.failure_reason,
         validation_output_path=validation_output_path,
+        validation_attempted=validation_attempted,
     )
 
 
-def _write_results(output_dir: Path, *, suite_path: Path, results: list[EvalResult]) -> None:
+def _write_results(
+    output_dir: Path,
+    *,
+    suite_path: Path,
+    results: list[EvalResult],
+    variant_name: str = "",
+    variant_metadata: dict[str, Any] | None = None,
+) -> None:
     (output_dir / "results.jsonl").write_text(
         "".join(json.dumps(result.to_json_dict(), sort_keys=True) + "\n" for result in results)
     )
-    eval_run = EvalRun(suite_path=suite_path, output_dir=output_dir, results=results)
+    if variant_metadata is not None:
+        (output_dir / "variant.json").write_text(json.dumps(variant_metadata, indent=2, sort_keys=True) + "\n")
+    eval_run = EvalRun(
+        suite_path=suite_path,
+        output_dir=output_dir,
+        results=results,
+        variant_name=variant_name,
+        variant_metadata=variant_metadata,
+    )
     (output_dir / "report.md").write_text(render_eval_report(eval_run))
+
+
+def _write_comparison(output_dir: Path, comparison: EvalComparison) -> None:
+    (output_dir / "comparison.md").write_text(render_eval_comparison(comparison))
+    (output_dir / "comparison.json").write_text(
+        json.dumps(
+            {
+                "suite_path": str(comparison.suite_path),
+                "output_dir": str(comparison.output_dir),
+                "variants": [
+                    {
+                        "name": run.variant_name,
+                        "metadata": run.variant_metadata,
+                        "summary": _variant_summary(run),
+                    }
+                    for run in comparison.variants
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+
+def _variant_summary(run: EvalRun) -> dict[str, Any]:
+    total = len(run.results)
+    successes = sum(1 for result in run.results if result.success)
+    validation_attempts = sum(1 for result in run.results if result.validation_attempted)
+    validations = sum(1 for result in run.results if result.validation_attempted and result.validation_ok)
+    return {
+        "cases": total,
+        "successes": successes,
+        "solve_rate": successes / total if total else 0.0,
+        "validation_attempts": validation_attempts,
+        "validation_rate": validations / validation_attempts if validation_attempts else 0.0,
+        "tool_calls": sum(result.tool_call_count for result in run.results),
+        "tool_errors": sum(result.tool_error_count for result in run.results),
+        "policy_denials": sum(result.policy_denials for result in run.results),
+        "sandbox_blocks": sum(result.sandbox_blocks for result in run.results),
+        "finish_gate_blocks": sum(result.finish_gate_blocks for result in run.results),
+        "compactions": sum(result.compaction_count for result in run.results),
+    }
 
 
 def _combined_output(stdout: str, stderr: str) -> str:
     if stdout and stderr:
         return f"{stdout}\n{stderr}"
     return stdout or stderr
+
+
+def _suite_hash(suite_path: Path) -> str:
+    hasher = hashlib.sha256()
+    for path in sorted(suite_path.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(suite_path).as_posix()
+        hasher.update(relative.encode())
+        hasher.update(b"\0")
+        hasher.update(path.read_bytes())
+        hasher.update(b"\0")
+    return hasher.hexdigest()[:12]

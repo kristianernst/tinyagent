@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import signal
 import sys
@@ -11,7 +12,16 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from agentd import __version__
-from agentd.eval_runner import check_eval_thresholds, default_eval_output_dir, render_eval_report, run_eval_suite
+from agentd.config import VariantSpec
+from agentd.eval_runner import (
+    check_eval_comparison_thresholds,
+    check_eval_thresholds,
+    default_eval_output_dir,
+    render_eval_comparison,
+    render_eval_report,
+    run_eval_comparison,
+    run_eval_suite,
+)
 from agentd.events import ConsoleTextSink, JsonlStreamSink, debug_level_from_env
 from agentd.kernel import Kernel
 from agentd.models import FakeModelProvider, ProviderError
@@ -97,6 +107,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    if len(argv) >= 2 and argv[0] == "eval" and argv[1] == "compare":
+        return _main_eval_compare(argv[2:])
+
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -232,11 +247,57 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
-def _model_for(provider: str, task: str):
+def _main_eval_compare(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="agentctl eval compare", description="Compare named eval variants.")
+    parser.add_argument("suite_path", type=Path, help="Directory containing eval cases.")
+    parser.add_argument("--variant", action="append", required=True, help="NAME or NAME=config.toml.")
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--thresholds", type=Path)
+    args = parser.parse_args(argv)
+    cancel_token = CancelToken()
+    try:
+        variants = [VariantSpec.parse(value) for value in args.variant]
+        output_dir = args.output_dir or _default_eval_compare_output_dir(args.suite_path)
+        with _sigint_cancel(cancel_token):
+            comparison = run_eval_comparison(
+                args.suite_path,
+                output_dir=output_dir,
+                variants=variants,
+                model_factory=lambda config, task: _model_for(config.provider, task, model_name=config.model),
+                profile_factory=lambda config: ApexCoderProfile(visible_tool_names=config.visible_tools or None),
+                tools_factory=lambda _config: default_tools(),
+                policy_factory=lambda _config: default_policy(),
+                cancel_token=cancel_token,
+            )
+    except RunCancelled:
+        print("eval compare cancelled: sigint")
+        return 130
+    except (OSError, ValueError, ProviderError) as exc:
+        print(f"eval compare error: {exc}")
+        return 1
+    print(render_eval_comparison(comparison), end="")
+    threshold_failures = check_eval_comparison_thresholds(comparison, args.thresholds) if args.thresholds else []
+    for failure in threshold_failures:
+        print(f"threshold failed: {failure}")
+    failed_variants = [run.variant_name for run in comparison.variants if any(not result.success for result in run.results)]
+    if cancel_token.cancelled:
+        return 130 if cancel_token.reason == "sigint" else 1
+    return 0 if not failed_variants and not threshold_failures and not cancel_token.cancelled else 1
+
+
+def _default_eval_compare_output_dir(suite_path: Path) -> Path:
+    default_dir = default_eval_output_dir(suite_path)
+    return default_dir.with_name(f"{default_dir.name}-compare")
+
+
+def _model_for(provider: str, task: str, *, model_name: str | None = None):
     if provider == "fake":
-        return FakeModelProvider(_fake_responses(task))
+        return FakeModelProvider(_fake_responses(task), model=model_name or "fake")
     if provider == "openai-compatible":
-        return OpenAICompatibleProvider.from_env()
+        env = dict(os.environ)
+        if model_name:
+            env["TINYAGENT_MODEL_NAME"] = model_name
+        return OpenAICompatibleProvider.from_env(env)
     raise ValueError(f"Unknown provider: {provider}")
 
 
