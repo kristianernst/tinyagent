@@ -11,6 +11,7 @@ from pathlib import Path
 from agentd.output import write_text_artifact
 from agentd.state import RunState, ToolCall
 
+MAX_UNTRACKED_DIFF_BYTES = 1_000_000
 IGNORED_NAMES = frozenset(
     {
         ".git",
@@ -47,6 +48,7 @@ class WorkspaceSnapshot:
     is_git: bool
     paths: frozenset[str] = frozenset()
     path_fingerprints: dict[str, str] = field(default_factory=dict)
+    dirty_paths: frozenset[str] = frozenset()
     manifest: dict[str, FileStat] = field(default_factory=dict)
     diff_stat: str = ""
     fingerprint: str = ""
@@ -77,6 +79,7 @@ class WorkspaceDeltaObserver:
                 is_git=True,
                 paths=frozenset(path_fingerprints),
                 path_fingerprints=path_fingerprints,
+                dirty_paths=frozenset(_dirty_git_paths(state)),
                 manifest=manifest,
                 diff_stat=_git_diff_stat(state),
                 fingerprint=_fingerprint_map(path_fingerprints),
@@ -91,7 +94,7 @@ class WorkspaceDeltaObserver:
             paths = tuple(sorted(_changed_git_paths(before.path_fingerprints, after.path_fingerprints)))
             if not paths:
                 return WorkspaceDelta(mutated=False)
-            artifact = _write_git_diff_artifact(state, paths, before.path_fingerprints)
+            artifact = _write_git_diff_artifact(state, paths, before.path_fingerprints, before.dirty_paths)
             return WorkspaceDelta(mutated=True, paths=paths, diff_stat=after.diff_stat, diff_artifact=artifact)
         if before.is_git != after.is_git:
             paths = tuple(sorted(_manifest_delta_paths(before.manifest, after.manifest)))
@@ -179,6 +182,10 @@ def _git_diff_stat(state: RunState) -> str:
     return result.stdout if result.returncode == 0 else ""
 
 
+def _dirty_git_paths(state: RunState) -> set[str]:
+    return set(_git_status_entries(state)) | set(_git_index_entries(state))
+
+
 def _git_path_fingerprints(state: RunState) -> dict[str, str]:
     fingerprints: dict[str, str] = {}
     status_entries = _git_status_entries(state)
@@ -260,11 +267,20 @@ def _changed_git_paths(before: dict[str, str], after: dict[str, str]) -> set[str
     return {path for path in before.keys() | after.keys() if before.get(path) != after.get(path)}
 
 
-def _write_git_diff_artifact(state: RunState, paths: tuple[str, ...], before_fingerprints: dict[str, str] | None = None) -> str | None:
+def _write_git_diff_artifact(
+    state: RunState,
+    paths: tuple[str, ...],
+    before_fingerprints: dict[str, str] | None = None,
+    before_dirty_paths: frozenset[str] = frozenset(),
+) -> str | None:
+    safe_tracked_paths = tuple(path for path in paths if _git_path_tracked(state, path) and path not in before_dirty_paths)
+    redacted_dirty_paths = tuple(path for path in paths if _git_path_tracked(state, path) and path in before_dirty_paths)
     try:
-        if _git_has_head(state):
+        if not safe_tracked_paths:
+            content = ""
+        elif _git_has_head(state):
             result = subprocess.run(
-                ["git", "-C", str(state.workspace.root), "diff", "--no-ext-diff", "HEAD", "--", *paths],
+                ["git", "-C", str(state.workspace.root), "diff", "--no-ext-diff", "HEAD", "--", *safe_tracked_paths],
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -272,16 +288,19 @@ def _write_git_diff_artifact(state: RunState, paths: tuple[str, ...], before_fin
             )
             content = result.stdout if result.returncode == 0 else result.stderr
         else:
-            content = _join_parts(_git_diff_cached(state, paths), _git_diff_worktree(state, paths))
+            content = _join_parts(_git_diff_cached(state, safe_tracked_paths), _git_diff_worktree(state, safe_tracked_paths))
     except (OSError, subprocess.TimeoutExpired) as exc:
         content = f"git diff unavailable: {exc}\n"
+    dirty_summary = ""
+    if redacted_dirty_paths:
+        dirty_summary = "Tracked paths already dirty before this tool call; full diff redacted:\n" + "\n".join(redacted_dirty_paths) + "\n"
     before_fingerprints = before_fingerprints or {}
     untracked_diff = "".join(
         _git_untracked_diff(state, path, existed_before=path in before_fingerprints)
         for path in paths
         if not _git_path_tracked(state, path)
     )
-    content = _join_parts(content, untracked_diff)
+    content = _join_parts(content, dirty_summary, untracked_diff)
     if not content.strip():
         content = "Workspace mutation detected, but no tracked diff was available.\nChanged paths:\n" + "\n".join(paths) + "\n"
     return write_text_artifact(state, f"workspace-delta-{state.tool_call_count:04d}.patch", content, kind="workspace_delta")
@@ -343,7 +362,7 @@ def _git_path_tracked(state: RunState, path: str) -> bool:
 
 def _git_untracked_diff(state: RunState, path: str, *, existed_before: bool) -> str:
     candidate = state.workspace.root / path
-    if not candidate.is_file():
+    if _excluded_relative(state, path) or candidate.is_symlink() or not candidate.is_file():
         return ""
     if existed_before:
         return f"diff --git a/{path} b/{path}\n# Modified pre-existing untracked file; previous content was not retained.\n"
@@ -440,9 +459,20 @@ def _write_git_transition_artifact(state: RunState, before: WorkspaceSnapshot, a
 
 def _new_file_diff_lines(path: Path) -> list[str]:
     try:
-        new_text = path.read_text(errors="replace").splitlines()
+        size = path.stat().st_size
     except OSError:
         return []
+    if path.is_symlink():
+        return []
+    if size > MAX_UNTRACKED_DIFF_BYTES:
+        return [f"Binary files /dev/null and {path.as_posix()} differ"]
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return []
+    if b"\0" in raw:
+        return [f"Binary files /dev/null and {path.as_posix()} differ"]
+    new_text = raw.decode(errors="replace").splitlines()
     return list(difflib.unified_diff([], new_text, fromfile="/dev/null", tofile=path.as_posix(), lineterm=""))
 
 
@@ -465,8 +495,19 @@ def _excluded_relative(state: RunState, path: str) -> bool:
     parts = Path(path).parts
     if any(part in IGNORED_NAMES for part in parts):
         return True
+    if _looks_like_secret_path(parts):
+        return True
     try:
         output_relative = state.output_dir.resolve().relative_to(state.workspace.root.resolve()).as_posix()
     except ValueError:
         return False
     return path == output_relative or path.startswith(f"{output_relative}/")
+
+
+def _looks_like_secret_path(parts: tuple[str, ...]) -> bool:
+    for part in parts:
+        if part == ".ssh":
+            return True
+        if part in {".env", ".npmrc", ".pypirc", ".netrc"} or part.startswith(".env."):
+            return True
+    return False

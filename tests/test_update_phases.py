@@ -9,16 +9,18 @@ from dataclasses import replace
 import pytest
 
 from agentd.context import BuiltContext, ContextConfig, estimate_messages_tokens, estimate_tools_tokens
-from agentd.contextfs import read_hints
+from agentd.contextfs import read_hints, refresh_contextfs
 from agentd.eval_metrics import evaluate_thresholds, extract_run_metrics
 from agentd.kernel import Kernel
 from agentd.models import FakeModelProvider
+from agentd.observations import Observation
+from agentd.output import write_text_artifact
 from agentd.policy import LocalPolicy, PolicyConfig, PolicyRule
 from agentd.profiles import ApexCoderProfile
 from agentd.run_graph import fork_run
 from agentd.sdk import Agent
 from agentd.state import Message, ModelResponse, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, ToolStep, Workspace
-from agentd.tools import ShellTool, default_tools
+from agentd.tools import ReadContextTool, ShellTool, default_tools
 
 
 class RecordingModel:
@@ -150,6 +152,282 @@ def test_observations_classify_patch_diff_verification_and_policy(tmp_path) -> N
     assert "verification" in kinds
     assert "policy_block" in kinds
     assert any(event.type == "observation.recorded" for event in state.events)
+
+
+def test_contextfs_recovery_files_expose_task_diff_observations_transcript_and_tools(tmp_path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    (tmp_path / "generated.txt").write_text("hello contextfs\n")
+    (tmp_path / ".env").write_text("TOKEN=secret-contextfs\n")
+    state = RunState.create("recover contextfs state", Workspace(tmp_path), run_id="run_contextfs_recovery")
+    state.output_dir.mkdir(parents=True, exist_ok=True)
+    search_output = write_text_artifact(state, "search-output-call_search.txt", "generated.txt:1:hello contextfs\n", kind="search_captured_output")
+    delta = write_text_artifact(state, "workspace-delta-0001.patch", "diff --git a/generated.txt b/generated.txt\n", kind="workspace_delta")
+    state.emit("diff.snapshot", {"tool_call_id": "call_shell", "path": delta, "paths": ["generated.txt"]})
+    state.emit("command.completed", {"cmd": f"{sys.executable} -m unittest discover -s .", "ok": True, "returncode": 0})
+    state.observations.extend(
+        [
+            Observation(kind="file_changed", subject="generated.txt", summary="generated.txt changed by shell.", refs=(delta,), data={"source": "workspace_delta"}),
+            Observation(kind="verification", subject="unittest", summary="Verification command passed.", data={"cmd": f"{sys.executable} -m unittest discover -s ."}),
+            Observation(kind="policy_block", subject="network", summary="Network command was blocked by policy.", data={"capability": "network", "source": "policy"}),
+            Observation(kind="sandbox_block", subject="filesystem", summary="Filesystem write was blocked by sandbox.", data={"capability": "filesystem", "source": "sandbox"}),
+        ]
+    )
+    search_call = ToolCall(id="call_search", name="search_repo", args={"query": "hello contextfs"})
+    search_result = ToolResult(
+        tool_name="search_repo",
+        call_id="call_search",
+        output="generated.txt:1:hello contextfs",
+        artifact_path=search_output,
+        data={"output_artifact": search_output, "query": "hello contextfs"},
+    )
+    state.tool_steps.append(ToolStep(call=search_call, result=search_result))
+    state.transcript.record_tool_call(
+        item_id="transcript-tool-call-0001",
+        turn_id="turn-0001",
+        model_call_id="model-call-0001",
+        tool_call_id="call_search",
+        tool_name="search_repo",
+        args={"query": "hello contextfs"},
+    )
+    state.transcript.record_tool_result(
+        item_id="transcript-tool-result-0002",
+        turn_id="turn-0001",
+        tool_call_id="call_search",
+        tool_name="search_repo",
+        ok=True,
+        summary="generated.txt:1:hello contextfs",
+        failure_kind=None,
+        artifact_refs=(search_output,),
+    )
+    (state.output_dir / "events.jsonl").write_text(
+        json.dumps(
+            {
+                "seq": 1,
+                "type": "command.completed",
+                "time": "2026-05-03T00:00:00Z",
+                "visibility": "debug",
+                "data": {"cmd": "curl https://example.com?token=raw-history-secret", "output_preview": "raw-history-secret"},
+                "artifact_refs": ["artifacts/model-response-0001.json"],
+            }
+        )
+        + "\n"
+    )
+    refresh_contextfs(state)
+
+    for relative in [
+        "context/INDEX.md",
+        "context/task.md",
+        "context/current_status.md",
+        "context/current_diff.patch",
+        "context/last_failure.md",
+        "context/observations.md",
+        "context/transcript.md",
+        "context/history/raw.jsonl",
+        "context/history/summary.md",
+        "context/tools/INDEX.md",
+        "context/tools/read_file.md",
+        "context/tools/read_context.md",
+        "context/tools/search_repo.md",
+        "context/tools/shell.md",
+        "context/diffs/INDEX.md",
+    ]:
+        assert (state.output_dir / relative).exists(), relative
+
+    diff = (state.output_dir / "context" / "current_diff.patch").read_text()
+    assert "generated.txt" in diff
+    assert ".tinyagent" not in diff
+    assert "secret-contextfs" not in diff
+    assert "secret-contextfs" not in (state.output_dir / "context" / "current_status.md").read_text()
+    raw_history = (state.output_dir / "context" / "history" / "raw.jsonl").read_text()
+    assert "raw-history-secret" not in raw_history
+    assert "model-response-0001" not in raw_history
+    observations = (state.output_dir / "context" / "observations.md").read_text()
+    assert "file_changed" in observations
+    assert "verification" in observations
+    transcript = (state.output_dir / "context" / "transcript.md").read_text()
+    assert "tool_call_id:" in transcript
+    assert "tool_result" in transcript
+    assert "artifacts/search-output" in (state.output_dir / "context" / "tools" / "search_repo.md").read_text()
+
+    reader = ReadContextTool()
+    for relative in [
+        "context/INDEX.md",
+        "context/current_diff.patch",
+        "context/observations.md",
+        "context/transcript.md",
+        "context/tools/search_repo.md",
+    ]:
+        result = reader.run(ToolCall(name="read_context", args={"path": relative}), state)
+        assert result.ok is True, result.output
+
+
+def test_read_context_safely_allows_recovery_artifacts_but_not_raw_model_artifacts(tmp_path) -> None:
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(name="search_repo", args={"query": "needle"}),)),
+                ModelResponse(content="done", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    ).run("context reader safety", workspace=tmp_path, run_id="run_context_reader_safety")
+
+    state.output_dir.mkdir(parents=True, exist_ok=True)
+    context_report = next(event.data["path"] for event in state.events if event.type == "artifact.created" and event.data["kind"] == "context_report")
+    search_output = next(event.data["path"] for event in state.events if event.type == "artifact.created" and event.data["kind"] == "search_captured_output")
+    reader = ReadContextTool()
+
+    assert reader.run(ToolCall(name="read_context", args={"path": "context/INDEX.md"}), state).ok is True
+    assert reader.run(ToolCall(name="read_context", args={"path": search_output}), state).ok is True
+    assert reader.run(ToolCall(name="read_context", args={"path": context_report}), state).ok is False
+    assert reader.run(ToolCall(name="read_context", args={"path": "events.jsonl"}), state).ok is False
+    assert reader.run(ToolCall(name="read_context", args={"path": "artifacts/model-response-0001.json"}), state).ok is False
+    forged_checkpoint = state.output_dir / "artifacts" / "context-checkpoint-9999.md"
+    forged_checkpoint.write_text("forged checkpoint\n")
+    assert reader.run(ToolCall(name="read_context", args={"path": "artifacts/context-checkpoint-9999.md"}), state).ok is False
+
+
+def test_contextfs_diff_excludes_custom_output_dir_symlinks_and_large_files(tmp_path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    outside = tmp_path.parent / "outside-secret.txt"
+    outside.write_text("outside-secret\n")
+    try:
+        (tmp_path / "linked-secret.txt").symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlink unavailable: {exc}")
+    (tmp_path / "big.bin").write_bytes(b"x" * 1_000_001)
+    output_dir = tmp_path / "run-output"
+    state = RunState.create("custom output contextfs", Workspace(tmp_path), run_id="run_custom_output", output_dir=output_dir)
+    state.output_dir.mkdir(parents=True, exist_ok=True)
+
+    refresh_contextfs(state)
+    refresh_contextfs(state)
+
+    diff = (state.output_dir / "context" / "current_diff.patch").read_text()
+    status = (state.output_dir / "context" / "current_status.md").read_text()
+    assert "outside-secret" not in diff
+    assert "linked-secret.txt" not in diff
+    assert "run-output" not in diff
+    assert "run-output" not in status
+    assert "big.bin" in diff
+    assert "Binary files /dev/null and b/big.bin differ" in diff
+
+
+def test_read_context_blocks_stale_context_files_not_generated_this_run(tmp_path) -> None:
+    state = RunState.create("stale context", Workspace(tmp_path), run_id="run_stale_context")
+    stale = state.output_dir / "context" / "shell" / "0001-stale.txt"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("stale-secret\n")
+    refresh_contextfs(state)
+
+    result = ReadContextTool().run(ToolCall(name="read_context", args={"path": "context/shell/0001-stale.txt"}), state)
+
+    assert result.ok is False
+    assert "not part of the current run recovery surface" in result.output
+
+
+def test_contextfs_sanitizes_transcript_observations_and_workspace_delta_artifacts(tmp_path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    outside = tmp_path.parent / "delta-outside-secret.txt"
+    outside.write_text("delta-outside-secret\n")
+    try:
+        (tmp_path / "linked-secret.txt").symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlink unavailable: {exc}")
+    (tmp_path / ".env").write_text("TOKEN=workspace-delta-secret\n")
+    (tmp_path / "created.txt").write_text("old\n")
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": f"printf 'visible\\n' > created.txt && {sys.executable} -c \"open('big.bin', 'wb').write(b'x' * 1000001)\""}),)),
+                ModelResponse(content="Done. Could not run verification in this environment.", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    ).run("workspace delta sanitizer", workspace=tmp_path, run_id="run_delta_sanitizer")
+
+    artifact = next(event.artifact_refs[0] for event in state.events if event.type == "workspace.mutation.detected")
+    delta_text = (state.output_dir / artifact).read_text()
+    assert "workspace-delta-secret" not in delta_text
+    assert "delta-outside-secret" not in delta_text
+    assert "linked-secret.txt" not in delta_text
+    assert "Binary files /dev/null and" in delta_text
+
+    state.observations.append(
+        Observation(
+            kind="hook",
+            subject="artifacts/model-response-0001.json",
+            summary="command used TOKEN=secret-value against artifacts/model-response-0001.json",
+            refs=("artifacts/model-response-0001.json",),
+            data={"cmd": "curl https://example.com?token=secret-value", "artifact": "artifacts/model-response-0001.json"},
+        )
+    )
+    state.transcript.record_tool_call(
+        item_id="transcript-tool-call-sanitize",
+        turn_id="turn-x",
+        model_call_id="model-call-x",
+        tool_call_id="call_sanitize",
+        tool_name="shell",
+        args={"cmd": "curl https://example.com?token=secret-value"},
+    )
+    refresh_contextfs(state)
+    transcript = (state.output_dir / "context" / "transcript.md").read_text()
+    observations = (state.output_dir / "context" / "observations.md").read_text()
+    assert "secret-value" not in transcript
+    assert "secret-value" not in observations
+    assert "artifacts/model-response-0001" not in transcript
+    assert "artifacts/model-response-0001" not in observations
+
+
+def test_workspace_delta_redacts_preexisting_dirty_tracked_diffs_from_contextfs(tmp_path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    (tmp_path / "secret.txt").write_text("clean\n")
+    subprocess.run(["git", "add", "secret.txt"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    (tmp_path / "secret.txt").write_text("dirty-secret\n")
+
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "git add secret.txt"}),)),
+                ModelResponse(content="Done. Could not run verification in this environment.", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    ).run("stage dirty file", workspace=tmp_path, run_id="run_dirty_tracked_delta")
+
+    artifact = next(event.artifact_refs[0] for event in state.events if event.type == "workspace.mutation.detected")
+    delta_text = (state.output_dir / artifact).read_text()
+    assert "dirty-secret" not in delta_text
+    assert "full diff redacted" in delta_text
+    refresh_contextfs(state)
+    copied_diff = (state.output_dir / "context" / "diffs" / "0001-workspace-delta-0001.patch").read_text()
+    assert "dirty-secret" not in copied_diff
+
+
+def test_contextfs_sanitizes_compacted_history(tmp_path) -> None:
+    state = RunState.create("compact safety", Workspace(tmp_path), run_id="run_safe_compact")
+    state.output_dir.mkdir(parents=True, exist_ok=True)
+    artifact = write_text_artifact(state, "context-checkpoint-0001.md", "raw checkpoint", kind="context_checkpoint")
+    state.context_checkpoint_artifact = artifact
+    state.context_checkpoint = "cmd: curl https://example.com?token=checkpoint-secret\nartifact: artifacts/model-response-0001.json"
+
+    refresh_contextfs(state)
+    compacted = (state.output_dir / "context" / "history" / "compacted.md").read_text()
+    checkpoint = ReadContextTool().run(ToolCall(name="read_context", args={"path": artifact}), state)
+
+    assert "checkpoint-secret" not in compacted
+    assert "artifacts/model-response-0001" not in compacted
+    assert checkpoint.ok is True
 
 
 def test_progress_guard_blocks_repeated_failed_command_before_policy_retry(tmp_path) -> None:

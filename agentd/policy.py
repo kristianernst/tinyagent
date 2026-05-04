@@ -38,6 +38,8 @@ class LocalPolicy:
                 case "search_repo":
                     resolve_workspace_path(state, call.args.get("path", "."), allow_run_artifacts=self.allow_run_artifacts)
                     return PolicyDecision.allow("search_repo path is inside workspace")
+                case "read_context":
+                    return PolicyDecision.allow("read_context path is constrained to safe ContextFS recovery files")
                 case "apply_patch" | "str_replace_edit" | "write_file":
                     return self._evaluate_patch(call, state)
                 case "shell":

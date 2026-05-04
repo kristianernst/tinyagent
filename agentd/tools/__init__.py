@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from agentd.contracts import Tool
+from agentd.tools.context import ReadContextTool
 from agentd.tools.builtins.edit import StrReplaceEditTool, WriteFileTool
 from agentd.tools.builtins.patch import ApplyPatchTool, patch_paths
 from agentd.tools.builtins.shell import ShellTool
@@ -16,7 +17,7 @@ def builtin_tools() -> list[Tool]:
 
 
 def all_tools() -> list[Tool]:
-    return [*builtin_tools(), *_repo_inspect_tools()]
+    return [*builtin_tools(), *_repo_inspect_tools(), ReadContextTool()]
 
 
 def default_tools() -> list[Tool]:
@@ -27,6 +28,7 @@ __all__ = [
     "ApplyPatchTool",
     "ListFilesTool",
     "ReadFileTool",
+    "ReadContextTool",
     "SearchRepoTool",
     "ShellTool",
     "StrReplaceEditTool",

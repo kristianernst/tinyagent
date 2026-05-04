@@ -17,7 +17,7 @@ PROFILE_ROOT = Path(__file__).resolve().parents[1] / "profiles"
 
 class ApexCoderProfile:
     name = "apex-coder"
-    DEFAULT_VISIBLE_TOOL_NAMES = ("read_file", "search_repo", "apply_patch", "shell")
+    DEFAULT_VISIBLE_TOOL_NAMES = ("read_file", "read_context", "search_repo", "apply_patch", "shell")
 
     def __init__(
         self,
@@ -187,9 +187,9 @@ def _visible_tool_names_for_state(state: RunState, configured: Sequence[str]) ->
     edit_style = str((state.model_spec or {}).get("edit_style") or "apply_patch")
     match edit_style:
         case "str_replace":
-            return ("read_file", "search_repo", "str_replace_edit", "shell")
+            return ("read_file", "read_context", "search_repo", "str_replace_edit", "shell")
         case "whole_file":
-            return ("read_file", "search_repo", "write_file", "shell")
+            return ("read_file", "read_context", "search_repo", "write_file", "shell")
         case _:
             return ApexCoderProfile.DEFAULT_VISIBLE_TOOL_NAMES
 

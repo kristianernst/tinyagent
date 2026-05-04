@@ -264,7 +264,7 @@ def test_model_spec_drives_context_budget_and_visible_tools(tmp_path) -> None:
     ).run("use spec", workspace=tmp_path, run_id="run_model_spec")
 
     assert state.failed is False
-    assert provider.tools == ["read_file", "search_repo", "str_replace_edit", "shell"]
+    assert provider.tools == ["read_file", "read_context", "search_repo", "str_replace_edit", "shell"]
     assert state.model_spec["edit_style"] == "str_replace"
     report_event = next(event for event in state.events if event.type == "context.report.written")
     report = json.loads((state.output_dir / report_event.data["context_report_artifact"]).read_text())

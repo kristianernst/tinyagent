@@ -31,6 +31,8 @@ def extract_observations(call: ToolCall, result: ToolResult, state: RunState) ->
         return _shell_observations(call, result)
     if call.name == "read_file":
         return _read_file_observations(call, result)
+    if call.name == "read_context":
+        return _read_context_observations(call, result)
     if call.name == "search_repo":
         return _search_repo_observations(call, result)
     if result.data.get("blocked") or (result.failure_kind or result.data.get("failure_kind")) in {"policy_denied", "sandbox_blocked"}:
@@ -142,6 +144,23 @@ def _read_file_observations(call: ToolCall, result: ToolResult) -> list[Observat
                 "total_lines": result.data.get("total_lines"),
                 "tool_call_id": call.id,
             },
+        )
+    ]
+
+
+def _read_context_observations(call: ToolCall, result: ToolResult) -> list[Observation]:
+    if _is_policy_block(result):
+        return [_block_observation(call, result)]
+    if not result.ok:
+        return [_command_failure_observation(call, result)]
+    path = str(result.data.get("path") or call.args.get("path") or "")
+    return [
+        Observation(
+            kind="context_read",
+            subject=path,
+            summary=f"Read ContextFS recovery file {path}.",
+            refs=_result_refs(result),
+            data={"path": path, "tool_call_id": call.id},
         )
     ]
 
