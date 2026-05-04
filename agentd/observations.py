@@ -29,6 +29,10 @@ def extract_observations(call: ToolCall, result: ToolResult, state: RunState) ->
         return _patch_observations(call, result)
     if call.name == "shell":
         return _shell_observations(call, result)
+    if call.name == "read_file":
+        return _read_file_observations(call, result)
+    if call.name == "search_repo":
+        return _search_repo_observations(call, result)
     if result.data.get("blocked") or (result.failure_kind or result.data.get("failure_kind")) == "policy_denied":
         return [_policy_block_observation(call, result)]
     if not result.ok:
@@ -115,6 +119,57 @@ def _patch_observations(call: ToolCall, result: ToolResult) -> list[Observation]
             )
         )
     return observations
+
+
+def _read_file_observations(call: ToolCall, result: ToolResult) -> list[Observation]:
+    if _is_policy_block(result):
+        return [_policy_block_observation(call, result)]
+    if not result.ok:
+        return [_command_failure_observation(call, result)]
+    path = str(result.data.get("path") or call.args.get("path") or "")
+    line_count = result.data.get("line_count")
+    summary = f"Read {line_count} line(s) from {path}." if line_count is not None else f"Read {path}."
+    return [
+        Observation(
+            kind="file_read",
+            subject=path,
+            summary=summary,
+            refs=_result_refs(result),
+            data={
+                "path": path,
+                "start_line": result.data.get("start_line"),
+                "line_count": result.data.get("line_count"),
+                "total_lines": result.data.get("total_lines"),
+                "tool_call_id": call.id,
+            },
+        )
+    ]
+
+
+def _search_repo_observations(call: ToolCall, result: ToolResult) -> list[Observation]:
+    if _is_policy_block(result):
+        return [_policy_block_observation(call, result)]
+    if not result.ok:
+        return [_command_failure_observation(call, result)]
+    query = str(result.data.get("query") or call.args.get("query") or "")
+    path = str(result.data.get("path") or call.args.get("path") or ".")
+    match_count = result.data.get("match_count")
+    summary = f"Search for {query!r} in {path} returned {match_count} match(es)."
+    return [
+        Observation(
+            kind="search_result",
+            subject=query,
+            summary=summary,
+            refs=_result_refs(result),
+            data={
+                "query": query,
+                "path": path,
+                "match_count": match_count,
+                "truncated": result.data.get("truncated"),
+                "tool_call_id": call.id,
+            },
+        )
+    ]
 
 
 def _policy_block_observation(call: ToolCall, result: ToolResult) -> Observation:

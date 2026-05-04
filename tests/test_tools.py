@@ -51,6 +51,27 @@ def test_list_and_search_exclude_tinyagent_outputs(tmp_path) -> None:
     assert [event.type for event in state.events] == ["files.listed", "artifact.created", "search.completed"]
 
 
+def test_structured_inspection_tools_emit_artifact_metadata(tmp_path) -> None:
+    (tmp_path / "hello.txt").write_text("needle\n" * 30)
+    state = RunState.create("test", Workspace(tmp_path), run_id="run_structured_inspection")
+    state.budgets = RunBudgets(max_command_output_chars_visible=80)
+
+    read = ReadFileTool().run(ToolCall(name="read_file", args={"path": "hello.txt", "max_lines": 30}), state)
+    search = SearchRepoTool().run(ToolCall(name="search_repo", args={"query": "needle", "max_matches": 5}), state)
+
+    assert read.ok is True
+    assert read.artifact_path and read.artifact_path.startswith("context/read_file/")
+    assert read.truncated is True
+    assert read.read_hints
+    assert read.data["path"] == "hello.txt"
+    assert read.data["line_count"] == 30
+    assert search.ok is True
+    assert search.artifact_path
+    assert search.data["output_artifact"] == search.artifact_path
+    assert search.truncated is True
+    assert search.read_hints
+
+
 def test_read_file_and_apply_patch_protect_current_run_artifacts(tmp_path) -> None:
     state = RunState.create("test", Workspace(tmp_path), run_id="run_test")
     state.output_dir.mkdir(parents=True)
@@ -645,13 +666,13 @@ def test_apex_profile_caches_system_prompt(tmp_path) -> None:
     assert profile.system_prompt() == "first"
 
 
-def test_apex_profile_exposes_only_shell_and_apply_patch_by_default(tmp_path) -> None:
+def test_apex_profile_exposes_structured_inspection_edit_and_shell_by_default(tmp_path) -> None:
     state = RunState.create("test", Workspace(tmp_path), run_id="run_test")
     tools = {tool.name: tool for tool in default_tools()}
 
     visible = ApexCoderProfile().visible_tools(state, tools)
 
-    assert [tool.name for tool in visible] == ["shell", "apply_patch"]
+    assert [tool.name for tool in visible] == ["read_file", "search_repo", "apply_patch", "shell"]
 
 
 def test_tool_collections_name_builtin_and_repo_groups() -> None:
@@ -692,9 +713,7 @@ def test_apex_profile_visible_tools_are_overridable_for_ablations(tmp_path) -> N
 @pytest.mark.parametrize(
     ("tool_name", "args"),
     [
-        ("read_file", {"path": "hello.txt"}),
         ("list_files", {}),
-        ("search_repo", {"query": "hello"}),
     ],
 )
 def test_apex_profile_blocks_registered_but_hidden_tools(tmp_path, tool_name, args) -> None:
@@ -723,7 +742,11 @@ def test_apex_profile_blocks_registered_but_hidden_tools(tmp_path, tool_name, ar
     assert result.tool_name == tool_name
     assert result.ok is False
     assert result.output == f"Tool is not visible for this profile: {tool_name}"
-    assert result.data == {"blocked": True, "error_type": "ToolNotVisible", "visible_tools": ["apply_patch", "shell"]}
+    assert result.data == {
+        "blocked": True,
+        "error_type": "ToolNotVisible",
+        "visible_tools": ["apply_patch", "read_file", "search_repo", "shell"],
+    }
     hidden_events = [event for event in state.events if event.data.get("tool_call_id") == hidden_call.id]
     assert [event.type for event in hidden_events] == [
         "model.tool_call.assembly.started",
@@ -1060,7 +1083,7 @@ def test_golden_trace_covers_context_artifacts_tool_args_shell_artifact_and_untr
     assert (state.output_dir / model_request.data["logical_request_artifact"]).exists()
     assert (state.output_dir / model_response.data["response_artifact"]).exists()
     logical_request = json.loads((state.output_dir / model_request.data["logical_request_artifact"]).read_text())
-    assert [tool["name"] for tool in logical_request["tools"]] == ["shell", "apply_patch"]
+    assert [tool["name"] for tool in logical_request["tools"]] == ["read_file", "search_repo", "apply_patch", "shell"]
     final_context = (state.output_dir / model_requests[-1].data["context_artifact"]).read_text()
     assert "Tool: shell" in final_context
     assert "created.txt" in final_context

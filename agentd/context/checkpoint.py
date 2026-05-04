@@ -92,7 +92,7 @@ def artifact_refs_from_tool_steps(steps: Sequence[ToolStep]) -> list[ArtifactRef
     refs: list[ArtifactRef] = []
     seen: set[str] = set()
     for step in steps:
-        for key in ("output_artifact", "captured_output_artifact"):
+        for key in ("context_artifact", "output_artifact", "captured_output_artifact"):
             path = step.result.data.get(key)
             if not isinstance(path, str) or path in seen:
                 continue
@@ -164,6 +164,10 @@ def _artifact_description(step: ToolStep) -> str:
     if step.call.name == "apply_patch":
         paths = step.result.data.get("paths", [])
         return f"apply_patch output for {', '.join(str(path) for path in paths)}"
+    if step.call.name == "read_file":
+        return f"read_file output for {step.result.data.get('path', '')}"
+    if step.call.name == "search_repo":
+        return f"search_repo output for {step.result.data.get('query', '')!r}"
     return f"{step.call.name} output"
 
 

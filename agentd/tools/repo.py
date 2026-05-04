@@ -9,6 +9,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from agentd.contextfs import model_readable_path, read_hints, write_context_tool_output
 from agentd.contracts import Tool
 from agentd.state import RunState, ToolCall, ToolResult
 from agentd.tools.core import (
@@ -17,6 +18,7 @@ from agentd.tools.core import (
     relative_workspace_path,
     resolve_workspace_path,
     tool_env,
+    visible_output,
     write_tool_output_artifact,
 )
 
@@ -65,6 +67,14 @@ class ReadFileTool:
         selected = lines[start_line - 1 : start_line - 1 + max_lines]
         numbered = "\n".join(f"{index}: {line}" for index, line in enumerate(selected, start=start_line))
         rel_path = relative_workspace_path(state, path)
+        output = f"{rel_path}\n{numbered}" if numbered else f"{rel_path}\n"
+        output_chars = len(output)
+        artifact_path = None
+        hints: list[str] = []
+        if output_chars > state.budgets.max_command_output_chars_visible:
+            artifact_path = write_context_tool_output(state, call, output, kind="read_file_output")
+            hints = read_hints(model_readable_path(state, artifact_path))
+            output = visible_output(output, state)
         state.emit(
             "file.read",
             {
@@ -73,13 +83,26 @@ class ReadFileTool:
                 "line_count": len(selected),
                 "total_lines": len(lines),
                 "bytes": len(text.encode()),
+                "output_chars": output_chars,
+                "context_artifact": artifact_path,
             },
         )
         return ToolResult(
             tool_name=self.name,
             call_id=call.id,
-            output=f"{rel_path}\n{numbered}" if numbered else f"{rel_path}\n",
-            data={"path": rel_path, "line_count": len(selected), "total_lines": len(lines)},
+            output=output,
+            data={
+                "path": rel_path,
+                "start_line": start_line,
+                "line_count": len(selected),
+                "total_lines": len(lines),
+                "bytes": len(text.encode()),
+                "context_artifact": artifact_path,
+                "output_chars": output_chars,
+            },
+            artifact_path=artifact_path,
+            truncated=artifact_path is not None,
+            read_hints=hints,
         )
 
 
@@ -167,6 +190,7 @@ class SearchRepoTool:
             captured_output or "No matches.",
             kind="search_captured_output",
         )
+        readable_artifact = model_readable_path(state, artifact)
         state.emit(
             "search.completed",
             {
@@ -185,6 +209,8 @@ class SearchRepoTool:
             tool_name=self.name,
             call_id=call.id,
             output=output or "No matches.",
+            artifact_path=artifact,
+            truncated=truncated,
             data={
                 "query": query,
                 "path": relative_workspace_path(state, path),
@@ -197,6 +223,7 @@ class SearchRepoTool:
                 "output_artifact": artifact,
                 "output_chars": len(captured_output or "No matches."),
             },
+            read_hints=read_hints(readable_artifact, failure=timed_out),
         )
 
 

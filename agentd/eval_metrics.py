@@ -86,6 +86,9 @@ def extract_run_metrics(run_path: Path) -> RunMetrics:
                     pre_edit_inspection = True
             if int(event.data.get("output_chars") or 0) > 12_000:
                 large_outputs += 1
+        elif event.type in {"file.read", "search.completed"}:
+            if first_edit_seq is None:
+                pre_edit_inspection = True
         elif event.type == "tool.execution.output.snapshot":
             if int(event.data.get("output_chars") or 0) > 12_000:
                 large_outputs += 1
