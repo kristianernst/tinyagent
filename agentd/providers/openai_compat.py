@@ -12,7 +12,7 @@ from typing import Any
 
 from agentd.contracts import Tool
 from agentd.model_stream import ModelDelta, ProviderStreamEvent, parse_chat_completion, parse_chat_completion_chunk
-from agentd.models import ProviderError
+from agentd.models import ModelCapabilities, ProviderError
 from agentd.state import Message, ModelResponse, RunState
 
 
@@ -22,6 +22,8 @@ class OpenAICompatibleConfig:
     api_key: str
     model: str
     timeout_seconds: int = 60
+    context_window: int = 128_000
+    max_output_tokens: int = 8_000
     extra_body: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -38,12 +40,19 @@ class OpenAICompatibleConfig:
             timeout_seconds = int(values.get("TINYAGENT_MODEL_TIMEOUT_SECONDS", "60"))
         except ValueError as exc:
             raise ProviderError("TINYAGENT_MODEL_TIMEOUT_SECONDS must be an integer.") from exc
+        try:
+            context_window = int(values.get("TINYAGENT_MODEL_CONTEXT_WINDOW", "128000"))
+            max_output_tokens = int(values.get("TINYAGENT_MODEL_MAX_OUTPUT_TOKENS", "8000"))
+        except ValueError as exc:
+            raise ProviderError("TINYAGENT_MODEL_CONTEXT_WINDOW and TINYAGENT_MODEL_MAX_OUTPUT_TOKENS must be integers.") from exc
         extra_body = _extra_body_from_env(values)
         return cls(
             base_url=base_url,
             api_key=api_key,
             model=model,
             timeout_seconds=timeout_seconds,
+            context_window=context_window,
+            max_output_tokens=max_output_tokens,
             extra_body=extra_body,
         )
 
@@ -53,6 +62,13 @@ class OpenAICompatibleProvider:
 
     def __init__(self, config: OpenAICompatibleConfig) -> None:
         self.config = config
+        self.capabilities = ModelCapabilities(
+            context_window=config.context_window,
+            max_output_tokens=config.max_output_tokens,
+            supports_tools=True,
+            supports_parallel_tools=False,
+            tool_protocol="chat_completions",
+        )
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> OpenAICompatibleProvider:

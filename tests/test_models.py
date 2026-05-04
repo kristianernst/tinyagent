@@ -11,6 +11,7 @@ from agentd.kernel import Kernel
 from agentd.model_stream import ModelDelta, assemble_model_deltas, parse_chat_completion_chunk
 from agentd.models import (
     FakeModelProvider,
+    ModelCapabilities,
     ProviderError,
 )
 from agentd.providers.openai_compat import OpenAICompatibleConfig, OpenAICompatibleProvider
@@ -137,6 +138,8 @@ def test_openai_compatible_config_reads_environment() -> None:
             "TINYAGENT_MODEL_API_KEY": "key",
             "TINYAGENT_MODEL_NAME": "model",
             "TINYAGENT_MODEL_TIMEOUT_SECONDS": "12",
+            "TINYAGENT_MODEL_CONTEXT_WINDOW": "64000",
+            "TINYAGENT_MODEL_MAX_OUTPUT_TOKENS": "4000",
             "TINYAGENT_MODEL_EXTRA_BODY_JSON": '{"max_tokens":128,"temperature":0}',
         }
     )
@@ -145,6 +148,8 @@ def test_openai_compatible_config_reads_environment() -> None:
     assert config.api_key == "key"
     assert config.model == "model"
     assert config.timeout_seconds == 12
+    assert config.context_window == 64_000
+    assert config.max_output_tokens == 4_000
     assert config.extra_body == {"max_tokens": 128, "temperature": 0}
 
 
@@ -200,6 +205,30 @@ def test_openai_compatible_provider_merges_extra_body_without_overriding_stream_
     assert payload["temperature"] == 0
     assert payload["stream"] is True
     assert payload["stream_options"] == {"debug": True, "include_usage": True}
+    assert provider.capabilities.tool_protocol == "chat_completions"
+    assert provider.capabilities.input_budget_tokens == 120_000
+
+
+def test_kernel_fails_clearly_when_provider_does_not_support_tools(tmp_path) -> None:
+    class TextOnlyProvider:
+        name = "text-only"
+        capabilities = ModelCapabilities(supports_tools=False, tool_protocol="none")
+
+        def complete(self, messages, tools, state):
+            raise AssertionError("kernel should reject visible tools before calling provider")
+
+    state = Kernel(
+        model=TextOnlyProvider(),
+        profile=BasicProfile(),
+        tools=[SampleTool()],
+        policy=AllowAllPolicy(),
+        workspace_mode="current",
+    ).run("use tools", workspace=tmp_path)
+
+    assert state.failed is True
+    assert state.failure_reason == "Model provider does not support tools."
+    failed = next(event for event in state.events if event.type == "model.call.failed")
+    assert failed.data["capabilities"]["supports_tools"] is False
 
 
 def test_openai_compatible_provider_sends_messages_tools_and_parses_tool_calls() -> None:

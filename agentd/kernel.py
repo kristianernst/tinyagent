@@ -15,6 +15,7 @@ from agentd.contracts import ApprovalHandler, Executor, LocalExecutor, ModelProv
 from agentd.events import EventSink, json_safe
 from agentd.hooks import TinyHook
 from agentd.model_stream import complete_model_call
+from agentd.models import model_capabilities
 from agentd.observations import extract_observations
 from agentd.output import (
     capture_final_diff,
@@ -188,6 +189,19 @@ class Kernel:
                 return
 
             visible_tools = list(self.profile.visible_tools(state, self.tools))
+            capabilities = model_capabilities(self.model)
+            if visible_tools and not capabilities.supports_tools:
+                state.emit(
+                    "model.call.failed",
+                    {
+                        "provider": self.model.name,
+                        "reason": "model provider does not support tools",
+                        "capabilities": capabilities.to_json_dict(),
+                    },
+                    visibility="user",
+                )
+                state.fail("Model provider does not support tools.")
+                return
             visible_tool_names = frozenset(tool.name for tool in visible_tools)
             built_context = self._build_context(state, visible_tools)
             if self._should_compact(state):
@@ -222,7 +236,8 @@ class Kernel:
                 state,
                 call_index=model_call_index,
                 built_context=built_context,
-                budget=_context_budget(self.profile, state),
+                budget=_context_budget(self.profile, state, capabilities),
+                model_capabilities=model_capabilities(self.model),
             )
             state.emit(
                 "context.report.written",
@@ -1174,11 +1189,14 @@ def _output_chars(result: ToolResult) -> int:
     return value if isinstance(value, int) else len(result.output)
 
 
-def _context_budget(profile: Profile, state: RunState) -> int:
+def _context_budget(profile: Profile, state: RunState, capabilities=None) -> int:
     config = getattr(profile, "context_config", None)
     budget = getattr(config, "effective_compact_at_tokens", None)
+    capability_budget = capabilities.input_budget_tokens if capabilities is not None else None
     if isinstance(budget, int):
-        return budget
+        return min(budget, capability_budget) if isinstance(capability_budget, int) else budget
+    if isinstance(capability_budget, int):
+        return capability_budget
     return state.context_token_estimate
 
 
