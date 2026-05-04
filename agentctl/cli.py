@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import signal
 import sys
 from collections.abc import Iterator
@@ -24,16 +23,16 @@ from agentd.eval_runner import (
 )
 from agentd.events import ConsoleTextSink, JsonlStreamSink, debug_level_from_env
 from agentd.kernel import Kernel
-from agentd.models import FakeModelProvider, ProviderError
+from agentd.models import ProviderError
 from agentd.policy import default_policy
 from agentd.profiles import ApexCoderProfile
-from agentd.providers.openai_compat import OpenAICompatibleProvider
+from agentd.providers.factory import ProviderSpec, provider_for
 from agentd.replay import replay_run
-from agentd.runtime import create_runtime_server
-from agentd.run_graph import fork_run
 from agentd.run_control import CancelToken, RunCancelled
+from agentd.run_graph import fork_run
 from agentd.run_record import load_run_record, render_run_inspection
-from agentd.state import ApprovalRequest, ApprovalResolution, ModelResponse, RunState, ToolCall
+from agentd.runtime import create_runtime_server
+from agentd.state import ApprovalRequest, ApprovalResolution, RunState
 from agentd.tools import default_tools
 
 
@@ -82,6 +81,17 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=8765)
     serve_parser.add_argument("--run-root", type=Path)
+    serve_parser.add_argument("--provider", choices=["fake", "openai-compatible"], default="fake")
+    serve_parser.add_argument("--model")
+    serve_parser.add_argument("--stream", action="store_true", help="Stream model deltas through the runtime event stream.")
+    serve_parser.add_argument(
+        "--debug",
+        type=int,
+        help="SSE event verbosity. Defaults to TINYAGENT_DEBUG or 0.",
+    )
+    serve_parser.add_argument("--workspace-mode", choices=["auto", "worktree", "current"], default="current")
+    serve_parser.add_argument("--approval-mode", choices=["never", "on-request", "yolo"], default="yolo")
+    serve_parser.add_argument("--sandbox-mode", choices=["none", "container", "native", "worktree"], default="none")
 
     eval_parser = subparsers.add_parser("eval", help="Run a local eval suite.")
     eval_parser.add_argument("suite_path", type=Path, help="Directory containing eval cases.")
@@ -196,7 +206,24 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "serve":
-        server = create_runtime_server(Path(args.workspace), host=args.host, port=args.port, run_root=args.run_root)
+        try:
+            debug_level = _debug_level(args.debug)
+            server = create_runtime_server(
+                Path(args.workspace),
+                host=args.host,
+                port=args.port,
+                run_root=args.run_root,
+                provider=args.provider,
+                model_name=args.model,
+                stream=args.stream,
+                debug_level=debug_level,
+                workspace_mode=args.workspace_mode,
+                approval_mode=args.approval_mode,
+                sandbox_mode=args.sandbox_mode,
+            )
+        except (ProviderError, ValueError) as exc:
+            print(f"serve error: {exc}")
+            return 1
         print(f"serving tinyagent runtime on http://{args.host}:{server.server_port}")
         try:
             server.serve_forever()
@@ -291,14 +318,7 @@ def _default_eval_compare_output_dir(suite_path: Path) -> Path:
 
 
 def _model_for(provider: str, task: str, *, model_name: str | None = None):
-    if provider == "fake":
-        return FakeModelProvider(_fake_responses(task), model=model_name or "fake")
-    if provider == "openai-compatible":
-        env = dict(os.environ)
-        if model_name:
-            env["TINYAGENT_MODEL_NAME"] = model_name
-        return OpenAICompatibleProvider.from_env(env)
-    raise ValueError(f"Unknown provider: {provider}")
+    return provider_for(ProviderSpec(kind=provider, model=model_name), task, env=os.environ)  # type: ignore[arg-type]
 
 
 def _debug_level(level: int | None) -> int:
@@ -347,21 +367,6 @@ def _sigint_cancel(token: CancelToken) -> Iterator[None]:
         yield
     finally:
         signal.signal(signal.SIGINT, previous)
-
-
-def _fake_responses(task: str) -> list[ModelResponse]:
-    path = _first_mentioned_file(task)
-    if path is None:
-        return [ModelResponse(content="Fake run finished.", finish_reason="stop")]
-    return [
-        ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": f"sed -n '1,120p' {path}"}),)),
-        ModelResponse(content=f"Fake run finished after reading {path}.", finish_reason="stop"),
-    ]
-
-
-def _first_mentioned_file(task: str) -> str | None:
-    match = re.search(r"(?P<path>[\w./-]+\.[A-Za-z0-9_+-]+)", task)
-    return match.group("path") if match else None
 
 
 if __name__ == "__main__":

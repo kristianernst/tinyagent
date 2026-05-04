@@ -9,7 +9,10 @@ from pathlib import Path
 
 import pytest
 
-from agentd.runtime import create_runtime_server
+from agentd.model_stream import ModelDelta
+from agentd.runtime import RunController, RuntimeConfig, RuntimeHTTPServer, create_runtime_server
+from agentd.session import SessionStore
+from agentd.state import Message, ModelResponse, RunState, ToolCall
 
 
 def test_runtime_server_starts_run_streams_reconnects_and_reads_artifact(tmp_path) -> None:
@@ -21,6 +24,7 @@ def test_runtime_server_starts_run_streams_reconnects_and_reads_artifact(tmp_pat
         events = _sse(base, "/api/runs/run_runtime_smoke/events")
         event_types = [event["type"] for event in events]
         assert "run.started" in event_types
+        assert "model.text.delta" in event_types
         assert "run.completed" in event_types
 
         after_first = _sse(base, "/api/runs/run_runtime_smoke/events?after_seq=1")
@@ -38,10 +42,116 @@ def test_runtime_server_starts_run_streams_reconnects_and_reads_artifact(tmp_pat
         assert b"Fake run finished: runtime smoke" in final
 
 
+def test_runtime_default_sse_filters_internal_reasoning_but_keeps_surface_events(tmp_path) -> None:
+    with _server(tmp_path, provider_factory=lambda _task: _InternalReasoningProvider()) as base:
+        _request(base, "POST", "/api/runs", {"task": "stream private reasoning", "run_id": "run_private_stream"})
+        _wait_for_status(base, "run_private_stream", "completed")
+
+        events = _sse(base, "/api/runs/run_private_stream/events")
+
+        assert "model.text.delta" in [event["type"] for event in events]
+        assert not any(event["visibility"] == "internal" for event in events)
+        assert not any(event["data"].get("delta") == "private thought" for event in events)
+        model_started = next(event for event in events if event["type"] == "model.call.started")
+        assert "context_artifact" not in model_started["data"]
+        assert "context_report_artifact" not in model_started["data"]
+        assert "logical_request_artifact" not in model_started["data"]
+        assert "http_request_artifact" not in model_started["data"]
+
+
+def test_runtime_post_runs_can_append_to_session_and_use_prior_context(tmp_path) -> None:
+    with _server(tmp_path) as base:
+        first = _request(
+            base,
+            "POST",
+            "/api/runs",
+            {"task": "first", "run_id": "run_http_session_1", "session_id": "sess_http", "turn_id": "turn_1"},
+        )
+        assert first["session_id"] == "sess_http"
+        assert first["turn_id"] == "turn_1"
+        _wait_for_status(base, "run_http_session_1", "completed")
+
+        second = _request(
+            base,
+            "POST",
+            "/api/runs",
+            {"task": "second", "run_id": "run_http_session_2", "session_id": "sess_http", "turn_id": "turn_2"},
+        )
+        assert second["session_id"] == "sess_http"
+        assert second["turn_id"] == "turn_2"
+        _wait_for_status(base, "run_http_session_2", "completed")
+
+        prior_context = tmp_path / ".tinyagent" / "runs" / "run_http_session_2" / "artifacts" / "prior-context.json"
+        assert prior_context.exists()
+        assert "first" in prior_context.read_text()
+        assert "Fake run finished: first" in prior_context.read_text()
+
+        sessions = _request(base, "GET", "/api/sessions")
+        assert sessions["sessions"][0]["session_id"] == "sess_http"
+        assert sessions["sessions"][0]["title"] == "first"
+        assert sessions["sessions"][0]["turn_count"] == 2
+
+
+def test_runtime_retains_live_events_briefly_after_run_thread_exits(tmp_path) -> None:
+    with _server(tmp_path) as base:
+        _request(base, "POST", "/api/runs", {"task": "retention smoke", "run_id": "run_retention"})
+        _wait_for_status(base, "run_retention", "completed")
+
+        events = _sse(base, "/api/runs/run_retention/events")
+
+        assert any(event["type"] == "model.text.delta" for event in events)
+        surface_log = tmp_path / ".tinyagent" / "runs" / "run_retention" / "surface-events.jsonl"
+        surface_events = [json.loads(line) for line in surface_log.read_text().splitlines()]
+        assert any(event["type"] == "model.text.delta" for event in surface_events)
+        assert any(event["type"] == "run.completed" for event in surface_events)
+        assert not any(event["visibility"] == "internal" for event in surface_events)
+
+
+def test_runtime_surface_stream_correlates_tool_events_by_tool_call_id(tmp_path) -> None:
+    (tmp_path / "hello.txt").write_text("hello\n")
+    with _server(tmp_path) as base:
+        _request(base, "POST", "/api/runs", {"task": "read hello.txt", "run_id": "run_tool_surface"})
+        _wait_for_status(base, "run_tool_surface", "completed")
+
+        events = _sse(base, "/api/runs/run_tool_surface/events")
+
+        assembled = next(event for event in events if event["type"] == "model.tool_call.assembly.completed")
+        started = next(event for event in events if event["type"] == "tool.execution.started")
+        completed = next(event for event in events if event["type"] == "tool.execution.completed")
+        tool_call_id = assembled["data"]["tool_call_id"]
+        assert tool_call_id
+        assert started["data"]["tool_call_id"] == tool_call_id
+        assert completed["data"]["tool_call_id"] == tool_call_id
+        assert completed["visibility"] == "user"
+        assert "artifact_path" not in completed["data"]
+        assert "read_hints" not in completed["data"]
+        assert "context_artifact" not in completed["data"]["data"]
+        assert "output_artifact" in completed["data"]["data"]
+        assert "context/" not in json.dumps(completed)
+
+
+def test_runtime_default_sse_redacts_read_context_paths(tmp_path) -> None:
+    with _server(tmp_path, provider_factory=lambda _task: _ReadContextProvider()) as base:
+        _request(base, "POST", "/api/runs", {"task": "read context", "run_id": "run_read_context_surface"})
+        _wait_for_status(base, "run_read_context_surface", "completed")
+
+        events = _sse(base, "/api/runs/run_read_context_surface/events")
+
+        completed = next(
+            event
+            for event in events
+            if event["type"] == "tool.execution.completed" and event["data"].get("tool") == "read_context"
+        )
+        payload = json.dumps(completed)
+        assert "context/" not in payload
+        assert ".tinyagent/runs/" not in payload
+        assert "[redacted]" in payload
+
+
 def test_runtime_cancel_endpoint_stops_active_run(tmp_path) -> None:
     with _server(tmp_path) as base:
         _request(base, "POST", "/api/runs", {"task": "sleep please", "run_id": "run_runtime_cancel"})
-        _wait_for_event(base, "run_runtime_cancel", "command.started")
+        _wait_for_event(base, "run_runtime_cancel", "tool.execution.started")
 
         cancelled = _request(base, "POST", "/api/runs/run_runtime_cancel/cancel", {"reason": "test_cancel"})
 
@@ -96,7 +206,13 @@ def test_runtime_completed_runs_are_not_cancellable_and_fork_output_dir_is_rejec
         _wait_for_status(base, "run_terminal", "completed")
 
         cancel = _request_error(base, "POST", "/api/runs/run_terminal/cancel", {"reason": "too_late"}, expected=404)
-        fork = _request_error(base, "POST", "/api/runs/run_terminal/fork", {"at": "1", "output_dir": str(tmp_path / "escape")}, expected=400)
+        fork = _request_error(
+            base,
+            "POST",
+            "/api/runs/run_terminal/fork",
+            {"at": "1", "output_dir": str(tmp_path / "escape")},
+            expected=400,
+        )
 
         assert cancel["cancelled"] is False
         assert "output_dir" in fork["error"]
@@ -137,15 +253,31 @@ def test_runtime_cancelled_approval_cannot_be_late_approved(tmp_path) -> None:
 
 
 class _server:
-    def __init__(self, workspace: Path) -> None:
+    def __init__(self, workspace: Path, *, provider_factory=None) -> None:
         self.workspace = workspace
+        self.provider_factory = provider_factory
         self.server = None
         self.thread = None
         self.base = ""
 
     def __enter__(self) -> str:
         try:
-            self.server = create_runtime_server(self.workspace, port=0)
+            if self.provider_factory is None:
+                self.server = create_runtime_server(self.workspace, port=0, session_root=self.workspace / ".tinyagent" / "sessions")
+            else:
+                self.server = RuntimeHTTPServer(
+                    ("127.0.0.1", 0),
+                    RunController(
+                        RuntimeConfig(
+                            workspace=self.workspace,
+                            run_root=self.workspace / ".tinyagent" / "runs",
+                            provider_factory=self.provider_factory,
+                            stream=True,
+                            debug_level=0,
+                            session_store=SessionStore(self.workspace / ".tinyagent" / "sessions"),
+                        )
+                    ),
+                )
         except PermissionError as exc:
             pytest.skip(f"localhost socket binding unavailable: {exc}")
         self.base = f"127.0.0.1:{self.server.server_port}"
@@ -260,3 +392,33 @@ def _wait_for_artifact(base: str, run_id: str, path: str, timeout: float = 10) -
             conn.close()
         time.sleep(0.05)
     raise AssertionError(f"artifact {path} not available: {last_error}")
+
+
+class _InternalReasoningProvider:
+    name = "internal-reasoning"
+
+    def complete(self, messages, tools, state: RunState) -> ModelResponse:
+        del messages, tools, state
+        return ModelResponse(content="public answer", finish_reason="stop")
+
+    def stream(self, messages: list[Message], tools, state: RunState):
+        del messages, tools, state
+        yield ModelDelta(kind="reasoning_visible_delta", delta="private thought")
+        yield ModelDelta(kind="text_delta", delta="public answer")
+        yield ModelDelta(kind="completed", data={"finish_reason": "stop"})
+
+
+class _ReadContextProvider:
+    name = "read-context"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def complete(self, messages, tools, state: RunState) -> ModelResponse:
+        del messages, tools, state
+        self.calls += 1
+        if self.calls == 1:
+            return ModelResponse(
+                tool_calls=(ToolCall(id="call_read_context", name="read_context", args={"path": "context/INDEX.md"}),)
+            )
+        return ModelResponse(content="read context done", finish_reason="stop")

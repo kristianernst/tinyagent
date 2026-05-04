@@ -333,6 +333,30 @@ def test_kernel_dispatches_model_policy_tool_then_finishes_from_content(tmp_path
         "data": {},
     }
 
+
+def test_kernel_writes_exact_prior_context_snapshot(tmp_path) -> None:
+    model = StaticModel([ModelResponse(content="done", finish_reason="stop")])
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[NoopTool()],
+        policy=AllowAllPolicy(),
+    )
+
+    state = kernel.run(
+        "continue",
+        workspace=tmp_path,
+        run_id="run_prior_snapshot",
+        prior_messages=[Message(role="user", content="first"), Message(role="assistant", content="second")],
+    )
+
+    assert state.prior_context_artifact == "artifacts/prior-context.json"
+    payload = json.loads((state.output_dir / state.prior_context_artifact).read_text())
+    assert payload["messages"] == [
+        {"role": "user", "content": "first", "meta": {}},
+        {"role": "assistant", "content": "second", "meta": {}},
+    ]
+
     loaded_events = load_events_jsonl(state.output_dir / "events.jsonl")
     assert [event.to_json_dict() for event in loaded_events] == [event.to_json_dict() for event in state.events]
 

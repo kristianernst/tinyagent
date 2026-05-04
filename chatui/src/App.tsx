@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Composer, TurnView } from "./components";
 import type { Mode } from "./components";
 import { LeftSidebar, RightSidebar, SidebarToggle } from "./sidebars";
+import type { Conversation } from "./sidebars";
 import { IconSidebarL, IconSidebarR } from "./icons";
 import { useRun } from "./lib/useRun";
 
@@ -13,12 +14,24 @@ const SAMPLE_QUERIES = [
 ];
 
 export function App() {
-  const { turns, phase, approval, artifacts, error, send, stop, respondToApproval } = useRun();
+  const {
+    turns,
+    phase,
+    approval,
+    artifacts,
+    sessions,
+    activeSessionId,
+    error,
+    send,
+    stop,
+    newSession,
+    respondToApproval,
+  } = useRun();
 
   const [leftOpen, setLeftOpen] = useState(true);
   const [rightOpen, setRightOpen] = useState(true);
   const [mode, setMode] = useState<Mode>("yolo");
-  const [activeChat, setActiveChat] = useState("c1");
+  const [pickedChat, setPickedChat] = useState("");
 
   const threadRef = useRef<HTMLDivElement>(null);
 
@@ -89,11 +102,17 @@ export function App() {
 
   const isEmpty = turns.length === 0;
   const approvalMode = mode === "yolo" ? "yolo" : "on-request";
+  const conversations: Conversation[] = sessions.map((session) => ({
+    id: session.session_id,
+    title: session.title || "New conversation",
+    time: formatSessionTime(session.updated_at),
+  }));
 
   const onSend = (text: string) => send(text, approvalMode);
 
   const newChat = () => {
     if (phase !== "idle") void stop();
+    newSession();
   };
 
   return (
@@ -101,8 +120,9 @@ export function App() {
       <LeftSidebar
         open={leftOpen}
         onToggle={() => setLeftOpen((o) => !o)}
-        activeChat={activeChat}
-        onPickChat={setActiveChat}
+        activeChat={activeSessionId ?? pickedChat}
+        conversations={conversations}
+        onPickChat={setPickedChat}
         onNewChat={newChat}
       />
 
@@ -185,4 +205,14 @@ export function App() {
       />
     </div>
   );
+}
+
+function formatSessionTime(value: string): string {
+  const timestamp = Date.parse(value);
+  if (Number.isNaN(timestamp)) return "";
+  const deltaMs = Date.now() - timestamp;
+  if (deltaMs < 60_000) return "now";
+  if (deltaMs < 3_600_000) return `${Math.max(1, Math.floor(deltaMs / 60_000))}m`;
+  if (deltaMs < 86_400_000) return `${Math.max(1, Math.floor(deltaMs / 3_600_000))}h`;
+  return new Date(timestamp).toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }

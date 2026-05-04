@@ -1,225 +1,681 @@
-I treated “core agent” as the harness layer: run loop, state, provider interface, context construction, tool dispatch, policy, execution, traces, compaction, and extension seams. I did not include TUI, desktop app, marketplace, package management, or broad tool catalogs. Web browsing is disabled in this environment, so I could inspect the GitHub repositories through the connector, but I could not verify the Cursor blog text or the current state of Cursor’s new SDK. I’m using those references conceptually, not as inspected sources.
+The earlier recommendation is directionally right, but it risks turning the chat UI into a product architecture before the core runtime is solid. I would keep the design centered on a much narrower principle:
 
-The high-level answer: tinyagent is not far off architecturally. It already has the right microkernel instinct. What is lacking is not “more tools” or “more framework,” but a few missing intelligence-bearing primitives: dynamic context planning, typed observations, stronger execution isolation, provider capability modeling, durable transcript invariants, loop/recovery guardrails, and a real extension protocol. Those can be added without bloating the visible agent surface.
+Tinyagent should expose one high-quality agent execution substrate. CLI, SDK, TUI, web UI, evals, IDEs, and future orchestrators should all be thin projections over that substrate.
 
-## Current tinyagent position
+The chat UI is useful because it forces the substrate to prove five things: real streaming, stable event semantics, approval/cancel control, artifact retrieval, and resumable conversation state. It should not become a second path through the agent.
 
-tinyagent already has several unusually strong choices.
+## 1. The core philosophy I would preserve
 
-It is genuinely minimal. The package has no runtime dependencies, only dev dependencies for tests/linting, and exposes a CLI entrypoint through `agentctl` rather than pulling in a large framework stack.  The README frames the first slice as a small Python kernel, CLI workflow, bounded local execution, JSONL traces, fake provider tests, and a minimal coding profile. 
+Tinyagent’s strongest architectural shape right now is that a run is small, replayable, inspectable, and local. The current project shape matches that: `agentd` owns `Kernel`, `RunState`, `Profile`, `Tool`, `PolicyEngine`, `Transcript`, `Event`, workspace handling, and model providers, while `agentctl` is just a frontend and `chatui` is a newly added consumer over HTTP/SSE. The design note in the branch explicitly says not to optimize for chat UI specifically; CLIs, evals, IDE plugins, and external orchestrators should consume the same surface.
 
-The architectural split is also correct. Your design document says the core should be a small kernel plus profile plus extensions/executors/providers, while complex search, benchmark prompts, repo-map heuristics, semantic ranking, UI, and marketplace behavior should stay out of the kernel.  That is the right line.
+That means the core should remain:
 
-The implementation already reflects that. The kernel wires model, profile, tools, policy, approval handling, executor, budgets, event sink, approval mode, workspace mode, sandbox mode, and hooks. Its loop builds context, calls the model, gates visible tools, dispatches tool calls, records artifacts, refreshes context, and applies finish checks.  The contracts are compact and clean: `Tool`, `ModelProvider`, `StreamingModelProvider`, `Profile`, `PolicyEngine`, `ApprovalHandler`, and `Executor` are protocols rather than a heavy inheritance hierarchy. 
+Small. No heavy web framework or frontend-shaped abstractions in `agentd`.
 
-The `apex-coder` profile is also more principled than many larger agents. It exposes only `shell` and `apply_patch` by default, and it has a finish gate that prevents the model from claiming verification without evidence, forces diff/file inspection after edits, asks for verification or an explanation, and requires failures or sandbox/policy limitations to be reported.  This is a good example of “less structure, more intelligence”: the model is not micromanaged, but the harness enforces important truthfulness boundaries.
+Auditable. Every meaningful decision should be reconstructable from events, transcript, artifacts, and workspace diffs.
 
-The existing context system is a decent first pass. It has explicit layers for system/profile, environment, project instructions, task, context index, finish gate, checkpoint, and recent tool preview. It estimates token use, packs by priority, and selectively preserves recent failures, diffs, patches, and tests.  The context state tracks objective, constraints, files seen/changed, commands run, tests run, known facts, open issues, next steps, artifacts, and compaction count.  Compaction is deterministic and artifact-backed, which is robust and cheap. 
+Coding-first. The runtime should optimize for long-running code tasks, workspace mutation, approvals, tool identity, diffs, and recovery — not just conversational niceness.
 
-So the issue is not that tinyagent lacks a core. It has one. The issue is that its core is still mostly a clean agent loop, not yet a high-performance coding harness.
+Surface-agnostic. A browser, CLI, TUI, SDK, or IDE should consume the same events, not ask the kernel for different output shapes.
 
-## What the status quo shows
+Append-only where possible. Runs and sessions should be observable timelines. Mutation should happen in the workspace, not in hidden UI state.
 
-Codex.rs is the strongest coding harness because it has very mature invariants around execution, context, tool routing, and session state. Its core is much larger: it includes modules for session management, compaction, context fragments, exec policy, file watching, hooks, MCP, network policy/proxy, plugins, skills, sandboxing, thread management, tools, unified exec, web search, and platform sandboxes.  The turn loop explicitly handles pre-sampling compaction, skills/plugins/apps, MCP dependencies, hooks, history preparation, sampling, token checks, mid-turn compaction, stop hooks, and pending input. 
+The question is not “how do we add chat?” The question is “what must the runtime expose so any interface can drive the agent without knowing kernel internals?”
 
-The important thing to copy from Codex.rs is not its size. It is its invariants. For example, Codex has a `ContextManager` that owns response-item history, token information, reference context for diffing, output truncation, model-visible normalization, rollback, and call/output pairing. It enforces that every tool call has a corresponding output and every output has a corresponding call.  Its tool registry has handlers with pre/post hook payloads, mutation classification, streamed argument diffs, dispatch tracing, and telemetry.  Its router supports model-visible specs, deferred dynamic tools, MCP tools, tool search, custom/local shell calls, and parallel-support detection.  Its execution layer is far more mature: it has cancellation, timeouts, output caps, process-group handling, sandbox transforms, network sandbox policy, Windows sandbox handling, and sandbox-denial detection. 
+## 2. What the current branch shows
 
-Hermes is valuable for a different reason: it is a survivalist agent. Its main runner imports systems for memory, retries, API error classification/failover, model metadata/context probing, context compression, prompt caching, usage pricing, display, tool guardrails, trajectory saving, and provider-specific adapters.  Its compressor is especially relevant: it uses an auxiliary model, structured summary sections, “reference only” framing, resolved/pending tracking, iterative updates, tail-token protection, tool-output pruning, scaled summary budgets, and tool-call/result detail preservation.  Hermes also has a pure side-effect-free tool loop guardrail controller that detects repeated exact failures, repeated same-tool failures, and idempotent no-progress loops.  Its tool system includes plugin discovery, toolset filtering, schema sanitization, dynamic schema rewriting, argument type coercion, sync/async bridging, pre/post tool hooks, and tool-result transformation. 
+The `feature/chatui` branch is intentionally light. It adds `chatui/` and a `docs/chat-sessions-design.md` file, without changing the kernel/runtime core. The comparison shows one commit ahead of `main`, with new frontend files and the design document only.
 
-Pi’s strongest idea is extension ergonomics. Extensions are TypeScript modules that can register tools, commands, shortcuts, flags, UI, persistent state, and subscribe to lifecycle events. More importantly, they can intercept context, model requests, tool calls, tool results, compaction, session lifecycle, and user input.  Pi also documents compaction as a first-class session operation: it finds a cut point, keeps recent tokens, summarizes older messages with previous summaries, saves a compaction entry, reloads the session from summary plus tail, handles split turns, tracks read/modified files, and lets extensions provide custom compaction. 
+The current runtime is already close to the right low-level shape. It has a `RunController`, `RunStore`, `RunBus`, approval broker, cancel endpoint, SSE event endpoint, run listing, run summary, fork endpoint, and artifact serving. The SSE endpoint emits events as named SSE messages with `id: <seq>`, `event: <event.type>`, and JSON `data`.
 
-OpenCode’s main lessons are provider breadth, config-driven agents, server/session architecture, and permission sophistication. It positions itself as provider-agnostic, client/server, TUI-focused, with built-in `build`, `plan`, and `general` agents.  Its config schema supports agents, providers, MCP, LSP, skills, plugins, permission, tools, tool-output limits, and compaction settings.  Its agent config supports model, prompt, tools/permissions, mode, hidden state, steps, and per-agent options.  Its shell tool is instructive: it parses Bash/PowerShell with tree-sitter, detects path usage, asks for permissions on external directories and command patterns, supports plugin-provided shell env, streams/truncates output, saves full output, handles abort/timeouts, and returns structured metadata. 
+The immediate technical gap is also clear: `RunController.start_run` hardcodes `FakeModelProvider(_fake_responses(task))`, does not use the OpenAI-compatible provider path, and does not pass `stream=True` into `kernel.run(...)`.
 
-## What is lacking in tinyagent
+The real provider already exists. `OpenAICompatibleProvider.from_env` reads `TINYAGENT_MODEL_BASE_URL`, `TINYAGENT_MODEL_API_KEY`, `TINYAGENT_MODEL_NAME`, timeout, context-window, max-output-token, and extra-body settings; it also implements both non-streaming `complete(...)` and streaming `stream(...)`.
 
-The core gap is dynamic context optimization.
+So the smallest meaningful web-streaming milestone is not a new chat architecture. It is: make the existing runtime server instantiate the same real provider the CLI can instantiate, run the kernel with streaming enabled, and expose the same event stream over SSE.
 
-By “context,” I mean the model-visible input: system/developer instructions, user task, environment facts, prior messages, tool results, file snippets, diffs, checkpoints, memories, and anything else sent to the model. A “context window” is the maximum amount of this input plus output the model can handle. “Compaction” is the act of replacing older context with a shorter summary. “Dynamic context optimization” is broader than compaction: it is deciding, at every turn, what the model should see, what it should not see, what should be summarized, what should be lazily retrieved, and what should be pinned because it is safety-critical or task-critical.
+## 3. What the event system already gets right
 
-tinyagent currently has static layer packing plus deterministic compaction. That is good, but not enough. The current `ContextBuilder` prioritizes predefined layers and recent tool evidence.  It does not yet have a context planner that says: “for this next model call, the task stage is debugging; keep the failing test output, changed files, relevant stack traces, current diff, and last successful command; drop generic setup chatter and stale explorations.” That is the main missing Cursor-like idea.
+The best existing seam is `RunState.emit(...)`. It is the single event boundary. It increments `seq`, writes durable events to `events.jsonl`, and emits both durable and ephemeral events to a live sink. This is exactly the kind of primitive that can serve CLI, SDK, web UI, TUI, and tests.
 
-The second gap is that tool results are not semantically rich enough. tinyagent’s `ToolResult` already has fields for output, exit code, duration, summary, preview, artifact path, truncation, failure kind, metadata, and read hints.  That is promising. But the shell tool is still mostly “run command, capture output, emit artifacts.”  A better core would extract typed observations from the two visible tools. For example, after `pytest`, the harness should know this was a test command, whether it passed, which files/tests failed, and what error class appeared. After `git diff`, it should know changed files. After `rg`, it should know query and match count. After `apply_patch`, it should know files added/deleted/modified and whether the patch was clean. This is not adding model-visible structure. It is adding harness-side understanding.
+The event model also already has the right separation:
 
-The third gap is execution isolation. tinyagent’s README explicitly says the shell is cwd-bound with sanitized env and a denylist, but not an actual sandbox.  The implementation runs commands through `subprocess.Popen(..., shell=True)` in the workspace with timeout and output management.  The policy layer is “classifier-first” and regex/shlex based; it denies common risky commands, network-looking commands, writes to evidence/secrets/run artifacts, and certain outside-workspace redirects, but it is not a real shell AST or OS sandbox.  For a best-in-class coding agent, this is a hard ceiling. The agent must be able to act boldly while the harness keeps it contained.
+Durable events are the replayable trace: run lifecycle, turn lifecycle, model calls, tool calls, approvals, artifacts, workspace mutations, etc.
 
-The fourth gap is transcript invariants. A “transcript” here means the canonical internal history of messages, model outputs, tool calls, tool results, reasoning summaries, compactions, and synthetic harness messages. Codex’s context manager normalizes history, strips unsupported images, truncates outputs, tracks token usage, rolls back turns, and enforces call/result pair integrity.  tinyagent has good run state and event logging, but it does not yet appear to have a dedicated transcript object with those invariants. Without that, context building, replay, compaction, rollback, evals, and debugging all become more ad hoc.
+Ephemeral events are live-only deltas: `model.text.delta`, `model.reasoning.delta`, `model.tool_call.args.delta`, tool output deltas, command output deltas. They are streamed to sinks but not written to `events.jsonl`.
 
-The fifth gap is provider capability modeling. tinyagent’s provider is currently OpenAI-compatible Chat Completions using `urllib`, with fake provider support for tests.   That is minimal, but not sufficient for “best agent.” A coding harness needs to know model context window, output limits, tool-call format, streaming behavior, parallel tool support, reasoning support, image support, prompt caching support, cost, retry behavior, and provider-specific quirks. OpenCode leans heavily into provider breadth through many AI SDK providers.  tinyagent does not need that dependency tree, but it does need a small capability object.
+Large payloads are kept out of the event stream. Events refer to artifacts instead. This matters because coding agents generate large command outputs, diffs, context reports, request payloads, response payloads, and final files.
 
-The sixth gap is extension protocol. tinyagent has hooks in the kernel.  But Pi shows the more powerful abstraction: user/project-local extensions can register tools, intercept context, mutate/block tool calls, modify tool results, customize compaction, add commands, and persist state.  tinyagent should not copy Pi’s whole TypeScript runtime. But it should have a tiny extension manifest and event API. Otherwise, “easy extendability” depends on modifying core Python.
+The model streaming path is also already coherent. `complete_model_call(...)` normalizes provider stream chunks into `ModelDelta`s, emits `model.text.delta`, reasoning deltas, tool-call argument deltas, usage, and final tool-call assembly events, and then returns a normal `ModelResponse` to the rest of the kernel.
 
-The seventh gap is loop/recovery intelligence. Hermes’ guardrail controller is a good minimal pattern: it is pure, side-effect-free, and detects repeated exact failures, same-tool failure loops, and read-only no-progress loops.  tinyagent has repeated failed command checks in policy, but not a general turn-level progress model.  The core needs to know when the agent is thrashing, retrying identical commands, repeatedly reading the same data, or making edits without new evidence.
+That is a strong pattern: streaming is not a frontend concern. Streaming is a model-provider concern normalized into core events.
 
-The eighth gap is eval feedback. tinyagent has replay/inspect/eval CLI surfaces.  But to become better than status quo, the traces should not just be logs. They should become training data for the harness: context waste, tool-loop causes, verification misses, policy false positives, model-call cost, patch success rate, time-to-first-edit, test-after-edit rate, and finish-gate interventions. This is how the core improves without growing much.
+## 4. What is missing in the core/service boundary
 
-## What I would add, minimally
+The missing pieces are not primarily React pieces.
 
-I would not add many visible tools. Keep `shell` and `apply_patch` as the default surface. That is one of tinyagent’s best choices. Instead, add these core primitives behind the surface.
+The first missing piece is shared provider construction. Today, `agentctl run` has `_model_for(...)`, while `agentd/runtime.py` hardcodes fake responses. The runtime, CLI, eval runner, SDK, and any future server mode should all use the same provider factory. The current CLI path already proves this shape: `agentctl run` and `agentctl eval` call `_model_for(...)`; `serve` does not.
 
-First, add a `Transcript` object. It should own canonical turns, model responses, tool calls, tool outputs, compaction records, injected finish-gate messages, and rollback. It should enforce: no orphan tool outputs, no tool calls without outputs after dispatch, stable call IDs, normalized provider messages, output truncation before model visibility, and artifact pointers for large data. This borrows the Codex invariant, not the Codex size.
+The second missing piece is a real visibility/privacy filter at the runtime boundary. Events have `visibility` values of `internal`, `debug`, `user`, and `public`, plus debug-level helpers.  The web UI must not be trusted as the privacy boundary. The server should filter before sending SSE events. The UI can also ignore hidden events defensively, but that is not sufficient.
 
-Second, add an `Observation` layer. A tool result is raw evidence. An observation is interpreted evidence. For example:
+The third missing piece is live-stream retention. `RunBus` currently stores live events in memory while a run is active and then `cleanup_run(...)` removes them when the kernel thread exits.  Since ephemeral deltas are not persisted, a client that reconnects after completion cannot recover token deltas. That is acceptable if `final.md` is always available, but the runtime should avoid dropping live events before connected SSE clients have a chance to drain them. A small TTL-based live buffer would be more robust than immediate cleanup.
 
-```python
-@dataclass
-class Observation:
-    kind: Literal[
-        "file_read", "file_changed", "diff_seen", "test_run",
-        "test_failure", "command_failure", "policy_block",
-        "dependency_error", "search_result", "verification"
-    ]
-    subject: str
-    summary: str
-    confidence: float = 1.0
-    refs: list[str] = field(default_factory=list)
-    data: dict[str, Any] = field(default_factory=dict)
+The fourth missing piece is stable event-to-surface identity. The chat reducer currently often keys tool UI state by `event.item_id`, but actual tool events usually carry `data.tool_call_id`, and many tool execution events do not set `item_id`. The reducer will therefore fail to correlate “tool assembled”, “tool started”, and “tool completed” reliably.
+
+The fifth missing piece is durable final answer recovery. The UI currently expects `model.message.completed.data.text`, but the design note says the actual event contains output metadata such as `content_chars` and `output_path`, not necessarily full text. The frontend must recover the final assistant answer from the artifact endpoint when live deltas are absent or incomplete.
+
+The sixth missing piece is a canonical conversation/message ledger. `Transcript` is useful but not sufficient as a full session-history primitive today. It records metadata for model responses, tool calls, tool results, finish gates, and compaction, but model response content is represented by length and artifact refs rather than inline full assistant messages.  The context builder currently builds context from the current task, environment, project instructions, context plan, observations, checkpoint, ContextFS index, and recent tool steps; it does not reconstruct a multi-turn chat history from prior user/assistant messages.
+
+That is the important “hole in the armour”: the run trace is good, but the conversation ledger needed for sessions is not yet first-class.
+
+## 5. What other agents suggest
+
+The useful pattern across Codex, Pi, Hermes, and OpenCode is that they separate the live execution unit from the persisted conversation/session unit.
+
+Codex is the cleanest conceptual comparison. Its protocol document defines the core engine as separate from the UI. The UI sends operations through a submission queue; the core emits events through an event queue. A `Session` is current configuration and state. A `Task` is work started by user input. A task consists of one or more `Turn`s, and the system has at most one task running in a session at a time. The document explicitly says the UI may be CLI/TUI or GUI, while Codex is intended to be operated by arbitrary UI implementations.
+
+Codex also persists sessions as rollout JSONL files. Its rollout recorder is specifically described as persisting session rollouts so sessions can be replayed or inspected later; resumed sessions open the existing rollout file in append mode and load rollout items back into `InitialHistory::Resumed`.
+
+Pi has a very lightweight but powerful session model. It stores sessions automatically under `~/.pi/agent/sessions/`, organized by working directory; each session is a JSONL file with a tree structure; it supports continuing, browsing, no-session mode, explicit session selection, and forking. It also has `/tree`, `/fork`, `/clone`, `/compact`, and an interactive session picker. ([Pi][1])
+
+Pi’s important design signal is not the exact directory path. It is that sessions are branchable trees, not just linear chats. That matters for coding agents because users often ask “try approach A,” then later branch back and ask for approach B. Pi’s docs describe session entries linked by `id` and `parentId`, enabling branching without creating separate disconnected files. ([Pi][2])
+
+Hermes goes heavier. It stores session metadata and full message history in `~/.hermes/state.db` with SQLite FTS5 search, while also keeping JSONL transcripts under `~/.hermes/sessions/`. It tracks source platform, user ID, title, model config, system prompt snapshot, full messages, tool calls, tool results, token counts, timestamps, and parent session IDs. It also supports CLI resume by latest session, by ID, and by title.
+
+Hermes’s important design signal is cross-surface persistence. CLI, Telegram, Discord, Slack, WhatsApp, cron, API server, and other sources all map into sessions with explicit source metadata. That is relevant because tinyagent’s surfaces should likewise be adapters over the same session/run substrate.
+
+OpenCode presents the product-surface side. Its official docs describe terminal, desktop, and IDE extension availability; its CLI includes `opencode serve` for a headless HTTP server, `opencode session list`, `opencode export`, and `opencode import`. Its site also advertises multi-session and share links, while its agent docs describe primary agents and subagents, including child-session navigation. ([OpenCode][3])
+
+The lesson is not “copy any one of them.” The lesson is: a serious coding agent eventually needs sessions, branching/forking, durable history, streamable events, resumability, provider config, and interface neutrality. But it does not need all of that in the first chat UI PR.
+
+## 6. The design thesis
+
+I would define tinyagent around four primitives:
+
+A `Run` is one execution attempt for one user task. It may include many model/tool loops. It is replayable and inspectable.
+
+A `Turn` is one user-visible interaction inside a session. In the current kernel, each run has exactly one `turn-0001`; that is fine for now.
+
+A `Session` is a durable conversation/work stream composed of turns, where each turn can point to one run.
+
+An `Event` is the only live observation stream. Surfaces do not receive special UI messages. They project events into their own UI state.
+
+This keeps the kernel honest. The kernel remains a run engine. The runtime grows into an interface-neutral coordinator. The session layer becomes a lightweight persistence/indexing layer, not a second execution engine.
+
+## 7. Recommended architecture
+
+The architecture should have four layers.
+
+Layer 1: `agentd.core`
+
+This is the kernel and execution machinery: model calls, tool dispatch, policy, approvals, workspace, sandbox, context, compaction, transcript, events, artifacts.
+
+This layer should not know about HTTP, React, SSE, browser sessions, web sockets, or frontend reducers.
+
+Layer 2: `agentd.runtime`
+
+This is the controller layer: start run, cancel run, approve, list runs, serve artifacts, stream events, create sessions, append messages to sessions, and select providers.
+
+This layer may expose HTTP, but the internal controller should also be callable by an SDK or tests without HTTP.
+
+Layer 3: `agentd.session`
+
+This should be small at first. It owns session metadata, turn list, branch/fork pointers, prior-message reconstruction, and home/workspace indexing. It does not execute tools. It calls the runtime to start runs.
+
+Layer 4: surfaces
+
+CLI, chat UI, future TUI, SDK, evals, IDE plugins. They consume events and call controller operations. They do not construct `Kernel` directly unless they are intentionally using the low-level SDK.
+
+This gives tinyagent a clean identity: one core, many surfaces.
+
+## 8. The first streaming milestone
+
+The first PR should not implement full sessions. It should make a single run stream correctly into the chat UI using the real provider path.
+
+Concretely:
+
+Add provider and streaming args to `agentctl serve`.
+
+Current `serve` only accepts `--workspace`, `--host`, `--port`, and `--run-root`.  It should accept at least:
+
+```text
+agentctl serve \
+  --provider openai-compatible \
+  --workspace . \
+  --host 127.0.0.1 \
+  --port 8765 \
+  --stream \
+  --debug 0
 ```
 
-This lets the harness understand progress without forcing the model into a rigid workflow. The model still thinks freely. The harness just knows what happened.
+Move provider construction out of `agentctl/cli.py` into `agentd.providers.factory` or similar.
 
-Third, replace static packing with a `ContextPlan`. This should be tiny:
-
-```python
-@dataclass
-class ContextPlan:
-    pinned: list[ContextItem]
-    recent_tail_budget: int
-    retrieval_queries: list[str]
-    include_observation_kinds: set[str]
-    omit_artifact_refs: set[str]
-    reason: str
-```
-
-The profile produces the plan; the context builder executes it. The planner can be heuristic at first. Later it can be model-assisted. This is the smallest version of dynamic context optimization.
-
-Fourth, add a `ModelCapabilities` object:
+A minimal shape:
 
 ```python
 @dataclass(frozen=True)
-class ModelCapabilities:
-    context_window: int
-    max_output_tokens: int
-    supports_tools: bool = True
-    supports_parallel_tools: bool = False
-    supports_reasoning: bool = False
-    supports_images: bool = False
-    supports_prompt_cache: bool = False
-    tool_protocol: Literal["chat_completions", "responses", "anthropic", "gemini"]
+class ProviderSpec:
+    kind: Literal["fake", "openai-compatible"]
+    model: str | None = None
+
+def provider_for(spec: ProviderSpec, task: str, env: Mapping[str, str] | None = None) -> ModelProvider:
+    ...
 ```
 
-This keeps the provider abstraction minimal while unlocking correct context budgeting, provider serialization, fallback, and tool-call handling.
+Then CLI, evals, serve, and SDK all call the same factory.
 
-Fifth, introduce an `ExecutionEnvelope`. This should wrap command execution with cwd, env, timeout, output caps, network policy, writable roots, process group cancellation, and sandbox backend. The default can remain local, but the interface should support stronger backends. This is where tinyagent should learn from Codex’s exec layer and OpenCode’s shell parsing.  
-
-Sixth, add a pure `ProgressGuard`. It should inspect observations and tool calls and return guidance or a synthetic result. Keep it side-effect-free like Hermes.  This is an example of “less structure, more intelligence”: do not force a plan; just interrupt obvious loops.
-
-Seventh, add an `ExtensionHost`, but keep it austere. The minimum viable extension protocol is:
+Extend `RuntimeConfig`.
 
 ```python
-class Extension(Protocol):
-    def on_context(self, event: ContextEvent) -> ContextPatch | None: ...
-    def on_tool_call(self, event: ToolCallEvent) -> ToolCallPatch | Block | None: ...
-    def on_tool_result(self, event: ToolResultEvent) -> ToolResultPatch | None: ...
-    def on_compact(self, event: CompactEvent) -> CompactPatch | None: ...
-    def tools(self) -> list[Tool]: ...
+@dataclass(frozen=True)
+class RuntimeConfig:
+    workspace: Path
+    run_root: Path
+    provider_factory: Callable[[str], ModelProvider]
+    stream: bool = True
+    debug_level: int = 0
+    workspace_mode: WorkspaceMode = "current"
+    approval_mode: ApprovalMode = "yolo"
+    sandbox_mode: SandboxModeInput = "none"
 ```
 
-Then load `tinyagent.toml` or `.tinyagent/extensions/*.py`. Do not invent a plugin ecosystem yet. Just make core modification unnecessary.
-
-Eighth, make evals harness-native. Every run should produce enough structured data to answer: Did the agent inspect before editing? Did it verify after editing? Did it retry identical failures? Did context contain the failing evidence? Did the finish gate prevent a bad final answer? Which tool outputs consumed most context? Which observations were missing?
-
-## The most important design shift
-
-Right now, tinyagent’s model-visible surface is minimal, but its harness intelligence is also still minimal. The goal should be:
-
-“Minimal visible structure, maximal hidden interpretation.”
-
-That means the model sees simple tools and concise context. The harness, however, quietly tracks typed observations, task state, verification state, file state, tool-loop state, and context relevance. The model should not be forced through a rigid planner, but the harness should continuously shape what the model sees.
-
-The core loop would become:
+Then `RunController.start_run(...)` creates:
 
 ```python
-while not state.done:
-    observations = observer.from_state(state)
-
-    plan = profile.plan_next_context(
-        state=state,
-        observations=observations,
-        capabilities=model.capabilities,
-    )
-
-    request = context_builder.build(state, plan)
-    response = model.complete(request)
-
-    transcript.record_model_response(response)
-
-    for call in response.tool_calls:
-        guard = progress_guard.before_call(state, call)
-        if guard.blocks:
-            transcript.record_synthetic_tool_result(call, guard.message)
-            continue
-
-        decision = policy.evaluate(call, state)
-        result = executor.run(call, decision)
-
-        transcript.record_tool_result(call, result)
-        obs = observer.extract(call, result, workspace_diff=workspace.diff())
-        state.observe(obs)
-
-        progress_guard.after_call(state, call, result, obs)
-
-    if context_manager.needs_compaction(state, model.capabilities):
-        profile.compact(state, transcript, observations)
-
-    finish = profile.before_finish(state, response)
-    if finish.allow:
-        state.finish(response.content)
+kernel = Kernel(
+    model=self.config.provider_factory(task),
+    profile=ApexCoderProfile(),
+    tools=default_tools(),
+    policy=default_policy(),
+    approval_handler=self.approvals,
+    event_sink=self.bus,
+    stream=self.config.stream,
+    workspace_mode=self.config.workspace_mode,
+    approval_mode=approval_mode,
+    sandbox_mode=self.config.sandbox_mode,
+)
 ```
 
-This keeps the kernel small. The new intelligence lives in `plan_next_context`, `observer.extract`, `progress_guard`, and `Transcript`.
+And passes `stream=self.config.stream` into `kernel.run(...)`.
 
-## Specific priority order
+Add event filtering before SSE writes.
 
-The first priority should be dynamic context optimization. It will compound everything else. A better context planner makes the same model look smarter, reduces wasted tokens, improves verification, and makes compaction less destructive. Start with a heuristic context planner that classifies the next turn into modes such as explore, edit, debug, verify, summarize, and finish. Then tune the selected evidence per mode.
+The runtime should use `event_debug_level(event)` and `event.visibility`. A browser/default public surface should receive `public` and `user` events at debug level 0. Internal reasoning should never leak to the default web UI. The event system already has debug-level machinery; use it at the HTTP boundary.
 
-The second priority should be typed observations. This is the highest leverage small abstraction. It lets the finish gate, context planner, evals, and loop guardrails share a common understanding of what happened. It also avoids exposing more tools to the model.
+Add a small terminal live-buffer retention policy.
 
-The third priority should be execution isolation. A best coding agent needs permission to act. To give it that permission, the harness must be safer. The current policy is a good start, but it should be backed by a stronger execution envelope and, eventually, a real sandbox.
+Do not call `bus.cleanup_run(run_id)` immediately, or change it to mark a terminal time and purge after a TTL, for example 2–5 minutes or after max N events. That avoids losing ephemeral tail events for clients that are actively connected but scheduled slightly behind the run thread.
 
-The fourth priority should be provider capabilities. Without capability-aware budgeting and serialization, the core will either overfit to OpenAI-compatible Chat Completions or accumulate provider hacks. A tiny capabilities object prevents that.
+This is not red tape. It is a robustness fix to the current stream path.
 
-The fifth priority should be the extension protocol. Pi is the reference here. But tinyagent should keep it smaller: events, tools, context patches, tool-call patches, tool-result patches, and compaction patches. No need for a full package ecosystem initially.
+## 9. Chat UI should become a reducer over real events
 
-The sixth priority should be eval trace analysis. This is how tinyagent becomes “minimal and better” rather than “minimal and underpowered.” Every failure should point to one of a small number of harness fixes: context missing, observation missing, policy wrong, execution failed, provider malformed, loop not detected, verifier absent, finish gate weak.
+The chat UI should not invent an approximation of events. It already has `startRun`, `streamRunEvents`, `cancelRun`, and `decideApproval` in `api.ts`, which is the right basic shape.
 
-## What not to copy
+But `useRun.ts` should be corrected to treat tinyagent events as the source of truth.
 
-Do not copy Codex.rs’ surface area. It is strong, but its core is large because it supports many integrations, sandboxes, plugins, skills, MCP, network policy, thread stores, and platform-specific behavior.  tinyagent should copy its invariants.
+Tool identity should use `data.tool_call_id`, not `event.item_id`.
 
-Do not copy Hermes’ monolithic accumulation. Hermes has many practical survival mechanisms, but its main runner is still a very large orchestrator with many imported concerns.  tinyagent should copy its resilience primitives: tool-loop guardrails, JSON repair, context compression patterns, tool-result pruning, and memory fencing.
+Reasoning deltas should only render when `event.visibility` is `public` or `user`, and even then only if the payload contains a displayable `delta`.
 
-Do not copy Pi’s entire extension runtime. Copy the event model and hot-swappable extension feel. Pi’s extension docs show a broad lifecycle system with hooks from input through provider request through tool result and compaction.  tinyagent only needs the narrow subset that affects core agent quality.
+Assistant text should append from `model.text.delta`.
 
-Do not copy OpenCode’s dependency/provider stack. It is powerful but large. Its useful lessons are config-driven agents, permission rules, provider-agnosticism, session persistence, shell parsing, and output truncation.  
+`model.message.completed` should not assume `data.text`. If the live answer is empty or incomplete, fetch the event’s `output_path` artifact, such as `final.md`.
 
-## Bottom line
+Approval UI should use `approval_id`, `tool`, `command`, `args_preview`, and risk fields from the approval event payload.
 
-tinyagent’s current core is clean, but it is still mostly an agent loop plus a good profile. To become “minimal and better,” it needs a small number of deeper invariants:
+Artifacts should store enough data to produce links back through `/api/runs/{run_id}/artifacts/{path}`.
 
-A `Transcript` that makes history safe and replayable.
+Reconnect should track `after_seq`. But the UI must understand the difference between live-only replay and durable replay: after completion, text deltas are gone, so final answer recovery comes from artifacts.
 
-An `Observation` layer that turns raw tool output into task evidence.
+This keeps the UI thin and testable. The reducer can be frontend code, but the concepts should mirror the event stream exactly.
 
-A `ContextPlan` that makes context dynamic instead of statically packed.
+## 10. Session design: choose sequence-of-runs first
 
-A `ModelCapabilities` layer that prevents provider hacks.
+I would choose a hybrid of “session = sequence of runs” first, with one important addition: a canonical session message ledger.
 
-An `ExecutionEnvelope` that makes bold action safe.
+Do not make `Kernel.run_session(...)` the first session implementation. That would require changing `RunState.done`, cancel semantics, approval scopes, budget semantics, turn lifecycle, workspace cleanup, and `_run_loop` termination. The current kernel sets `state.done` when a run finishes or fails; `finish(...)`, `fail(...)`, and cancel all assume done means terminal.  Changing that now would be invasive.
 
-A `ProgressGuard` that stops thrashing.
+Do not implement `Kernel.continue_run(state, message)` yet either. That would preserve in-memory context, but it would also force you to reset terminal state and split “turn done” from “run done.” That is a valid future design, but it is not the smallest next step.
 
-An `ExtensionHost` that lets users extend without modifying core.
+Instead:
 
-An eval/trace analyzer that converts failures into harness improvements.
+A session is a durable controller-level object.
 
-That is the path I would take. Keep the model-facing interface almost as small as it is now. Make the harness far more perceptive.
+Each user message creates one run.
+
+Each run remains independently replayable and inspectable.
+
+The session stores a canonical user/assistant/tool history sufficient to build context for the next run.
+
+The session owns conversation-level metadata: title, workspace, provider profile, branch parent, active turn, current run, and prior turns.
+
+The kernel gets one minimal extension: the ability to accept prior context.
+
+The current context builder only includes the current task as `Task:\n{state.task}` and does not include prior session messages.  So the minimal kernel-level change is not a full session loop; it is an input-context seam.
+
+Possible API:
+
+```python
+Kernel.run(
+    task: str,
+    *,
+    prior_messages: Sequence[Message] = (),
+    ...
+)
+```
+
+or slightly more explicit:
+
+```python
+@dataclass(frozen=True)
+class RunInput:
+    task: str
+    prior_messages: tuple[Message, ...] = ()
+    attachments: tuple[InputAttachment, ...] = ()
+```
+
+Then `ContextBuilder.build(...)` can include a `conversation:history` context item before the current task.
+
+The session controller becomes responsible for producing `prior_messages`.
+
+That gives you multi-turn behavior without making the kernel long-lived.
+
+## 11. But the session ledger must be real
+
+This is the part I would be strict about.
+
+Do not try to make session history out of `events.jsonl` alone. Events are observational. They are excellent for replay and UI streaming, but they are not the best canonical source for model-visible conversation state.
+
+Do not rely on `Transcript` alone in its current form. It records useful tool/result metadata, but not full assistant content inline.
+
+Add a compact session message ledger.
+
+For each turn, store:
+
+```json
+{
+  "type": "turn.completed",
+  "session_id": "...",
+  "turn_id": "...",
+  "run_id": "...",
+  "parent_turn_id": null,
+  "user_message": {
+    "id": "...",
+    "role": "user",
+    "content": "..."
+  },
+  "assistant_message": {
+    "id": "...",
+    "role": "assistant",
+    "content_artifact": "final.md",
+    "content_preview": "...",
+    "content_chars": 1234
+  },
+  "tool_summary": [
+    {
+      "tool_call_id": "...",
+      "tool": "shell",
+      "ok": true,
+      "summary": "...",
+      "artifact_refs": [...]
+    }
+  ],
+  "token_estimate": 12345,
+  "created_at": "..."
+}
+```
+
+This ledger is not a replacement for run traces. It is the durable conversation skeleton used to build future context.
+
+The ledger can be small. It does not need to store every command output inline. Tool results can be summarized and link to run artifacts. That preserves the tinyagent style: large data lives in artifacts; small metadata lives in records.
+
+## 12. Storage layout
+
+I would reconcile home-directory session listing with workspace-rooted runs like this:
+
+```text
+~/.tinyagent/
+  config.toml
+  sessions/
+    index.jsonl
+    <session_id>/
+      session.json
+      turns.jsonl
+
+<workspace>/.tinyagent/
+  runs/
+    <run_id>/
+      events.jsonl
+      transcript.json
+      metrics.json
+      final.md
+      artifacts/
+      context/
+```
+
+The home directory gives a global “resume” list like Codex, Pi, Hermes, and OpenCode.
+
+The workspace run directory preserves existing replay/inspect/fork behavior.
+
+Each session turn references a workspace run:
+
+```json
+{
+  "turn_id": "turn_...",
+  "run_id": "run_...",
+  "workspace": "/path/to/repo",
+  "run_path": "/path/to/repo/.tinyagent/runs/run_...",
+  "parent_turn_id": null,
+  "status": "completed"
+}
+```
+
+This avoids forcing `agentctl replay` to learn sessions immediately. Existing run tools keep working. Later, `agentctl session inspect` or `agentctl session replay` can be added as a higher-level view.
+
+For branching, copy Pi’s conceptual model, not necessarily its exact implementation: turns can have `parent_turn_id`. A session can be a tree. The active branch is just a pointer to the current leaf. Pi’s docs explicitly use an `id`/`parentId` tree structure to enable branching and navigation. ([Pi][2])
+
+## 13. Session API shape
+
+Keep `/api/runs` unchanged.
+
+Add sessions as a sibling resource later:
+
+```text
+POST /api/sessions
+GET  /api/sessions
+GET  /api/sessions/{session_id}
+
+POST /api/sessions/{session_id}/messages
+GET  /api/sessions/{session_id}/events?after_seq=N
+
+POST /api/sessions/{session_id}/cancel-turn
+POST /api/sessions/{session_id}/end
+POST /api/sessions/{session_id}/approve
+POST /api/sessions/{session_id}/fork
+```
+
+But implement this only after single-run streaming is correct.
+
+`POST /api/sessions/{id}/messages` should return immediately:
+
+```json
+{
+  "session_id": "sess_...",
+  "turn_id": "turn_...",
+  "run_id": "run_...",
+  "status": "running"
+}
+```
+
+The web UI can then stream either run events or session events.
+
+For the first session implementation, I would not create a full session-level event stream. I would let the client stream the active run events using the returned `run_id`. Session events can be added once session branching/resume becomes real.
+
+That avoids premature API expansion.
+
+## 14. Provider config
+
+Start with process-level provider config for `serve`.
+
+```text
+agentctl serve --provider openai-compatible --stream
+```
+
+Backed by env vars:
+
+```text
+TINYAGENT_MODEL_BASE_URL=http://127.0.0.1:8080/v1
+TINYAGENT_MODEL_API_KEY=local
+TINYAGENT_MODEL_NAME=<model-name>
+```
+
+This matches the current provider implementation.
+
+Then add named provider profiles later:
+
+```toml
+[providers.local-llama]
+kind = "openai-compatible"
+base_url = "http://127.0.0.1:8080/v1"
+api_key_env = "TINYAGENT_MODEL_API_KEY"
+model = "qwen3-coder"
+
+[providers.openai]
+kind = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+model = "gpt-4.1"
+```
+
+Do not allow arbitrary browser-supplied provider base URLs by default. A web UI should select a configured provider name, not submit raw provider credentials and URLs unless the server is explicitly running in an unsafe local-dev mode.
+
+This keeps the browser out of the trust boundary.
+
+## 15. Approval and cancel semantics
+
+For single-run streaming, keep the current semantics.
+
+For sessions, distinguish:
+
+Cancel active turn: cancels the active run but keeps the session alive.
+
+End session: marks the session closed and releases any session-owned workspace/sandbox resources.
+
+Approval scope should evolve from:
+
+```text
+once | run
+```
+
+to:
+
+```text
+once | turn | session
+```
+
+But do not rename `run` immediately. For backward compatibility, treat `run` as `turn` inside session mode. Add `session` only once session-level approvals exist.
+
+Codex’s protocol distinction is useful here: a session can have at most one active task, and interrupting a task does not necessarily destroy the session.  Tinyagent should adopt that distinction later.
+
+## 16. Workspace and sandbox lifecycle
+
+For now, single-run web streaming should use `workspace_mode="current"` unless explicitly overridden.
+
+For sessions, workspace semantics become a serious coding-agent issue. If each turn creates a fresh worktree and tears it down, the session loses accumulated edits. If all turns use the current workspace, edits persist but safety is weaker.
+
+The minimal session design should support a session-owned workspace lease:
+
+```text
+session.workspace_root
+session.effective_workspace_root
+session.workspace_mode
+session.sandbox_mode
+session.cleanup_policy
+```
+
+At first, this can be metadata only for `current` mode.
+
+Later, if `worktree` mode becomes default for sessions, the controller should create the worktree at session start and clean it up at session end, not per turn.
+
+This is one reason not to rush long-lived kernel sessions. Workspace lifecycle belongs in the runtime/session controller before it belongs in `_run_loop`.
+
+## 17. Compaction across turns
+
+Do not implement cross-turn compaction as a kernel feature first.
+
+Instead:
+
+Each run can compact internally as it already does.
+
+The session ledger should build prior context using a bounded history window plus optional summaries.
+
+Add manual `/compact` or `POST /api/sessions/{id}/compact` later.
+
+A compacted session turn can write a summary message into the ledger:
+
+```json
+{
+  "type": "session.compacted",
+  "covers_turns": ["turn_1", "turn_2", "..."],
+  "summary_artifact": "session-summary-0001.md",
+  "summary_preview": "..."
+}
+```
+
+This follows the general direction of Pi and Hermes: compaction is a session operation that preserves continuity while reducing context pressure. Pi exposes `/compact`; Hermes creates lineage when compression continues a session. ([Pi][1])
+
+## 18. The event contract for surfaces
+
+Do not create a large formal event projection system yet. That is where the previous recommendation felt too heavy.
+
+Instead, create a small “surface contract” document and tests around the existing event stream.
+
+Minimum contract:
+
+```text
+run.started
+turn.started
+model.call.started
+model.text.delta
+model.message.completed
+model.tool_call.assembly.completed
+tool.execution.started
+tool.execution.completed
+tool.execution.failed
+tool.execution.blocked
+approval.requested
+approval.resolved
+artifact.created
+artifact.materialized
+workspace.mutation.detected
+run.completed
+run.failed
+run.cancelled
+```
+
+Rules:
+
+`seq` is monotonic per run.
+
+`data.tool_call_id` is the tool correlation key.
+
+`artifact_refs` and explicit artifact path fields are fetchable through the artifact endpoint.
+
+`model.text.delta` is live-only.
+
+`model.message.completed` or `final.md` is the durable answer fallback.
+
+`visibility=internal` never leaves the public runtime stream.
+
+Unknown event types must be ignored by surfaces.
+
+This is enough for SDK, web, TUI, CLI, and eval adapters to behave consistently.
+
+## 19. Implementation order
+
+I would do this in five steps.
+
+Step 1: Make the current run server real.
+
+Add `agentctl serve --provider openai-compatible --stream --debug`.
+
+Move provider construction into `agentd`.
+
+Make `RuntimeConfig` carry provider factory, stream flag, debug level, workspace mode, approval mode, and sandbox mode.
+
+Run kernel with `stream=True`.
+
+Filter SSE events by visibility/debug level.
+
+Retain terminal live events briefly instead of immediate bus cleanup.
+
+This gives you real token streaming into the browser without changing kernel semantics.
+
+Step 2: Harden chatui as a diagnostic surface.
+
+Fix tool correlation to use `data.tool_call_id`.
+
+Ignore non-user-visible reasoning.
+
+Track `after_seq`.
+
+Fetch final output artifact if no live answer was assembled.
+
+Render approval request/resolution from actual event payloads.
+
+Render artifact links through `/api/runs/{id}/artifacts/...`.
+
+This makes chatui a useful probe of the runtime contract.
+
+Step 3: Add tests around the surface contract.
+
+Test that SSE includes `model.text.delta` when streaming is enabled.
+
+Test that `internal` events are filtered from default web streams.
+
+Test that tool-call assembly and tool execution correlate by `tool_call_id`.
+
+Test that disconnect/reconnect after completion can recover durable final output.
+
+Test that approval request/decision works over HTTP.
+
+Step 4: Add a minimal session ledger.
+
+Create `agentd/session.py` or `agentd/sessions/store.py`.
+
+Store `session.json` and `turns.jsonl` under `~/.tinyagent/sessions/<session_id>/`.
+
+Each turn creates one run and records the run reference.
+
+Do not add full session SSE yet unless needed.
+
+Add `agentctl session list`, `agentctl session resume`, or HTTP session endpoints only after the store works internally.
+
+Step 5: Add prior-context injection.
+
+Add `prior_messages` or `RunInput` to the kernel.
+
+Teach `ContextBuilder` to include a bounded `conversation:history` item.
+
+Build that history from the session ledger.
+
+Keep each turn independently replayable by writing the exact prior-context snapshot into the run artifacts.
+
+This is the first real core extension. It is small, but it unlocks multi-turn sessions without making the kernel long-lived.
+
+## 20. What not to build yet
+
+Do not build a full chat-session API before single-run streaming is proven.
+
+Do not change `RunState.done` semantics yet.
+
+Do not add SQLite yet. Hermes needs SQLite because it is a multi-platform persistent personal agent with full-text search and many message sources. Tinyagent can start with JSONL and add SQLite indexing later if session listing/search becomes slow. Hermes’s SQLite design is powerful, but it is heavier than tinyagent needs right now.
+
+Do not make React types part of the core.
+
+Do not create UI-specific event names.
+
+Do not make the browser responsible for provider configuration, authorization, or privacy filtering.
+
+Do not make “chat” the product center. The product center is the coding agent runtime.
+
+## 21. The main design decision
+
+The answer I would commit to is:
+
+Tinyagent should keep `Kernel.run` as the fundamental execution unit, make the runtime server a real event-streaming surface over that unit, and later add sessions as a lightweight controller-level sequence/tree of runs with a canonical message ledger.
+
+That gives you the benefits that Codex, Pi, Hermes, and OpenCode converge on — resume, branch, search, multi-surface interaction, and durable history — without prematurely turning the kernel into a long-lived chat loop.
+
+The first concrete milestone is therefore not “chat sessions.” It is:
+
+```text
+real provider + stream=True + filtered SSE + robust event reducer + final artifact fallback
+```
+
+Once that works, the missing core seams will be obvious under real use: prior context, session ledger, workspace lease, approval scope, cancel scope, and compaction across turns. Those should be added in that order.
+
+[1]: https://pi.dev/docs/latest/sessions?utm_source=chatgpt.com "Pi Coding Agent"
+[2]: https://pi.dev/docs/latest/session-format?utm_source=chatgpt.com "Pi Coding Agent"
+[3]: https://opencode.ai/?utm_source=chatgpt.com "OpenCode | The open source AI coding agent"

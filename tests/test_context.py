@@ -125,6 +125,32 @@ def test_apex_context_layers_environment_agents_task_and_budgeted_tools(tmp_path
     assert "older-noise" not in recent
 
 
+def test_apex_context_includes_prior_conversation_before_current_task(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    state = RunState.create(
+        "current request",
+        Workspace(tmp_path),
+        run_id="run_prior_context",
+        prior_messages=[
+            Message(role="user", content="previous question"),
+            Message(role="assistant", content="previous answer"),
+        ],
+    )
+    state.prior_context_artifact = "artifacts/prior-context.json"
+    profile = ApexCoderProfile(context_config=ContextConfig(compact_at_tokens=999_999))
+
+    built = profile.build_context(state)
+    layers = [message.meta.get("context_layer") for message in built.messages]
+
+    assert layers.index("conversation_history") < layers.index("task")
+    conversation = next(message.content for message in built.messages if message.meta.get("context_layer") == "conversation_history")
+    assert "previous question" in conversation
+    assert "previous answer" in conversation
+    assert "artifacts/prior-context.json" in conversation
+
+
 def test_kernel_compacts_at_turn_boundary_and_uses_checkpoint(tmp_path, monkeypatch) -> None:
     home = tmp_path / "home"
     home.mkdir()

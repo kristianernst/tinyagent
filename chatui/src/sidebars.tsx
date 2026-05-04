@@ -38,33 +38,26 @@ export function SidebarToggle({
   );
 }
 
-type Conversation = { id: string; title: string; time: string };
+export type Conversation = { id: string; title: string; time: string };
 type Project = { id: string; name: string; conversations: Conversation[] };
-
-const PROJECTS: Project[] = [
-  {
-    id: "p1",
-    name: "Workspace",
-    conversations: [
-      { id: "c1", title: "New conversation", time: "now" },
-    ],
-  },
-];
 
 export function LeftSidebar({
   open,
   onToggle,
   activeChat,
+  conversations,
   onPickChat,
   onNewChat,
 }: {
   open: boolean;
   onToggle: () => void;
   activeChat: string;
+  conversations: Conversation[];
   onPickChat: (id: string) => void;
   onNewChat: () => void;
 }) {
-  const [openProjects, setOpenProjects] = useState<Set<string>>(() => new Set(["p1"]));
+  const projects: Project[] = [{ id: "workspace", name: "Workspace", conversations }];
+  const [openProjects, setOpenProjects] = useState<Set<string>>(() => new Set(["workspace"]));
   const toggleProject = (id: string) =>
     setOpenProjects((s) => {
       const n = new Set(s);
@@ -100,7 +93,7 @@ export function LeftSidebar({
 
         <div className="sb-scroll">
           <div className="sb-section-label">Projects</div>
-          {PROJECTS.map((p, pi) => {
+          {projects.map((p, pi) => {
             const isOpen = openProjects.has(p.id);
             return (
               <div
@@ -117,17 +110,21 @@ export function LeftSidebar({
                 <div className="sb-collapsible" data-open={isOpen}>
                   <div className="sb-collapsible-inner">
                     <div className="sb-convs">
-                      {p.conversations.map((c, ci) => (
-                        <button
-                          key={c.id}
-                          className={`sb-conv ${activeChat === c.id ? "is-active" : ""}`}
-                          onClick={() => onPickChat(c.id)}
-                          style={{ ["--ci" as any]: ci }}
-                        >
-                          <span className="sb-conv-title">{c.title}</span>
-                          <span className="sb-conv-time">{c.time}</span>
-                        </button>
-                      ))}
+                      {p.conversations.length === 0 ? (
+                        <div className="sb-empty sb-empty-compact">No conversations yet</div>
+                      ) : (
+                        p.conversations.map((c, ci) => (
+                          <button
+                            key={c.id}
+                            className={`sb-conv ${activeChat === c.id ? "is-active" : ""}`}
+                            onClick={() => onPickChat(c.id)}
+                            style={{ ["--ci" as any]: ci }}
+                          >
+                            <span className="sb-conv-title">{c.title}</span>
+                            <span className="sb-conv-time">{c.time}</span>
+                          </button>
+                        ))
+                      )}
                     </div>
                   </div>
                 </div>
@@ -217,16 +214,26 @@ function ArtifactItem({ artifact, index }: { artifact: Artifact; index: number }
         : artifact.kind === "code"
           ? IconCode
           : IconFile;
-  return (
-    <button
-      className={`sb-artifact sb-artifact-${artifact.state || "done"} fade-up-sm`}
-      style={{ ["--i" as any]: index }}
-      title={artifact.title}
-    >
+  const content = (
+    <>
       <span className="sb-artifact-ico">
         <Ico size={14} strokeWidth={2} />
       </span>
       <span className="sb-artifact-title">{artifact.title}</span>
+    </>
+  );
+  const className = `sb-artifact sb-artifact-${artifact.state || "done"} fade-up-sm`;
+  const style = { ["--i" as any]: index };
+  if (artifact.href) {
+    return (
+      <a className={className} style={style} title={artifact.title} href={artifact.href} target="_blank" rel="noreferrer">
+        {content}
+      </a>
+    );
+  }
+  return (
+    <button className={className} style={style} title={artifact.title}>
+      {content}
     </button>
   );
 }

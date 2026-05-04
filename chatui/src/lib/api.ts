@@ -18,6 +18,21 @@ export type StartRunResponse = {
   run_id: string;
   run_path: string;
   status: string;
+  session_id?: string;
+  turn_id?: string;
+};
+
+export type SessionSummary = {
+  session_id: string;
+  title: string;
+  status: "open" | "closed";
+  active_turn_id: string | null;
+  created_at: string;
+  updated_at: string;
+  workspace: string;
+  turn_count: number;
+  last_run_id?: string;
+  last_turn_status?: string;
 };
 
 export type ApprovalDecision = "approved" | "denied" | "cancelled" | "expired";
@@ -26,7 +41,13 @@ const BASE = "/api";
 
 export async function startRun(
   task: string,
-  opts: { run_id?: string; approval_mode?: "yolo" | "on-request" | "never" } = {}
+  opts: {
+    run_id?: string;
+    approval_mode?: "yolo" | "on-request" | "never";
+    session_id?: string;
+    turn_id?: string;
+    parent_turn_id?: string;
+  } = {}
 ): Promise<StartRunResponse> {
   const res = await fetch(`${BASE}/runs`, {
     method: "POST",
@@ -64,6 +85,24 @@ export async function decideApproval(
   if (!res.ok) return false;
   const body = await res.json();
   return !!body.resolved;
+}
+
+export async function fetchArtifactText(runId: string, path: string): Promise<string> {
+  const segments = path.split("/").map(encodeURIComponent).join("/");
+  const res = await fetch(`${BASE}/runs/${encodeURIComponent(runId)}/artifacts/${segments}`);
+  if (!res.ok) {
+    throw new Error(`artifact fetch failed: ${res.status}`);
+  }
+  return res.text();
+}
+
+export async function listSessions(): Promise<SessionSummary[]> {
+  const res = await fetch(`${BASE}/sessions`);
+  if (!res.ok) {
+    throw new Error(`listSessions failed: ${res.status} ${await res.text()}`);
+  }
+  const body = await res.json();
+  return Array.isArray(body.sessions) ? body.sessions : [];
 }
 
 /**
@@ -115,16 +154,16 @@ export function streamRunEvents(
 }
 
 function parseSseBlock(block: string): RunEvent | null {
-  let dataLine: string | null = null;
+  const dataLines: string[] = [];
   for (const line of block.split("\n")) {
     if (line.startsWith(":")) continue;
     if (line.startsWith("data:")) {
-      dataLine = line.slice(5).trimStart();
+      dataLines.push(line.slice(5).trimStart());
     }
   }
-  if (!dataLine) return null;
+  if (dataLines.length === 0) return null;
   try {
-    return JSON.parse(dataLine) as RunEvent;
+    return JSON.parse(dataLines.join("\n")) as RunEvent;
   } catch {
     return null;
   }

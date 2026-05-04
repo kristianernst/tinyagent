@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -254,6 +255,8 @@ class RunState:
     transcript: Transcript = field(default_factory=_default_transcript)
     observations: list[Observation] = field(default_factory=list)
     finish_gate_messages: list[str] = field(default_factory=list)
+    prior_messages: tuple[Message, ...] = ()
+    prior_context_artifact: str = ""
     parent_run_id: str | None = None
     parent_event_id: str | None = None
     branch_name: str | None = None
@@ -274,6 +277,7 @@ class RunState:
         parent_run_id: str | None = None,
         parent_event_id: str | None = None,
         branch_name: str | None = None,
+        prior_messages: Sequence[Message] = (),
     ) -> RunState:
         resolved_workspace = Workspace(workspace.resolved_root())
         if not resolved_workspace.root.exists() or not resolved_workspace.root.is_dir():
@@ -293,6 +297,7 @@ class RunState:
             parent_run_id=parent_run_id,
             parent_event_id=parent_event_id,
             branch_name=branch_name,
+            prior_messages=tuple(prior_messages),
         )
 
     def emit(
