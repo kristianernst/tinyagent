@@ -19,6 +19,7 @@ from agentd.policy import default_policy
 from agentd.profiles import ApexCoderProfile
 from agentd.providers.openai_compat import OpenAICompatibleProvider
 from agentd.replay import replay_run
+from agentd.runtime import create_runtime_server
 from agentd.run_graph import fork_run
 from agentd.run_control import CancelToken, RunCancelled
 from agentd.run_record import load_run_record, render_run_inspection
@@ -65,6 +66,12 @@ def build_parser() -> argparse.ArgumentParser:
     fork_parser.add_argument("run_path", type=Path, help="Run directory or events.jsonl path.")
     fork_parser.add_argument("--at", required=True, help="Event id or sequence to fork from.")
     fork_parser.add_argument("--output-dir", type=Path)
+
+    serve_parser = subparsers.add_parser("serve", help="Serve live and recorded runs over HTTP.")
+    serve_parser.add_argument("--workspace", default=".")
+    serve_parser.add_argument("--host", default="127.0.0.1")
+    serve_parser.add_argument("--port", type=int, default=8765)
+    serve_parser.add_argument("--run-root", type=Path)
 
     eval_parser = subparsers.add_parser("eval", help="Run a local eval suite.")
     eval_parser.add_argument("suite_path", type=Path, help="Directory containing eval cases.")
@@ -171,6 +178,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"fork error: {exc}")
             return 1
         print(f"fork_dir: {path}")
+        return 0
+
+    if args.command == "serve":
+        server = create_runtime_server(Path(args.workspace), host=args.host, port=args.port, run_root=args.run_root)
+        print(f"serving tinyagent runtime on http://{args.host}:{server.server_port}")
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            return 130
+        finally:
+            server.server_close()
         return 0
 
     if args.command == "eval":
