@@ -193,7 +193,8 @@ def test_agentctl_run_rejects_invalid_debug_level(tmp_path, capsys) -> None:
     assert captured.out == "debug error: --debug must be non-negative.\n"
 
 
-def test_agentctl_accepts_new_sandbox_mode_choices_and_reports_missing_backend(tmp_path, capsys) -> None:
+def test_agentctl_accepts_new_sandbox_mode_choices_and_reports_missing_backend(tmp_path, capsys, monkeypatch) -> None:
+    monkeypatch.setattr("agentd.workspace.detect_container_backend", lambda: None)
     exit_code = main(
         [
             "run",
@@ -209,7 +210,7 @@ def test_agentctl_accepts_new_sandbox_mode_choices_and_reports_missing_backend(t
     captured = capsys.readouterr()
 
     assert exit_code == 1
-    assert "sandbox-mode=container requires a sandbox backend" in captured.out
+    assert "sandbox-mode=container requires a usable Docker or Podman backend" in captured.out
 
 
 def test_agentctl_run_missing_workspace_fails_cleanly(tmp_path, capsys) -> None:

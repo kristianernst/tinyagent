@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -1227,7 +1228,8 @@ def test_deprecated_worktree_sandbox_alias_maps_to_workspace_mode(tmp_path) -> N
     assert boundary.data["sandbox_enforced"] is False
 
 
-def test_container_sandbox_mode_fails_setup_until_backend_exists(tmp_path) -> None:
+def test_container_sandbox_mode_fails_setup_until_backend_exists(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("agentd.workspace.detect_container_backend", lambda: None)
     kernel = Kernel(
         model=FakeModelProvider([ModelResponse(content="done", finish_reason="stop")]),
         profile=ApexCoderProfile(),
@@ -1236,8 +1238,28 @@ def test_container_sandbox_mode_fails_setup_until_backend_exists(tmp_path) -> No
         sandbox_mode="container",
     )
 
-    with pytest.raises(ValueError, match="requires a sandbox backend"):
+    with pytest.raises(ValueError, match="requires a usable Docker or Podman backend"):
         kernel.run("use container sandbox", workspace=tmp_path, run_id="run_container_sandbox")
+
+
+def test_container_sandbox_mode_records_enforced_backend(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("agentd.workspace.detect_container_backend", lambda: "docker")
+    state = Kernel(
+        model=FakeModelProvider([ModelResponse(content="done", finish_reason="stop")]),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        sandbox_mode="container",
+    ).run("use container sandbox", workspace=tmp_path, run_id="run_container_sandbox")
+
+    boundary = next(event for event in state.events if event.type == "workspace.boundary")
+    assert boundary.data["sandbox_mode"] == "container"
+    assert boundary.data["sandbox_backend"] == "docker"
+    assert boundary.data["network_mode"] == "deny"
+    assert boundary.data["sandbox_enforced"] is True
+    preflight = next(event for event in state.events if event.type == "shell.preflight.completed")
+    assert preflight.data["authoritative"] is False
+    assert preflight.data["scope"] == "host-preflight-for-container"
 
 
 def test_shell_execution_envelope_exposes_sandbox_contract(tmp_path) -> None:
@@ -1252,6 +1274,69 @@ def test_shell_execution_envelope_exposes_sandbox_contract(tmp_path) -> None:
     assert envelope["sandbox_backend"] == "none"
     assert envelope["sandbox_enforced"] is False
     assert "escalation_hint" in envelope
+
+
+def test_shell_container_sandbox_wraps_process_with_isolated_home_and_network(tmp_path) -> None:
+    from agentd.tools.builtins.shell import _popen_command
+
+    home = tmp_path / "run" / "container-home"
+    envelope = SimpleNamespace(
+        sandbox_enforced=True,
+        sandbox_backend="docker",
+        container_home_host=home,
+        container_image="python:3.12-slim",
+        cwd=tmp_path,
+        network_mode="deny",
+    )
+
+    launch = _popen_command("printf ok", envelope, "call/one")
+    argv = launch.args
+
+    assert launch.shell is False
+    assert home.exists()
+    assert launch.cidfile == tmp_path / "run" / "container-cids" / "call-one.cid"
+    assert argv[:2] == ["docker", "run"]
+    assert "--pull" in argv
+    assert "never" in argv
+    assert "--cidfile" in argv
+    assert str(launch.cidfile) in argv
+    assert "--user" in argv
+    assert "--network" in argv
+    assert "none" in argv
+    assert f"{tmp_path}:/workspace:rw" in argv
+    assert f"{home}:/home/tinyagent:rw" in argv
+    assert "--tmpfs" in argv
+    assert "/workspace/.tinyagent:rw,noexec,nosuid,size=64m" in argv
+    assert "HOME=/home/tinyagent" in argv
+    assert "git config --global --add safe.directory /workspace" in argv[-1]
+    assert argv[-1].endswith("printf ok")
+
+
+def test_shell_container_timeout_kills_cidfile_container(tmp_path, monkeypatch) -> None:
+    from agentd.tools.builtins.shell import _ProcessLaunch, _terminate_container
+
+    cidfile = tmp_path / "container.cid"
+    cidfile.write_text("abc123\n")
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr("agentd.tools.builtins.shell.subprocess.run", fake_run)
+
+    _terminate_container(_ProcessLaunch(args=["docker"], shell=False, container_backend="docker", cidfile=cidfile))
+
+    assert calls == [["docker", "kill", "abc123"], ["docker", "rm", "-f", "abc123"]]
+
+
+def test_container_image_rejects_option_like_values(monkeypatch) -> None:
+    from agentd.container_sandbox import default_container_image
+
+    monkeypatch.setenv("TINYAGENT_CONTAINER_IMAGE", "--privileged")
+
+    with pytest.raises(ValueError, match="cannot start with"):
+        default_container_image()
 
 
 def test_policy_and_sandbox_denials_have_distinct_failure_dimensions(tmp_path) -> None:

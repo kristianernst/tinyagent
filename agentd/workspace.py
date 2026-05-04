@@ -8,6 +8,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from agentd.container_sandbox import default_container_image, detect_container_backend
+
 WorkspaceMode = Literal["auto", "worktree", "current"]
 SandboxMode = Literal["none", "container", "native"]
 SandboxModeInput = Literal["none", "worktree", "container", "native"]
@@ -124,8 +126,20 @@ def prepare_workspace(
         sandbox_alias = "worktree"
         sandbox_mode = "none"
         mode = "worktree"
-    if sandbox_mode in {"container", "native"}:
-        raise ValueError(f"sandbox-mode={sandbox_mode} requires a sandbox backend; no backend is configured yet")
+    sandbox_backend: SandboxBackend = "none"
+    sandbox_enforced = False
+    if sandbox_mode == "container":
+        detected_backend = detect_container_backend()
+        if detected_backend is None:
+            image = default_container_image()
+            raise ValueError(
+                "sandbox-mode=container requires a usable Docker or Podman backend "
+                f"with local image {image!r}; image pulls are disabled"
+            )
+        sandbox_backend = detected_backend
+        sandbox_enforced = True
+    elif sandbox_mode == "native":
+        raise ValueError("sandbox-mode=native requires a native sandbox backend; no backend is configured yet")
 
     use_worktree = mode == "worktree" or (mode == "auto" and dirty.is_git_repo and dirty.has_head and dirty.clean)
     if use_worktree:
@@ -150,9 +164,9 @@ def prepare_workspace(
         dirty_state_before=dirty,
         allowed_roots=(effective_root,),
         sandbox_mode=sandbox_mode,
-        sandbox_backend="none",
+        sandbox_backend=sandbox_backend,
         network_mode="deny",
-        sandbox_enforced=False,
+        sandbox_enforced=sandbox_enforced,
         sandbox_alias=sandbox_alias or (requested_sandbox_mode if requested_sandbox_mode != sandbox_mode else None),
     )
     return PreparedWorkspace(workspace=Workspace(effective_root), envelope=envelope, worktree_created=worktree_created)
