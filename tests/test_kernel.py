@@ -791,7 +791,7 @@ def test_streaming_reasoning_visibility_distinguishes_visible_and_private(tmp_pa
     assert state.failed is False
     assert state.final_output == "done"
     assert not any(event.type == "model.reasoning.delta" for event in state.events)
-    visible = next(event for event in sink.events if event.type == "model.reasoning.delta" and event.visibility == "internal")
+    visible = next(event for event in sink.events if event.type == "model.reasoning.delta" and event.data.get("delta") == "visible thought")
     safe_summary = [
         event for event in sink.events if event.type == "model.reasoning.delta" and event.data.get("delta") == "safe summary"
     ][0]
@@ -799,12 +799,19 @@ def test_streaming_reasoning_visibility_distinguishes_visible_and_private(tmp_pa
         event for event in sink.events if event.type == "model.reasoning.delta" and not event.data.get("delta")
     ][0]
     encrypted = next(event for event in sink.events if event.type == "reasoning.encrypted")
-    assert visible.visibility == "internal"
+    assert visible.visibility == "user"
     assert visible.data["delta"] == "visible thought"
+    assert visible.data["model_call_id"] == "model-call-0001"
     assert safe_summary.visibility == "user"
     assert safe_summary.data["delta"] == "safe summary"
+    assert safe_summary.data["model_call_id"] == "model-call-0001"
     assert private_summary.visibility == "debug"
-    assert private_summary.data == {"chars": 13, "item_id": None, "provider_field": "reasoning_content"}
+    assert private_summary.data == {
+        "chars": 13,
+        "item_id": None,
+        "model_call_id": "model-call-0001",
+        "provider_field": "reasoning_content",
+    }
     assert encrypted.visibility == "internal"
 
 

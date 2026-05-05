@@ -58,6 +58,7 @@ def test_agentctl_serve_uses_runtime_server_options(tmp_path, capsys, monkeypatc
         run_root,
         provider,
         model_name,
+        reasoning,
         stream,
         debug_level,
         workspace_mode,
@@ -72,6 +73,7 @@ def test_agentctl_serve_uses_runtime_server_options(tmp_path, capsys, monkeypatc
                 run_root,
                 provider,
                 model_name,
+                reasoning,
                 stream,
                 debug_level,
                 workspace_mode,
@@ -98,6 +100,8 @@ def test_agentctl_serve_uses_runtime_server_options(tmp_path, capsys, monkeypatc
             "fake",
             "--model",
             "fake-model",
+            "--reasoning-json",
+            '{"effort":"low"}',
             "--stream",
             "--debug",
             "1",
@@ -114,7 +118,20 @@ def test_agentctl_serve_uses_runtime_server_options(tmp_path, capsys, monkeypatc
     assert exit_code == 130
     assert "serving tinyagent runtime on http://127.0.0.2:9999" in captured.out
     assert calls == [
-        (tmp_path, "127.0.0.2", 1234, tmp_path / "runs", "fake", "fake-model", True, 1, "current", "yolo", "none"),
+        (
+            tmp_path,
+            "127.0.0.2",
+            1234,
+            tmp_path / "runs",
+            "fake",
+            "fake-model",
+            {"effort": "low"},
+            True,
+            1,
+            "current",
+            "yolo",
+            "none",
+        ),
         ("closed",),
     ]
 

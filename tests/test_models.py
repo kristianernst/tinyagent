@@ -16,8 +16,8 @@ from agentd.models import (
     ProviderError,
 )
 from agentd.policy import default_policy
-from agentd.providers.openai_compat import OpenAICompatibleConfig, OpenAICompatibleProvider
 from agentd.profiles import ApexCoderProfile
+from agentd.providers.openai_compat import OpenAICompatibleConfig, OpenAICompatibleProvider
 from agentd.state import Message, ModelResponse, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, Workspace
 from agentd.tools import default_tools
 
@@ -144,6 +144,7 @@ def test_openai_compatible_config_reads_environment() -> None:
             "TINYAGENT_MODEL_TIMEOUT_SECONDS": "12",
             "TINYAGENT_MODEL_CONTEXT_WINDOW": "64000",
             "TINYAGENT_MODEL_MAX_OUTPUT_TOKENS": "4000",
+            "TINYAGENT_MODEL_REASONING_JSON": '{"effort":"medium","budget_tokens":1024}',
             "TINYAGENT_MODEL_EXTRA_BODY_JSON": '{"max_tokens":128,"temperature":0}',
         }
     )
@@ -154,6 +155,7 @@ def test_openai_compatible_config_reads_environment() -> None:
     assert config.timeout_seconds == 12
     assert config.context_window == 64_000
     assert config.max_output_tokens == 4_000
+    assert config.reasoning == {"effort": "medium", "budget_tokens": 1024}
     assert config.extra_body == {"max_tokens": 128, "temperature": 0}
 
 
@@ -190,12 +192,26 @@ def test_openai_compatible_config_validates_extra_body_json() -> None:
         OpenAICompatibleConfig.from_env({**base_env, "TINYAGENT_MODEL_EXTRA_BODY_JSON": '{"messages":[]}'})
 
 
+def test_openai_compatible_config_validates_reasoning_json() -> None:
+    base_env = {
+        "TINYAGENT_MODEL_API_KEY": "key",
+        "TINYAGENT_MODEL_NAME": "model",
+    }
+
+    with pytest.raises(ProviderError, match="valid JSON"):
+        OpenAICompatibleConfig.from_env({**base_env, "TINYAGENT_MODEL_REASONING_JSON": "{"})
+
+    with pytest.raises(ProviderError, match="JSON object"):
+        OpenAICompatibleConfig.from_env({**base_env, "TINYAGENT_MODEL_REASONING_JSON": "true"})
+
+
 def test_openai_compatible_provider_merges_extra_body_without_overriding_stream_semantics() -> None:
     provider = OpenAICompatibleProvider(
         OpenAICompatibleConfig(
             base_url="https://models.example.test/v1",
             api_key="test-key",
             model="test-model",
+            reasoning={"effort": "low", "budget_tokens": 1024},
             extra_body={"max_tokens": 128, "temperature": 0, "stream_options": {"debug": True}},
         )
     )
@@ -207,10 +223,29 @@ def test_openai_compatible_provider_merges_extra_body_without_overriding_stream_
     assert payload["tools"] == [{"type": "function", "function": SampleTool.schema}]
     assert payload["max_tokens"] == 128
     assert payload["temperature"] == 0
+    assert payload["reasoning"] == {"effort": "low", "budget_tokens": 1024}
+    assert payload["thinking_budget_tokens"] == 1024
     assert payload["stream"] is True
     assert payload["stream_options"] == {"debug": True, "include_usage": True}
     assert provider.capabilities.tool_protocol == "chat_completions"
     assert provider.capabilities.input_budget_tokens == 120_000
+
+
+def test_openai_compatible_provider_preserves_explicit_thinking_budget_tokens() -> None:
+    provider = OpenAICompatibleProvider(
+        OpenAICompatibleConfig(
+            base_url="https://models.example.test/v1",
+            api_key="test-key",
+            model="test-model",
+            reasoning={"budget_tokens": 1024},
+            extra_body={"thinking_budget_tokens": 256},
+        )
+    )
+
+    payload = provider.build_payload([Message(role="user", content="hello")], [], _state_stub())
+
+    assert payload["reasoning"] == {"budget_tokens": 1024}
+    assert payload["thinking_budget_tokens"] == 256
 
 
 def test_kernel_fails_clearly_when_provider_does_not_support_tools(tmp_path) -> None:

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from agentd.contracts import ModelProvider
 from agentd.models import FakeModelProvider, ProviderError
@@ -20,6 +21,7 @@ ProviderKind = Literal["fake", "openai-compatible"]
 class ProviderSpec:
     kind: ProviderKind
     model: str | None = None
+    reasoning: dict[str, Any] | None = None
 
 
 def provider_for(spec: ProviderSpec, task: str, env: Mapping[str, str] | None = None) -> ModelProvider:
@@ -29,6 +31,8 @@ def provider_for(spec: ProviderSpec, task: str, env: Mapping[str, str] | None = 
         values = dict(os.environ if env is None else env)
         if spec.model:
             values["TINYAGENT_MODEL_NAME"] = spec.model
+        if spec.reasoning is not None:
+            values["TINYAGENT_MODEL_REASONING_JSON"] = json.dumps(spec.reasoning, sort_keys=True)
         return OpenAICompatibleProvider.from_env(values)
     raise ProviderError(f"Unknown provider: {spec.kind}")
 

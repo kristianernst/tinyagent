@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import signal
 import sys
@@ -51,6 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--workspace-mode", choices=["auto", "worktree", "current"], default="auto")
     run_parser.add_argument("--approval-mode", choices=["never", "on-request", "yolo"], default="yolo")
     run_parser.add_argument("--sandbox-mode", choices=["none", "container", "native", "worktree"], default="none")
+    run_parser.add_argument("--reasoning-json", help="JSON object passed as the provider's top-level reasoning parameter.")
     run_parser.add_argument("--run-id")
     run_parser.add_argument("--output-dir", type=Path)
     run_parser.add_argument(
@@ -83,6 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--run-root", type=Path)
     serve_parser.add_argument("--provider", choices=["fake", "openai-compatible"], default="fake")
     serve_parser.add_argument("--model")
+    serve_parser.add_argument("--reasoning-json", help="JSON object passed as the provider's top-level reasoning parameter.")
     serve_parser.add_argument("--stream", action="store_true", help="Stream model deltas through the runtime event stream.")
     serve_parser.add_argument(
         "--debug",
@@ -96,6 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser = subparsers.add_parser("eval", help="Run a local eval suite.")
     eval_parser.add_argument("suite_path", type=Path, help="Directory containing eval cases.")
     eval_parser.add_argument("--provider", choices=["fake", "openai-compatible"], default="fake")
+    eval_parser.add_argument("--reasoning-json", help="JSON object passed as the provider's top-level reasoning parameter.")
     eval_parser.add_argument("--output-dir", type=Path)
     eval_parser.add_argument("--thresholds", type=Path)
     eval_parser.add_argument("--workspace-mode", choices=["auto", "worktree", "current"], default="current")
@@ -136,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"debug error: {exc}")
             return 2
         try:
-            model = _model_for(args.provider, args.task)
+            model = _model_for(args.provider, args.task, reasoning_json=args.reasoning_json)
         except ProviderError as exc:
             print(f"provider error: {exc}")
             return 1
@@ -215,6 +219,7 @@ def main(argv: list[str] | None = None) -> int:
                 run_root=args.run_root,
                 provider=args.provider,
                 model_name=args.model,
+                reasoning=_parse_reasoning_json(args.reasoning_json),
                 stream=args.stream,
                 debug_level=debug_level,
                 workspace_mode=args.workspace_mode,
@@ -246,7 +251,7 @@ def main(argv: list[str] | None = None) -> int:
                 eval_run = run_eval_suite(
                     args.suite_path,
                     output_dir=output_dir,
-                    model_factory=lambda task: _model_for(args.provider, task),
+                    model_factory=lambda task: _model_for(args.provider, task, reasoning_json=args.reasoning_json),
                     profile=ApexCoderProfile(),
                     tools=default_tools(),
                     policy=default_policy(),
@@ -317,8 +322,24 @@ def _default_eval_compare_output_dir(suite_path: Path) -> Path:
     return default_dir.with_name(f"{default_dir.name}-compare")
 
 
-def _model_for(provider: str, task: str, *, model_name: str | None = None):
-    return provider_for(ProviderSpec(kind=provider, model=model_name), task, env=os.environ)  # type: ignore[arg-type]
+def _model_for(provider: str, task: str, *, model_name: str | None = None, reasoning_json: str | None = None):
+    return provider_for(
+        ProviderSpec(kind=provider, model=model_name, reasoning=_parse_reasoning_json(reasoning_json)),
+        task,
+        env=os.environ,
+    )  # type: ignore[arg-type]
+
+
+def _parse_reasoning_json(raw: str | None) -> dict | None:
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ProviderError(f"--reasoning-json must be valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ProviderError("--reasoning-json must be a JSON object.")
+    return parsed
 
 
 def _debug_level(level: int | None) -> int:

@@ -300,10 +300,21 @@ class RunStore:
         }
 
     def events(self, run_id: str, *, after_seq: int = 0) -> list[Event]:
-        path = self.run_path(run_id) / "events.jsonl"
-        if not path.exists():
+        run_path = self.run_path(run_id)
+        event_path = run_path / "events.jsonl"
+        if not event_path.exists():
             return []
-        return [event for event in load_events_jsonl(path) if event.seq > after_seq]
+        events = {event.seq: event for event in load_events_jsonl(event_path) if event.seq > after_seq}
+        surface_path = run_path / "surface-events.jsonl"
+        if surface_path.exists():
+            events.update(
+                {
+                    event.seq: event
+                    for event in load_events_jsonl(surface_path)
+                    if event.seq > after_seq
+                }
+            )
+        return [events[seq] for seq in sorted(events)]
 
     def artifact_path(self, run_id: str, relative_path: str) -> Path:
         run_path = self.run_path(run_id).resolve()
@@ -552,6 +563,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             if len(parts) == 3 and parts[:2] == ["api", "runs"]:
                 self._json(HTTPStatus.OK, self.server.controller.run_summary(parts[2]))
                 return
+            if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "events.json":
+                self._events_json(parts[2], parsed.query)
+                return
             if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "events":
                 self._events(parts[2], parsed.query)
                 return
@@ -655,6 +669,18 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionError):
             return
 
+    def _events_json(self, run_id: str, query: str) -> None:
+        if not self.server.controller.run_exists(run_id):
+            self._json(HTTPStatus.NOT_FOUND, {"error": f"run not found: {run_id}"})
+            return
+        after_seq = _after_seq(query, self.headers.get("Last-Event-ID"))
+        events = [
+            _surface_event_dict(event, self.server.controller.config.debug_level)
+            for event in self.server.controller.events(run_id, after_seq=after_seq)
+            if self._event_visible(event)
+        ]
+        self._json(HTTPStatus.OK, {"events": events})
+
     def _artifact(self, run_id: str, relative_path: str) -> None:
         if not self.server.controller.run_exists(run_id):
             self._json(HTTPStatus.NOT_FOUND, {"error": f"run not found: {run_id}"})
@@ -702,6 +728,7 @@ def create_runtime_server(
     *,
     provider: str = "fake",
     model_name: str | None = None,
+    reasoning: dict[str, Any] | None = None,
     stream: bool = True,
     debug_level: int = 0,
     workspace_mode: WorkspaceMode = "current",
@@ -712,7 +739,7 @@ def create_runtime_server(
     resolved_workspace = workspace.expanduser().resolve()
     root = (run_root or resolved_workspace / ".tinyagent" / "runs").expanduser().resolve()
     resolved_session_root = session_root.expanduser().resolve() if session_root is not None else None
-    spec = ProviderSpec(kind=provider, model=model_name)  # type: ignore[arg-type]
+    spec = ProviderSpec(kind=provider, model=model_name, reasoning=reasoning)  # type: ignore[arg-type]
     provider_for(spec, "provider validation")
     controller = RunController(
         RuntimeConfig(

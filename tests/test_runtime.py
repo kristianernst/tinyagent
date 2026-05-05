@@ -27,6 +27,12 @@ def test_runtime_server_starts_run_streams_reconnects_and_reads_artifact(tmp_pat
         assert "model.text.delta" in event_types
         assert "run.completed" in event_types
 
+        event_snapshot = _request(base, "GET", "/api/runs/run_runtime_smoke/events.json")
+        snapshot_types = [event["type"] for event in event_snapshot["events"]]
+        assert "run.started" in snapshot_types
+        assert "model.text.delta" in snapshot_types
+        assert "run.completed" in snapshot_types
+
         after_first = _sse(base, "/api/runs/run_runtime_smoke/events?after_seq=1")
         assert after_first
         assert min(event["seq"] for event in after_first) > 1
@@ -98,8 +104,10 @@ def test_runtime_retains_live_events_briefly_after_run_thread_exits(tmp_path) ->
         _wait_for_status(base, "run_retention", "completed")
 
         events = _sse(base, "/api/runs/run_retention/events")
+        event_snapshot = _request(base, "GET", "/api/runs/run_retention/events.json")
 
         assert any(event["type"] == "model.text.delta" for event in events)
+        assert any(event["type"] == "model.text.delta" for event in event_snapshot["events"])
         surface_log = tmp_path / ".tinyagent" / "runs" / "run_retention" / "surface-events.jsonl"
         surface_events = [json.loads(line) for line in surface_log.read_text().splitlines()]
         assert any(event["type"] == "model.text.delta" for event in surface_events)
@@ -403,7 +411,11 @@ class _InternalReasoningProvider:
 
     def stream(self, messages: list[Message], tools, state: RunState):
         del messages, tools, state
-        yield ModelDelta(kind="reasoning_visible_delta", delta="private thought")
+        yield ModelDelta(
+            kind="reasoning_summary_delta",
+            delta="private thought",
+            data={"safe_to_display": False},
+        )
         yield ModelDelta(kind="text_delta", delta="public answer")
         yield ModelDelta(kind="completed", data={"finish_reason": "stop"})
 

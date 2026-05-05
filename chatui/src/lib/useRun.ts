@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { cancelRun, decideApproval, fetchArtifactText, listSessions, startRun, streamRunEvents } from "./api";
+import {
+  cancelRun,
+  decideApproval,
+  fetchArtifactText,
+  fetchRunEvents,
+  listSessions,
+  startRun,
+  streamRunEvents,
+} from "./api";
 import type { ApprovalDecision, RunEvent, SessionSummary } from "./api";
 
 export type ToolStatus = "running" | "done" | "failed" | "blocked" | "cancelled";
@@ -99,6 +107,8 @@ const modelTextKey = (event: RunEvent): string =>
 
 const modelTextStepId = (modelCallId: string): string => `model-text-${modelCallId}`;
 
+const modelReasoningStepId = (modelCallId: string): string => `model-reasoning-${modelCallId}`;
+
 const lastPendingModelTextKey = (pending: Record<string, string>): string => {
   const keys = Object.keys(pending);
   return keys.length ? keys[keys.length - 1] : "";
@@ -137,6 +147,7 @@ export function useRun() {
   const activeRunIdRef = useRef<string | null>(null);
   const sessionIdRef = useRef<string | null>(null);
   const pendingModelTextRef = useRef<Record<string, string>>({});
+  const replayingRef = useRef(false);
   const lastSeqRef = useRef(0);
 
   const stopStream = useCallback(() => {
@@ -158,6 +169,13 @@ export function useRun() {
     setTurns((prev) => prev.map((t) => (t.id === id ? fn(t) : t)));
   }, []);
 
+  const clearActiveRun = useCallback((turnId: string) => {
+    if (activeTurnIdRef.current === turnId) {
+      activeTurnIdRef.current = null;
+      activeRunIdRef.current = null;
+    }
+  }, []);
+
   const handleEvent = useCallback(
     (turnId: string) => (event: RunEvent) => {
       lastSeqRef.current = Math.max(lastSeqRef.current, event.seq ?? 0);
@@ -165,14 +183,15 @@ export function useRun() {
       switch (event.type) {
         case "run.started": {
           updateTurn(turnId, (t) => ({ ...t, phase: "thinking" }));
-          setPhase("thinking");
+          if (!replayingRef.current) setPhase("thinking");
           break;
         }
         case "model.reasoning.delta": {
           if (!isUserVisible(event)) break;
           const delta = String(data.delta ?? "");
           if (!delta) break;
-          const reasoningId = event.item_id ?? event.id;
+          const modelCallId = typeof data.model_call_id === "string" ? data.model_call_id : "";
+          const reasoningId = modelCallId ? modelReasoningStepId(modelCallId) : event.item_id ?? event.id;
           updateTurn(turnId, (t) => {
             const idx = t.steps.findIndex((s) => s.kind === "text" && s.id === reasoningId);
             if (idx >= 0) {
@@ -189,7 +208,8 @@ export function useRun() {
           break;
         }
         case "model.reasoning.completed": {
-          const reasoningId = event.item_id ?? "";
+          const modelCallId = typeof data.model_call_id === "string" ? data.model_call_id : "";
+          const reasoningId = modelCallId ? modelReasoningStepId(modelCallId) : event.item_id ?? "";
           const finalText = typeof data.reason === "string" ? data.reason : "";
           if (!finalText) break;
           updateTurn(turnId, (t) => {
@@ -296,10 +316,8 @@ export function useRun() {
           if (!delta) break;
           const key = modelTextKey(event);
           pendingModelTextRef.current[key] = `${pendingModelTextRef.current[key] ?? ""}${delta}`;
-          updateTurn(turnId, (t) => {
-            setPhase("streaming");
-            return { ...t, answer: t.answer + delta, phase: "streaming" };
-          });
+          if (!replayingRef.current) setPhase("streaming");
+          updateTurn(turnId, (t) => ({ ...t, answer: t.answer + delta, phase: "streaming" }));
           break;
         }
         case "model.call.completed": {
@@ -377,11 +395,15 @@ export function useRun() {
           break;
         }
         case "run.completed": {
+          const durationSeconds = Number(data.duration_seconds);
           updateTurn(turnId, (t) => ({
             ...t,
             phase: "done",
-            durationSec: Math.max(1, Math.round((Date.now() - t.startedAt) / 1000)),
+            durationSec: Number.isFinite(durationSeconds) && durationSeconds > 0
+              ? Math.max(1, Math.round(durationSeconds))
+              : Math.max(1, Math.round((Date.now() - t.startedAt) / 1000)),
           }));
+          clearActiveRun(turnId);
           setPhase("idle");
           setArtifacts((prev) => prev.map((a) => ({ ...a, state: "done" })));
           refreshSessions();
@@ -389,19 +411,21 @@ export function useRun() {
         }
         case "run.failed": {
           updateTurn(turnId, (t) => ({ ...t, phase: "failed" }));
+          clearActiveRun(turnId);
           setPhase("idle");
           refreshSessions();
           break;
         }
         case "run.cancelled": {
           updateTurn(turnId, (t) => ({ ...t, phase: "cancelled" }));
+          clearActiveRun(turnId);
           setPhase("idle");
           refreshSessions();
           break;
         }
       }
     },
-    [updateTurn]
+    [clearActiveRun, refreshSessions, updateTurn]
   );
 
   const send = useCallback(
@@ -481,6 +505,80 @@ export function useRun() {
     refreshSessions();
   }, [refreshSessions, stopStream]);
 
+  const selectSession = useCallback(
+    async (sessionId: string) => {
+      stopStream();
+      const session = sessions.find((item) => item.session_id === sessionId);
+      sessionIdRef.current = sessionId;
+      activeTurnIdRef.current = null;
+      activeRunIdRef.current = null;
+      pendingModelTextRef.current = {};
+      lastSeqRef.current = 0;
+      setActiveSessionId(sessionId);
+      setTurns([]);
+      setArtifacts([]);
+      setApproval(null);
+      setError(null);
+      setPhase("idle");
+      if (!session?.last_run_id) return;
+
+      try {
+        const events = await fetchRunEvents(session.last_run_id);
+        const started = events.find((event) => event.type === "run.started");
+        const turnId =
+          started?.turn_id ||
+          session.active_turn_id ||
+          events.find((event) => event.turn_id)?.turn_id ||
+          `loaded_${session.last_run_id}`;
+        const task = String(started?.data?.task || session.title || "New conversation");
+        const startedAt = started?.time ? Date.parse(started.time) : NaN;
+        setTurns([
+          {
+            id: turnId,
+            runId: session.last_run_id,
+            user: task,
+            steps: [],
+            answer: "",
+            startedAt: Number.isNaN(startedAt) ? Date.now() : startedAt,
+            durationSec: 0,
+            phase: "thinking",
+          },
+        ]);
+        const applyEvent = handleEvent(turnId);
+        replayingRef.current = true;
+        try {
+          for (const event of events) {
+            lastSeqRef.current = Math.max(lastSeqRef.current, event.seq ?? 0);
+            applyEvent(event);
+          }
+          const sawTerminalEvent = events.some((event) =>
+            ["run.completed", "run.failed", "run.cancelled"].includes(event.type)
+          );
+          if (!sawTerminalEvent) {
+            const fallbackPhase: TurnPhase =
+              session.last_turn_status === "cancelled"
+                ? "cancelled"
+                : session.last_turn_status === "failed"
+                  ? "failed"
+                  : "done";
+            updateTurn(turnId, (t) => ({
+              ...t,
+              phase: fallbackPhase,
+            }));
+          }
+        } finally {
+          replayingRef.current = false;
+        }
+        setPhase("idle");
+      } catch (e) {
+        replayingRef.current = false;
+        setError(e instanceof Error ? e.message : String(e));
+        setPhase("idle");
+      }
+    },
+    [handleEvent, sessions, stopStream, updateTurn]
+  );
+
   const stop = useCallback(async () => {
     const runId = activeRunIdRef.current;
     if (runId) await cancelRun(runId);
@@ -512,6 +610,7 @@ export function useRun() {
     send,
     stop,
     newSession,
+    selectSession,
     respondToApproval,
   };
 }

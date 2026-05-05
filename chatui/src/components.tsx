@@ -133,7 +133,7 @@ export function Reasoning({
           {!isThinking && <IconCheck size={10} stroke="currentColor" strokeWidth={2} />}
         </span>
         <span className="label">
-          {isThinking ? "Thinking…" : `Thought for ${durationSec || 1}s`}
+          {isThinking ? "Running…" : `Worked for ${durationSec || 1}s`}
         </span>
         <IconChev className="chev" />
       </div>

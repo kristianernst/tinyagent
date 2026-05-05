@@ -105,6 +105,18 @@ export async function listSessions(): Promise<SessionSummary[]> {
   return Array.isArray(body.sessions) ? body.sessions : [];
 }
 
+export async function fetchRunEvents(runId: string, afterSeq = 0): Promise<RunEvent[]> {
+  const url = `${BASE}/runs/${encodeURIComponent(runId)}/events.json${
+    afterSeq > 0 ? `?after_seq=${afterSeq}` : ""
+  }`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`fetchRunEvents failed: ${res.status} ${await res.text()}`);
+  }
+  const body = await res.json();
+  return Array.isArray(body.events) ? body.events : [];
+}
+
 /**
  * Stream a run's SSE events using fetch + ReadableStream so every named event
  * (e.g. `event: model.text.delta`) is delivered to one handler. Returns an

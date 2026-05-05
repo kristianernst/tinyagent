@@ -154,7 +154,14 @@ def complete_model_call(
         assembler.accept(normalized)
         state.raise_if_cancelled()
     if trace.reasoning_seen:
-        state.emit("model.reasoning.completed", {"provider": model.name, "model_call_index": call_index})
+        state.emit(
+            "model.reasoning.completed",
+            {
+                "provider": model.name,
+                "model_call_id": state.current_model_call_id,
+                "model_call_index": call_index,
+            },
+        )
     try:
         response = assembler.response()
     except Exception as exc:
@@ -276,6 +283,8 @@ def _record_model_delta(state: RunState, provider: str, delta: ModelDelta) -> No
                 "chars": len(delta.delta),
                 "item_id": delta.item_id,
             }
+            if state.current_model_call_id:
+                data["model_call_id"] = state.current_model_call_id
             provider_field = delta.data.get("provider_field")
             if isinstance(provider_field, str) and provider_field:
                 data["provider_field"] = provider_field
@@ -291,13 +300,15 @@ def _record_model_delta(state: RunState, provider: str, delta: ModelDelta) -> No
             )
         case "reasoning_visible_delta":
             data = {"delta": delta.delta, "chars": len(delta.delta), "item_id": delta.item_id}
+            if state.current_model_call_id:
+                data["model_call_id"] = state.current_model_call_id
             provider_field = delta.data.get("provider_field")
             if isinstance(provider_field, str) and provider_field:
                 data["provider_field"] = provider_field
             state.emit(
                 "model.reasoning.delta",
                 data,
-                visibility="internal",
+                visibility="user",
                 durability="ephemeral",
                 item_id=delta.item_id,
             )

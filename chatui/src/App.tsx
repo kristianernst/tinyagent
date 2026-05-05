@@ -25,13 +25,13 @@ export function App() {
     send,
     stop,
     newSession,
+    selectSession,
     respondToApproval,
   } = useRun();
 
   const [leftOpen, setLeftOpen] = useState(true);
   const [rightOpen, setRightOpen] = useState(true);
   const [mode, setMode] = useState<Mode>("yolo");
-  const [pickedChat, setPickedChat] = useState("");
 
   const threadRef = useRef<HTMLDivElement>(null);
 
@@ -120,9 +120,9 @@ export function App() {
       <LeftSidebar
         open={leftOpen}
         onToggle={() => setLeftOpen((o) => !o)}
-        activeChat={activeSessionId ?? pickedChat}
+        activeChat={activeSessionId ?? ""}
         conversations={conversations}
-        onPickChat={setPickedChat}
+        onPickChat={(id) => void selectSession(id)}
         onNewChat={newChat}
       />
 
