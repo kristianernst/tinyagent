@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -13,26 +15,76 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 from uuid import uuid4
 
-from agentd.contracts import ApprovalHandler
-from agentd.events import Event, EventSink, load_events_jsonl
+from agentd.contracts import ApprovalHandler, ModelProvider
+from agentd.events import Event, EventSink, event_debug_level, load_events_jsonl
 from agentd.kernel import Kernel
-from agentd.models import FakeModelProvider
+from agentd.models import ProviderError
 from agentd.policy import default_policy
 from agentd.profiles import ApexCoderProfile
+from agentd.providers.factory import ProviderSpec, provider_for
 from agentd.run_control import CancelToken
 from agentd.run_graph import fork_run
 from agentd.run_record import load_run_record
-from agentd.state import ApprovalRequest, ApprovalResolution, ModelResponse, RunState, ToolCall
+from agentd.session import SessionStore
+from agentd.state import ApprovalMode, ApprovalRequest, ApprovalResolution, Message, RunState
 from agentd.tools import default_tools
+from agentd.workspace import SandboxModeInput, WorkspaceMode
 
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 TERMINAL_EVENT_TYPES = {"run.completed", "run.failed", "run.cancelled", "run.timed_out"}
+SURFACE_EVENT_TYPES = frozenset(
+    {
+        "run.started",
+        "turn.started",
+        "model.call.started",
+        "model.text.delta",
+        "model.message.completed",
+        "model.tool_call.assembly.completed",
+        "tool.execution.started",
+        "tool.execution.completed",
+        "tool.execution.failed",
+        "tool.execution.blocked",
+        "tool.execution.cancelled",
+        "approval.requested",
+        "approval.resolved",
+        "artifact.created",
+        "artifact.materialized",
+        "workspace.mutation.detected",
+        "run.completed",
+        "run.failed",
+        "run.cancelled",
+    }
+)
+LIVE_BUFFER_TTL_SECONDS = 300.0
+LIVE_BUFFER_MAX_EVENTS = 10_000
+DEFAULT_SURFACE_REDACTED_EVENT_DATA_KEYS = frozenset(
+    {
+        "artifact_path",
+        "context_artifact",
+        "context_report_artifact",
+        "logical_request_artifact",
+        "http_request_artifact",
+        "read_hints",
+    }
+)
+DEFAULT_SURFACE_REDACTED_PATH_PATTERN = re.compile(
+    r"(?:(?:[^\s\"']*/)?\.tinyagent/runs/[^\s\"']+/(?:context/[^\s\"']+|artifacts/(?:context|context-report|model-request)[^\s\"']*)"
+    r"|context/[^\s\"']+"
+    r"|artifacts/(?:context|context-report|model-request)[^\s\"']*)"
+)
 
 
 @dataclass(frozen=True)
 class RuntimeConfig:
     workspace: Path
     run_root: Path
+    provider_factory: Callable[[str], ModelProvider]
+    stream: bool = True
+    debug_level: int = 0
+    workspace_mode: WorkspaceMode = "current"
+    approval_mode: ApprovalMode = "yolo"
+    sandbox_mode: SandboxModeInput = "none"
+    session_store: SessionStore | None = None
 
 
 class ApprovalBroker(ApprovalHandler):
@@ -113,21 +165,31 @@ class ApprovalBroker(ApprovalHandler):
 
 
 class RunBus(EventSink):
-    def __init__(self) -> None:
+    def __init__(self, *, ttl_seconds: float = LIVE_BUFFER_TTL_SECONDS, max_events: int = LIVE_BUFFER_MAX_EVENTS) -> None:
         self._condition = threading.Condition()
         self._events_by_run: dict[str, list[Event]] = {}
+        self._terminal_at_by_run: dict[str, float] = {}
+        self._ttl_seconds = ttl_seconds
+        self._max_events = max_events
 
     def emit(self, event: Event) -> None:
         with self._condition:
+            self._purge_expired_locked()
             self._events_by_run.setdefault(event.run_id, []).append(event)
+            if len(self._events_by_run[event.run_id]) > self._max_events:
+                self._events_by_run[event.run_id] = self._events_by_run[event.run_id][-self._max_events :]
+            if event.type in TERMINAL_EVENT_TYPES:
+                self._terminal_at_by_run[event.run_id] = time.monotonic()
             self._condition.notify_all()
 
     def events_after(self, run_id: str, after_seq: int = 0) -> list[Event]:
         with self._condition:
+            self._purge_expired_locked()
             return [event for event in self._events_by_run.get(run_id, []) if event.seq > after_seq]
 
     def wait_for_event(self, run_id: str, after_seq: int, timeout: float = 0.5) -> list[Event]:
         with self._condition:
+            self._purge_expired_locked()
             self._condition.wait_for(
                 lambda: any(event.seq > after_seq for event in self._events_by_run.get(run_id, [])),
                 timeout=timeout,
@@ -136,12 +198,60 @@ class RunBus(EventSink):
 
     def last_seq(self, run_id: str) -> int:
         with self._condition:
+            self._purge_expired_locked()
             events = self._events_by_run.get(run_id, [])
             return events[-1].seq if events else 0
 
     def cleanup_run(self, run_id: str) -> None:
+        self.mark_terminal(run_id)
+
+    def mark_terminal(self, run_id: str) -> None:
+        with self._condition:
+            if run_id in self._events_by_run:
+                self._terminal_at_by_run[run_id] = time.monotonic()
+            else:
+                self._terminal_at_by_run.pop(run_id, None)
+
+    def _purge_expired_locked(self) -> None:
+        now = time.monotonic()
+        expired = [
+            run_id
+            for run_id, terminal_at in self._terminal_at_by_run.items()
+            if now - terminal_at >= self._ttl_seconds
+        ]
+        for run_id in expired:
+            self._events_by_run.pop(run_id, None)
+            self._terminal_at_by_run.pop(run_id, None)
+
+    def drop_run(self, run_id: str) -> None:
         with self._condition:
             self._events_by_run.pop(run_id, None)
+            self._terminal_at_by_run.pop(run_id, None)
+
+
+class TeeEventSink(EventSink):
+    def __init__(self, *sinks: EventSink) -> None:
+        self._sinks = sinks
+
+    def emit(self, event: Event) -> None:
+        for sink in self._sinks:
+            sink.emit(event)
+
+
+class SurfaceEventLogSink(EventSink):
+    def __init__(self, output_dir: Path, *, debug_level: int) -> None:
+        self._path = output_dir / "surface-events.jsonl"
+        self._debug_level = debug_level
+        self._lock = threading.Lock()
+
+    def emit(self, event: Event) -> None:
+        if not _surface_event_visible(event, self._debug_level):
+            return
+        payload = _surface_event_dict(event, self._debug_level)
+        with self._lock:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            with self._path.open("a") as file:
+                file.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
 class RunStore:
@@ -190,10 +300,21 @@ class RunStore:
         }
 
     def events(self, run_id: str, *, after_seq: int = 0) -> list[Event]:
-        path = self.run_path(run_id) / "events.jsonl"
-        if not path.exists():
+        run_path = self.run_path(run_id)
+        event_path = run_path / "events.jsonl"
+        if not event_path.exists():
             return []
-        return [event for event in load_events_jsonl(path) if event.seq > after_seq]
+        events = {event.seq: event for event in load_events_jsonl(event_path) if event.seq > after_seq}
+        surface_path = run_path / "surface-events.jsonl"
+        if surface_path.exists():
+            events.update(
+                {
+                    event.seq: event
+                    for event in load_events_jsonl(surface_path)
+                    if event.seq > after_seq
+                }
+            )
+        return [events[seq] for seq in sorted(events)]
 
     def artifact_path(self, run_id: str, relative_path: str) -> Path:
         run_path = self.run_path(run_id).resolve()
@@ -216,7 +337,66 @@ class RunController:
         self._threads: dict[str, threading.Thread] = {}
         self._reserved_run_ids: set[str] = set()
 
-    def start_run(self, task: str, *, run_id: str | None = None, approval_mode: str = "yolo") -> dict[str, Any]:
+    def start_run(self, task: str, *, run_id: str | None = None, approval_mode: str | None = None) -> dict[str, Any]:
+        return self._start_run(task, run_id=run_id, approval_mode=approval_mode)
+
+    def start_session_turn(
+        self,
+        session_id: str,
+        task: str,
+        *,
+        turn_id: str | None = None,
+        parent_turn_id: str | None = None,
+        run_id: str | None = None,
+        approval_mode: str | None = None,
+    ) -> dict[str, Any]:
+        if self.config.session_store is None:
+            raise ValueError("session store is not configured")
+        resolved_turn_id = turn_id or f"turn_{uuid4().hex}"
+        self.config.session_store.ensure(workspace=self.config.workspace, session_id=session_id, title=task[:80])
+        self._wait_for_session_idle(session_id)
+        prior_messages = self.config.session_store.prior_messages(session_id)
+        return self._start_run(
+            task,
+            run_id=run_id,
+            approval_mode=approval_mode,
+            prior_messages=prior_messages,
+            session_id=session_id,
+            turn_id=resolved_turn_id,
+            parent_turn_id=parent_turn_id,
+        )
+
+    def _wait_for_session_idle(self, session_id: str, *, timeout: float = 10.0) -> None:
+        if self.config.session_store is None:
+            return
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            turns = self.config.session_store.turns(session_id)
+            completed = {
+                str(turn.get("run_id"))
+                for turn in turns
+                if turn.get("type") == "turn.completed" and turn.get("run_id")
+            }
+            pending = [
+                str(turn.get("run_id"))
+                for turn in turns
+                if turn.get("type") == "turn.started" and turn.get("run_id") and str(turn.get("run_id")) not in completed
+            ]
+            if not pending or not any(self.is_active(run_id) for run_id in pending):
+                return
+            time.sleep(0.05)
+
+    def _start_run(
+        self,
+        task: str,
+        *,
+        run_id: str | None = None,
+        approval_mode: str | None = None,
+        prior_messages=(),
+        session_id: str | None = None,
+        turn_id: str | None = None,
+        parent_turn_id: str | None = None,
+    ) -> dict[str, Any]:
         token = CancelToken()
         resolved_run_id = run_id or f"run_server_{uuid4().hex}"
         output_dir = self.store.run_path(resolved_run_id)
@@ -226,28 +406,64 @@ class RunController:
                 raise ValueError(f"run already exists: {resolved_run_id}")
             self._reserved_run_ids.add(resolved_run_id)
             self._cancel_tokens[resolved_run_id] = token
-        kernel = Kernel(
-            model=FakeModelProvider(_fake_responses(task)),
-            profile=ApexCoderProfile(),
-            tools=default_tools(),
-            policy=default_policy(),
-            approval_handler=self.approvals,
-            event_sink=self.bus,
-            workspace_mode="current",
-            approval_mode=approval_mode,  # type: ignore[arg-type]
-        )
+        resolved_approval_mode = approval_mode or self.config.approval_mode
+        try:
+            kernel = Kernel(
+                model=self.config.provider_factory(task),
+                profile=ApexCoderProfile(),
+                tools=default_tools(),
+                policy=default_policy(),
+                approval_handler=self.approvals,
+                event_sink=TeeEventSink(
+                    self.bus,
+                    SurfaceEventLogSink(output_dir, debug_level=self.config.debug_level),
+                ),
+                stream=self.config.stream,
+                workspace_mode=self.config.workspace_mode,
+                approval_mode=resolved_approval_mode,  # type: ignore[arg-type]
+                sandbox_mode=self.config.sandbox_mode,
+            )
+        except Exception:
+            with self._lock:
+                self._cancel_tokens.pop(resolved_run_id, None)
+                self._reserved_run_ids.discard(resolved_run_id)
+            raise
+
+        if session_id and turn_id and self.config.session_store is not None:
+            self.config.session_store.record_turn_started(
+                session_id=session_id,
+                turn_id=turn_id,
+                run_id=resolved_run_id,
+                run_path=output_dir,
+                workspace=self.config.workspace,
+                user_message=Message(role="user", content=task),
+                parent_turn_id=parent_turn_id,
+            )
+
         def target() -> None:
+            state: RunState | None = None
             try:
-                kernel.run(
+                state = kernel.run(
                     task,
                     workspace=self.config.workspace,
                     run_id=resolved_run_id,
                     output_dir=output_dir,
                     cancel_token=token,
-                    workspace_mode="current",
-                    approval_mode=approval_mode,  # type: ignore[arg-type]
+                    stream=self.config.stream,
+                    workspace_mode=self.config.workspace_mode,
+                    approval_mode=resolved_approval_mode,  # type: ignore[arg-type]
+                    sandbox_mode=self.config.sandbox_mode,
+                    prior_messages=prior_messages,
                 )
             finally:
+                if state is not None and session_id and turn_id and self.config.session_store is not None:
+                    self.config.session_store.record_run_turn(
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        user_content=task,
+                        state=state,
+                        parent_turn_id=parent_turn_id,
+                    )
                 with self._lock:
                     self._threads.pop(resolved_run_id, None)
                     self._cancel_tokens.pop(resolved_run_id, None)
@@ -259,7 +475,12 @@ class RunController:
         with self._lock:
             self._threads[resolved_run_id] = thread
         thread.start()
-        return {"run_id": resolved_run_id, "run_path": str(output_dir), "status": "running"}
+        payload = {"run_id": resolved_run_id, "run_path": str(output_dir), "status": "running"}
+        if session_id:
+            payload["session_id"] = session_id
+        if turn_id:
+            payload["turn_id"] = turn_id
+        return payload
 
     def cancel(self, run_id: str, reason: str = "server_cancelled") -> bool:
         if any(event.type in TERMINAL_EVENT_TYPES for event in self.store.events(run_id)):
@@ -331,8 +552,19 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             if parts == ["api", "runs"]:
                 self._json(HTTPStatus.OK, {"runs": self.server.controller.store.list_runs()})
                 return
+            if parts == ["api", "sessions"]:
+                sessions = (
+                    self.server.controller.config.session_store.list(workspace=self.server.controller.config.workspace)
+                    if self.server.controller.config.session_store is not None
+                    else []
+                )
+                self._json(HTTPStatus.OK, {"sessions": sessions})
+                return
             if len(parts) == 3 and parts[:2] == ["api", "runs"]:
                 self._json(HTTPStatus.OK, self.server.controller.run_summary(parts[2]))
+                return
+            if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "events.json":
+                self._events_json(parts[2], parsed.query)
                 return
             if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "events":
                 self._events(parts[2], parsed.query)
@@ -344,7 +576,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
         except FileNotFoundError as exc:
             self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, ProviderError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
 
     def do_POST(self) -> None:
@@ -357,12 +589,26 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 if not task:
                     self._json(HTTPStatus.BAD_REQUEST, {"error": "task is required"})
                     return
+                session_id = str(body.get("session_id") or "")
+                if session_id:
+                    self._json(
+                        HTTPStatus.ACCEPTED,
+                        self.server.controller.start_session_turn(
+                            session_id,
+                            task,
+                            run_id=body.get("run_id"),
+                            turn_id=body.get("turn_id"),
+                            parent_turn_id=body.get("parent_turn_id"),
+                            approval_mode=str(body.get("approval_mode") or self.server.controller.config.approval_mode),
+                        ),
+                    )
+                    return
                 self._json(
                     HTTPStatus.ACCEPTED,
                     self.server.controller.start_run(
                         task,
                         run_id=body.get("run_id"),
-                        approval_mode=str(body.get("approval_mode") or "yolo"),
+                        approval_mode=str(body.get("approval_mode") or self.server.controller.config.approval_mode),
                     ),
                 )
                 return
@@ -390,7 +636,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
         except FileNotFoundError as exc:
             self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, ProviderError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -409,7 +655,8 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             while True:
                 events = self.server.controller.events(run_id, after_seq=after_seq)
                 for event in events:
-                    self._write_sse(event)
+                    if self._event_visible(event):
+                        self._write_sse(event)
                     after_seq = max(after_seq, event.seq)
                 if events and events[-1].type in TERMINAL_EVENT_TYPES:
                     break
@@ -421,6 +668,18 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 self.server.controller.bus.wait_for_event(run_id, after_seq, timeout=0.5)
         except (BrokenPipeError, ConnectionError):
             return
+
+    def _events_json(self, run_id: str, query: str) -> None:
+        if not self.server.controller.run_exists(run_id):
+            self._json(HTTPStatus.NOT_FOUND, {"error": f"run not found: {run_id}"})
+            return
+        after_seq = _after_seq(query, self.headers.get("Last-Event-ID"))
+        events = [
+            _surface_event_dict(event, self.server.controller.config.debug_level)
+            for event in self.server.controller.events(run_id, after_seq=after_seq)
+            if self._event_visible(event)
+        ]
+        self._json(HTTPStatus.OK, {"events": events})
 
     def _artifact(self, run_id: str, relative_path: str) -> None:
         if not self.server.controller.run_exists(run_id):
@@ -438,9 +697,12 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         self.wfile.write(content)
 
     def _write_sse(self, event: Event) -> None:
-        payload = json.dumps(event.to_json_dict(), sort_keys=True)
+        payload = json.dumps(_surface_event_dict(event, self.server.controller.config.debug_level), sort_keys=True)
         self.wfile.write(f"id: {event.seq}\nevent: {event.type}\ndata: {payload}\n\n".encode())
         self.wfile.flush()
+
+    def _event_visible(self, event: Event) -> bool:
+        return _surface_event_visible(event, self.server.controller.config.debug_level)
 
     def _read_body(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length") or "0")
@@ -458,10 +720,40 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def create_runtime_server(workspace: Path, host: str = "127.0.0.1", port: int = 8765, run_root: Path | None = None) -> RuntimeHTTPServer:
+def create_runtime_server(
+    workspace: Path,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    run_root: Path | None = None,
+    *,
+    provider: str = "fake",
+    model_name: str | None = None,
+    reasoning: dict[str, Any] | None = None,
+    stream: bool = True,
+    debug_level: int = 0,
+    workspace_mode: WorkspaceMode = "current",
+    approval_mode: ApprovalMode = "yolo",
+    sandbox_mode: SandboxModeInput = "none",
+    session_root: Path | None = None,
+) -> RuntimeHTTPServer:
     resolved_workspace = workspace.expanduser().resolve()
     root = (run_root or resolved_workspace / ".tinyagent" / "runs").expanduser().resolve()
-    controller = RunController(RuntimeConfig(workspace=resolved_workspace, run_root=root))
+    resolved_session_root = session_root.expanduser().resolve() if session_root is not None else None
+    spec = ProviderSpec(kind=provider, model=model_name, reasoning=reasoning)  # type: ignore[arg-type]
+    provider_for(spec, "provider validation")
+    controller = RunController(
+        RuntimeConfig(
+            workspace=resolved_workspace,
+            run_root=root,
+            provider_factory=lambda task: provider_for(spec, task),
+            stream=stream,
+            debug_level=debug_level,
+            workspace_mode=workspace_mode,
+            approval_mode=approval_mode,
+            sandbox_mode=sandbox_mode,
+            session_store=SessionStore(resolved_session_root),
+        )
+    )
     return RuntimeHTTPServer((host, port), controller)
 
 
@@ -476,6 +768,35 @@ def _after_seq(query: str, last_event_id: str | None) -> int:
         return int(candidate or 0)
     except ValueError:
         return 0
+
+
+def _redact_default_surface_data(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _redact_default_surface_data(item)
+            for key, item in value.items()
+            if key not in DEFAULT_SURFACE_REDACTED_EVENT_DATA_KEYS
+        }
+    if isinstance(value, list):
+        return [_redact_default_surface_data(item) for item in value]
+    if isinstance(value, str):
+        return DEFAULT_SURFACE_REDACTED_PATH_PATTERN.sub("[redacted]", value)
+    return value
+
+
+def _surface_event_visible(event: Event, debug_level: int) -> bool:
+    if event.visibility == "internal":
+        return False
+    if event.visibility in {"public", "user"}:
+        return True
+    return event_debug_level(event) <= debug_level
+
+
+def _surface_event_dict(event: Event, debug_level: int) -> dict[str, Any]:
+    payload = event.to_json_dict()
+    if debug_level <= 0:
+        payload["data"] = _redact_default_surface_data(payload["data"])
+    return payload
 
 
 def _status_from_events(events: list[Event], *, active: bool = False) -> str:
@@ -493,17 +814,3 @@ def _status_from_events(events: list[Event], *, active: bool = False) -> str:
 def _validate_run_id(run_id: str) -> None:
     if not run_id or not RUN_ID_PATTERN.fullmatch(run_id):
         raise ValueError(f"invalid run_id: {run_id}")
-
-
-def _fake_responses(task: str) -> list[ModelResponse]:
-    if "sleep" in task:
-        return [
-            ModelResponse(tool_calls=(ToolCall(id="call_sleep", name="shell", args={"cmd": "python -c 'import time; time.sleep(20)'"}),)),
-            ModelResponse(content="sleep done", finish_reason="stop"),
-        ]
-    if "approval" in task:
-        return [
-            ModelResponse(tool_calls=(ToolCall(id="call_approval", name="shell", args={"cmd": "printf approved > ../approved.txt"}),)),
-            ModelResponse(content="approval done", finish_reason="stop"),
-        ]
-    return [ModelResponse(content=f"Fake run finished: {task}", finish_reason="stop")]

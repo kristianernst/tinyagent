@@ -34,6 +34,8 @@ def test_agentctl_serve_help_exits_successfully(capsys) -> None:
     assert "--host" in captured.out
     assert "--port" in captured.out
     assert "--run-root" in captured.out
+    assert "--provider" in captured.out
+    assert "--stream" in captured.out
 
 
 def test_agentctl_serve_uses_runtime_server_options(tmp_path, capsys, monkeypatch) -> None:
@@ -48,8 +50,37 @@ def test_agentctl_serve_uses_runtime_server_options(tmp_path, capsys, monkeypatc
         def server_close(self):
             calls.append(("closed",))
 
-    def fake_create_runtime_server(workspace, *, host, port, run_root):
-        calls.append((Path(workspace), host, port, run_root))
+    def fake_create_runtime_server(
+        workspace,
+        *,
+        host,
+        port,
+        run_root,
+        provider,
+        model_name,
+        reasoning,
+        stream,
+        debug_level,
+        workspace_mode,
+        approval_mode,
+        sandbox_mode,
+    ):
+        calls.append(
+            (
+                Path(workspace),
+                host,
+                port,
+                run_root,
+                provider,
+                model_name,
+                reasoning,
+                stream,
+                debug_level,
+                workspace_mode,
+                approval_mode,
+                sandbox_mode,
+            )
+        )
         return FakeServer()
 
     monkeypatch.setattr(cli, "create_runtime_server", fake_create_runtime_server)
@@ -65,13 +96,44 @@ def test_agentctl_serve_uses_runtime_server_options(tmp_path, capsys, monkeypatc
             "1234",
             "--run-root",
             str(tmp_path / "runs"),
+            "--provider",
+            "fake",
+            "--model",
+            "fake-model",
+            "--reasoning-json",
+            '{"effort":"low"}',
+            "--stream",
+            "--debug",
+            "1",
+            "--workspace-mode",
+            "current",
+            "--approval-mode",
+            "yolo",
+            "--sandbox-mode",
+            "none",
         ]
     )
     captured = capsys.readouterr()
 
     assert exit_code == 130
     assert "serving tinyagent runtime on http://127.0.0.2:9999" in captured.out
-    assert calls == [(tmp_path, "127.0.0.2", 1234, tmp_path / "runs"), ("closed",)]
+    assert calls == [
+        (
+            tmp_path,
+            "127.0.0.2",
+            1234,
+            tmp_path / "runs",
+            "fake",
+            "fake-model",
+            {"effort": "low"},
+            True,
+            1,
+            "current",
+            "yolo",
+            "none",
+        ),
+        ("closed",),
+    ]
 
 
 def test_agentctl_version_exits_successfully(capsys) -> None:
@@ -279,6 +341,26 @@ def test_agentctl_run_openai_compatible_missing_env_fails_cleanly(tmp_path, caps
 
     assert exit_code == 1
     assert captured.out == "provider error: TINYAGENT_MODEL_API_KEY is required for openai-compatible provider.\n"
+    assert captured.err == ""
+
+
+def test_agentctl_serve_openai_compatible_missing_env_fails_cleanly(tmp_path, capsys, monkeypatch) -> None:
+    monkeypatch.delenv("TINYAGENT_MODEL_API_KEY", raising=False)
+    monkeypatch.delenv("TINYAGENT_MODEL_NAME", raising=False)
+
+    exit_code = main(
+        [
+            "serve",
+            "--provider",
+            "openai-compatible",
+            "--workspace",
+            str(tmp_path),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert captured.out == "serve error: TINYAGENT_MODEL_API_KEY is required for openai-compatible provider.\n"
     assert captured.err == ""
 
 

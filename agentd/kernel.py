@@ -21,6 +21,8 @@ from agentd.observations import Observation, extract_observations
 from agentd.output import (
     capture_final_diff,
     write_context_report_artifact,
+    write_final_text,
+    write_json_artifact,
     write_model_http_request_artifact,
     write_model_request_artifacts,
     write_model_response_artifact,
@@ -109,6 +111,7 @@ class Kernel:
         parent_run_id: str | None = None,
         parent_event_id: str | None = None,
         branch_name: str | None = None,
+        prior_messages: Sequence[Message] = (),
     ) -> RunState:
         resolved_run_id = run_id or f"run_{uuid4().hex}"
         prepared_workspace = prepare_workspace(
@@ -129,6 +132,7 @@ class Kernel:
             parent_run_id=parent_run_id,
             parent_event_id=parent_event_id,
             branch_name=branch_name,
+            prior_messages=prior_messages,
         )
         state.workspace_envelope = prepared_workspace.envelope
         state.model_spec = model_spec(self.model).to_json_dict()
@@ -168,6 +172,18 @@ class Kernel:
                     "branch_name": state.branch_name,
                 },
             )
+            if state.prior_messages:
+                state.prior_context_artifact = write_json_artifact(
+                    state,
+                    "prior-context.json",
+                    {
+                        "messages": [
+                            {"role": message.role, "content": json_safe(message.content), "meta": json_safe(message.meta)}
+                            for message in state.prior_messages
+                        ],
+                    },
+                    kind="prior_context",
+                )
             self._emit_workspace_boundary(state, prepared_workspace.worktree_created)
             if "shell" in self.tools:
                 state.shell_preflight = shell_preflight(state)
@@ -295,6 +311,7 @@ class Kernel:
                     "logical_request_artifact": request_artifact,
                     "http_request_artifact": http_request_artifact,
                 },
+                visibility="user",
             )
 
             try:
@@ -591,7 +608,11 @@ class Kernel:
         self._record_mutation_event(state, "workspace.mutation.started", call)
         state.emit("workspace.delta.started", {"tool_call_id": call.id, "tool": call.name})
         before_delta = self.workspace_delta_observer.snapshot(state)
-        state.emit("tool.execution.started", {"tool_call_id": call.id, "tool_execution_id": tool_execution_id, "tool": call.name})
+        state.emit(
+            "tool.execution.started",
+            {"tool_call_id": call.id, "tool_execution_id": tool_execution_id, "tool": call.name},
+            visibility="user",
+        )
         state.start_step("tool_execution", tool_execution_id, data={"tool_call_id": call.id, "tool": call.name})
         try:
             result = self.executor.run_tool(tool, call, state)
@@ -653,7 +674,12 @@ class Kernel:
     def _record_workspace_delta(self, state: RunState, call: ToolCall, result: ToolResult, delta) -> None:
         payload = {"tool_call_id": call.id, "tool": call.name, "ok": result.ok, "failure_kind": result.failure_kind, **delta.to_json_dict()}
         state.emit("workspace.delta.completed", payload)
-        state.emit("workspace.mutation.detected", payload, visibility="user", artifact_refs=[delta.diff_artifact] if delta.diff_artifact else [])
+        state.emit(
+            "workspace.mutation.detected",
+            payload,
+            visibility="user",
+            artifact_refs=[delta.diff_artifact] if delta.diff_artifact else [],
+        )
         if delta.diff_artifact:
             state.emit("diff.snapshot", {"tool_call_id": call.id, "path": delta.diff_artifact, "paths": list(delta.paths)})
         for path in delta.paths:
@@ -732,7 +758,7 @@ class Kernel:
                 payload[key] = value
         if result.read_hints:
             payload["read_hints"] = result.read_hints
-        state.emit("tool.execution.completed" if result.ok else "tool.execution.failed", payload)
+        state.emit("tool.execution.completed" if result.ok else "tool.execution.failed", payload, visibility="user")
 
     def _append_tool_step(self, state: RunState, call: ToolCall, result: ToolResult) -> None:
         artifact_refs = tuple(
@@ -894,6 +920,7 @@ class Kernel:
                     "tool_call_id": call.id,
                     "tool": call.name,
                 },
+                visibility="user",
             )
             state.emit(
                 "model.tool_call.assembly.completed",
@@ -905,6 +932,7 @@ class Kernel:
                     "tool": call.name,
                     "args": _small_event_data(call.args),
                 },
+                visibility="user",
             )
             state.transcript.record_tool_call(
                 item_id=f"transcript-tool-call-{len(state.transcript.items) + 1:04d}",
@@ -997,6 +1025,7 @@ class Kernel:
             return
         if any(event.type == "model.message.completed" and event.data.get("output_path") == "final.md" for event in state.events):
             return
+        write_final_text(state)
         state.emit(
             "model.message.completed",
             {
@@ -1015,7 +1044,7 @@ class Kernel:
             self._finalize_message(state)
             capture_final_diff(state)
             for path in ("final.md", "metrics.json", "final.diff"):
-                state.emit("artifact.materialized", {"path": path, "kind": "run_output"})
+                state.emit("artifact.materialized", {"path": path, "kind": "run_output"}, visibility="user")
             state.emit("artifact.finalization.completed", {"output_dir": str(state.output_dir)})
             state.finish_step("completed")
         except Exception as exc:  # pragma: no cover - defensive finalization boundary

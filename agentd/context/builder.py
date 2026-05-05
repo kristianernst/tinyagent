@@ -30,6 +30,7 @@ class ContextBuilder:
         project_instructions = load_project_instructions(state.workspace.root, self.config)
         environment = render_environment_context(state, self.config)
         project = render_project_instructions(project_instructions)
+        conversation = render_conversation_history(state)
         task = f"Task:\n{state.task}"
         context_plan = render_context_plan(plan)
         observations = render_observations(state, plan)
@@ -41,6 +42,9 @@ class ContextBuilder:
             _item("system:profile", "system", self.system_prompt, "system_prompt", 1000, stable=True),
             _item("environment:current", "user", environment, "environment", 850, stable=True),
             _item("project:instructions", "user", project, "project_instructions", 800, stable=True),
+            _item("conversation:history", "user", conversation, "conversation_history", 925, stable=True)
+            if conversation
+            else None,
             _item("task:current", "user", task, "task", 950, stable=True),
             _item("context:plan", "user", context_plan, "context_plan", 875, stable=True),
             _item("context:observations", "user", observations, "observations", 870, stable=True)
@@ -149,6 +153,19 @@ def render_project_instructions(instructions: ProjectInstructions) -> str:
             f"</project_instructions>{truncated}",
         ]
     )
+
+
+def render_conversation_history(state: RunState) -> str:
+    if not state.prior_messages:
+        return ""
+    lines = ["Conversation history:"]
+    for index, message in enumerate(state.prior_messages, start=1):
+        content = message_text(message).strip()
+        if len(content) > 2_000:
+            content = content[:1_999] + "..."
+        lines.append(f"[{index}] {message.role}: {content}")
+    artifact = f"\nPrior context artifact: {state.prior_context_artifact}" if state.prior_context_artifact else ""
+    return "\n".join(lines) + artifact
 
 
 def render_context_checkpoint(state: RunState) -> str:

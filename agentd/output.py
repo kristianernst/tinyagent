@@ -23,9 +23,14 @@ def write_run_outputs(state: RunState) -> None:
     (state.output_dir / "events.jsonl").write_text(
         "".join(json.dumps(event.to_json_dict(), sort_keys=True) + "\n" for event in state.events),
     )
-    (state.output_dir / "final.md").write_text(_final_text(state))
+    write_final_text(state)
     (state.output_dir / "metrics.json").write_text(json.dumps(_metrics(state), indent=2, sort_keys=True) + "\n")
     (state.output_dir / "final.diff").write_text(state.final_diff)
+
+
+def write_final_text(state: RunState) -> None:
+    state.output_dir.mkdir(parents=True, exist_ok=True)
+    (state.output_dir / "final.md").write_text(_final_text(state))
 
 
 def capture_final_diff(state: RunState) -> None:
