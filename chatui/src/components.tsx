@@ -1,5 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode, KeyboardEvent } from "react";
+import {
+  materializeRichInlineLineRange,
+  prepareRichInline,
+  walkRichInlineLineRanges,
+} from "@chenglou/pretext/rich-inline";
+import type { RichInlineItem, RichInlineLine } from "@chenglou/pretext/rich-inline";
 import {
   IconArrowUp,
   IconAsk,
@@ -153,7 +159,7 @@ function Step({ step, active, index }: { step: ReasoningStep; active: boolean; i
   if (step.kind === "text") {
     return (
       <div className={`rstep fade-up ${active ? "active" : ""}`} style={{ animationDelay: delay }}>
-        {step.text}
+        <PretextText text={step.text} variant="reasoning" />
       </div>
     );
   }
@@ -169,29 +175,155 @@ function Step({ step, active, index }: { step: ReasoningStep; active: boolean; i
   return null;
 }
 
-// ---------------- Markdown-ish render ----------------
-function renderInline(s: string) {
-  const parts = s.split(/(\*\*[^*]+\*\*|`[^`]+`)/g);
-  return parts.map((p, i) => {
-    if (p.startsWith("**") && p.endsWith("**"))
-      return <strong key={i}>{p.slice(2, -2)}</strong>;
-    if (p.startsWith("`") && p.endsWith("`")) return <code key={i}>{p.slice(1, -1)}</code>;
-    return <span key={i}>{p}</span>;
+// ---------------- Pretext text render ----------------
+type PretextRunKind = "text" | "strong" | "code";
+type PretextRun = { kind: PretextRunKind; text: string };
+type PretextLine = RichInlineLine & { runs: PretextRun[] };
+
+const PRETEXT_INLINE_RE = /(\*\*[^*]+\*\*|`[^`]+`)/g;
+const PRETEXT_FONT = {
+  assistant: {
+    text: "15.5px Inter",
+    strong: "600 15.5px Inter",
+    code: '12.5px "JetBrains Mono"',
+  },
+  reasoning: {
+    text: "14px Inter",
+    strong: "600 14px Inter",
+    code: '12.5px "JetBrains Mono"',
+  },
+} as const;
+
+function useElementWidth<T extends HTMLElement>() {
+  const ref = useRef<T | null>(null);
+  const [width, setWidth] = useState(0);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+
+    const update = () => setWidth(Math.max(0, Math.floor(el.getBoundingClientRect().width)));
+    update();
+
+    const ro = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) return update();
+      setWidth(Math.max(0, Math.floor(entry.contentRect.width)));
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  return [ref, width] as const;
+}
+
+function parsePretextRuns(text: string): PretextRun[] {
+  return text
+    .split(PRETEXT_INLINE_RE)
+    .filter(Boolean)
+    .map((part): PretextRun => {
+      if (part.startsWith("**") && part.endsWith("**")) {
+        return { kind: "strong", text: part.slice(2, -2) };
+      }
+      if (part.startsWith("`") && part.endsWith("`")) {
+        return { kind: "code", text: part.slice(1, -1) };
+      }
+      return { kind: "text", text: part };
+    });
+}
+
+function runsToPretextItems(runs: PretextRun[], variant: "assistant" | "reasoning"): RichInlineItem[] {
+  const fonts = PRETEXT_FONT[variant];
+  return runs.map((run) => ({
+    text: run.text,
+    font: fonts[run.kind],
+    break: run.kind === "code" ? "never" : "normal",
+    extraWidth: run.kind === "code" ? 14 : 0,
+  }));
+}
+
+function layoutPretextParagraph(
+  paragraph: string,
+  width: number,
+  variant: "assistant" | "reasoning",
+): PretextLine[] {
+  if (!paragraph || width <= 0) return [];
+
+  const runs = parsePretextRuns(paragraph);
+  const items = runsToPretextItems(runs, variant);
+  const prepared = prepareRichInline(items);
+  const lines: PretextLine[] = [];
+  walkRichInlineLineRanges(prepared, width, (lineRange) => {
+    lines.push({ ...materializeRichInlineLineRange(prepared, lineRange), runs });
   });
+  return lines;
+}
+
+function PretextText({
+  text,
+  streaming = false,
+  variant = "assistant",
+}: {
+  text: string;
+  streaming?: boolean;
+  variant?: "assistant" | "reasoning";
+}) {
+  const [ref, width] = useElementWidth<HTMLDivElement>();
+  const paragraphs = useMemo(() => text.split(/\n\n/), [text]);
+  const laidOut = useMemo(() => {
+    try {
+      return paragraphs.map((paragraph) => layoutPretextParagraph(paragraph, width, variant));
+    } catch {
+      return null;
+    }
+  }, [paragraphs, variant, width]);
+
+  if (!laidOut || width <= 0) {
+    return (
+      <div ref={ref} className={`pretext-text pretext-${variant}`} data-pretext-text>
+        {paragraphs.map((paragraph, i) => (
+          <div className="pretext-paragraph" key={i}>
+            {paragraph}
+            {streaming && i === paragraphs.length - 1 && <span className="stream-cursor" />}
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  return (
+    <div ref={ref} className={`pretext-text pretext-${variant}`} data-pretext-text>
+      {laidOut.map((lines, paragraphIndex) => (
+        <div className="pretext-paragraph" key={paragraphIndex}>
+          {lines.map((line, lineIndex) => {
+            const isLastLine = paragraphIndex === laidOut.length - 1 && lineIndex === lines.length - 1;
+            return (
+              <div className="pretext-line" key={lineIndex}>
+                {line.fragments.map((fragment, fragmentIndex) => {
+                  const run = line.runs[fragment.itemIndex] ?? { kind: "text" as const };
+                  const Tag = run.kind === "strong" ? "strong" : run.kind === "code" ? "code" : "span";
+                  return (
+                    <Tag
+                      key={fragmentIndex}
+                      className={run.kind === "code" ? "pretext-code" : undefined}
+                      style={fragment.gapBefore ? { marginLeft: `${fragment.gapBefore}px` } : undefined}
+                    >
+                      {fragment.text}
+                    </Tag>
+                  );
+                })}
+                {streaming && isLastLine && <span className="stream-cursor" />}
+              </div>
+            );
+          })}
+        </div>
+      ))}
+    </div>
+  );
 }
 
 export function AnswerText({ text, streaming }: { text: string; streaming: boolean }) {
-  const paragraphs = text.split(/\n\n/);
-  return (
-    <>
-      {paragraphs.map((p, i) => (
-        <p key={i}>
-          {renderInline(p)}
-          {streaming && i === paragraphs.length - 1 && <span className="stream-cursor" />}
-        </p>
-      ))}
-    </>
-  );
+  return <PretextText text={text} streaming={streaming} />;
 }
 
 // ---------------- Turn ----------------

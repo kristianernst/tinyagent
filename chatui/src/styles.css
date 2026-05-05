@@ -143,9 +143,34 @@ body.dark {
   color: var(--ink-soft);
   font-size: 15.5px;
 }
-.msg.assistant p { margin-bottom: 14px; text-wrap: pretty; }
-.msg.assistant p:last-child { margin-bottom: 0; }
 .msg.assistant strong { color: var(--ink); font-weight: 600; }
+
+.pretext-text {
+  width: 100%;
+  min-width: 0;
+}
+.pretext-paragraph {
+  margin-bottom: 14px;
+}
+.pretext-paragraph:last-child {
+  margin-bottom: 0;
+}
+.pretext-line {
+  display: block;
+  white-space: pre;
+  min-height: 1lh;
+}
+.pretext-assistant {
+  font-size: 15.5px;
+  line-height: 1.6;
+}
+.pretext-reasoning {
+  font-size: 14px;
+  line-height: 1.55;
+}
+.pretext-code {
+  white-space: pre;
+}
 
 /* ------- Reasoning block ------- */
 .reasoning {
