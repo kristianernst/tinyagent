@@ -193,7 +193,7 @@ tinyagent
   run/eval/replay/config commands
 
 profiles
-  apex-coder
+  tiny-coder
   research
   review
   local-small-model
@@ -324,7 +324,7 @@ This loop is the core product. It should remain legible.
 
 A profile is the primary capability surface.
 
-The flagship profile should be called something like `apex-coder`. The name is less important than the role: it is the highly optimized default.
+The flagship profile should be called something like `tiny-coder`. The name is less important than the role: it is the highly optimized default.
 
 The profile owns:
 
@@ -347,7 +347,7 @@ task-class routing
 
 The profile should be allowed to be opinionated. It should not be neutral.
 
-Default taste for `apex-coder`:
+Default taste for `tiny-coder`:
 
 ```text
 prefer acting over asking
@@ -1093,7 +1093,7 @@ Every profile change should be evaluated against a stable task set.
 A profile version report should look like:
 
 ```text
-apex-coder v0.4
+tiny-coder v0.4
   success: 68%
   avg tool calls: 44
   avg cost: 0.69
@@ -1207,7 +1207,7 @@ agent-harness/
       providers.py
 
   profiles/
-    apex-coder/
+    tiny-coder/
       profile.yaml
       system.md
       context.py
@@ -1396,7 +1396,7 @@ Build the Python kernel now.
 
 Keep it tiny.
 
-Make `apex-coder` the default.
+Make `tiny-coder` the default.
 
 Make YOLO-in-workspace the default.
 

@@ -4,7 +4,7 @@ Minimal general-purpose agent harness.
 
 The first implementation slice is Milestone 0+1 from `design/guideline.md`: a small
 Python kernel, CLI-first workflow, bounded local execution, JSONL traces, a fake
-provider for deterministic tests, and a minimal `apex-coder` profile.
+provider for deterministic tests, and a minimal `tiny-coder` profile.
 
 ## Development
 
@@ -30,7 +30,7 @@ payload data is written under each run's `artifacts/` directory.
 
 ## Default tool surface
 
-The default `apex-coder` profile exposes only:
+The default `tiny-coder` profile exposes only:
 
 ```text
 shell

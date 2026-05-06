@@ -73,7 +73,7 @@ class WorkspaceRecord:
     git_root: str | None
     git_remote: str | None
     trust: str = "untrusted"
-    default_profile: str = "apex-coder"
+    default_profile: str = "tiny-coder"
     default_provider: str = "fake"
     write_policy: str = "workspace"
     created_at: str = ""
@@ -116,7 +116,7 @@ class WorkspaceStore:
             git_root=identity_root if git_root else None,
             git_remote=git_remote,
             trust=trust if trust != "untrusted" or existing is None else existing.trust,
-            default_profile=existing.default_profile if existing else "apex-coder",
+            default_profile=existing.default_profile if existing else "tiny-coder",
             default_provider=default_provider or (existing.default_provider if existing else "fake"),
             write_policy=existing.write_policy if existing else "workspace",
             created_at=existing.created_at if existing else now,

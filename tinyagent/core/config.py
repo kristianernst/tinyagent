@@ -33,7 +33,7 @@ RUN_CONFIG_KEYS = frozenset(
 class RunConfig:
     provider: str = "fake"
     model: str = "fake"
-    profile: str = "apex-coder"
+    profile: str = "tiny-coder"
     visible_tools: tuple[str, ...] = ()
     workspace_mode: str = "current"
     approval_mode: str = "yolo"
@@ -58,7 +58,7 @@ class RunConfig:
         return cls(
             provider=provider,
             model=model,
-            profile=str(data.get("profile") or "apex-coder"),
+            profile=str(data.get("profile") or "tiny-coder"),
             visible_tools=_string_tuple(data, "visible_tools"),
             workspace_mode=str(data.get("workspace_mode") or "current"),
             approval_mode=str(data.get("approval_mode") or "yolo"),
@@ -78,7 +78,7 @@ class RunConfig:
     def validate_supported_eval_compare(self) -> None:
         if self.provider not in {"fake", "openai-compatible"}:
             raise ValueError(f"Unsupported eval provider: {self.provider}")
-        if self.profile != "apex-coder":
+        if self.profile != "tiny-coder":
             raise ValueError(f"Unsupported eval profile: {self.profile}")
         if self.workspace_mode not in {"auto", "current", "worktree"}:
             raise ValueError(f"Unsupported workspace_mode: {self.workspace_mode}")

@@ -8,7 +8,7 @@ def test_expected_top_level_scaffold_exists() -> None:
         "tinyagent",
         "tinyagent/cli.py",
         "profiles",
-        "profiles/apex-coder",
+        "profiles/tiny-coder",
         "tests",
         "docs",
         "pyproject.toml",

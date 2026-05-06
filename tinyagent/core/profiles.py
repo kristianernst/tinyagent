@@ -16,7 +16,7 @@ PROFILE_ROOT = Path(__file__).resolve().parents[1] / "profiles"
 
 
 class ApexCoderProfile:
-    name = "apex-coder"
+    name = "tiny-coder"
     DEFAULT_VISIBLE_TOOL_NAMES = ("read_file", "read_context", "search_repo", "apply_patch", "shell")
 
     def __init__(
@@ -28,7 +28,7 @@ class ApexCoderProfile:
         recent_tool_token_budget: int | None = None,
         visible_tool_names: Sequence[str] | None = None,
     ) -> None:
-        self.system_prompt_path = system_prompt_path or PROFILE_ROOT / "apex-coder" / "system.md"
+        self.system_prompt_path = system_prompt_path or PROFILE_ROOT / "tiny-coder" / "system.md"
         self.recent_results = recent_results
         self.visible_tool_names = tuple(visible_tool_names) if visible_tool_names is not None else self.DEFAULT_VISIBLE_TOOL_NAMES
         self.context_config = context_config or ContextConfig()
