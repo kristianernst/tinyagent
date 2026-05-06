@@ -3,14 +3,14 @@ from __future__ import annotations
 import subprocess
 from collections.abc import Sequence
 
-from agentd.context import ContextConfig, load_project_instructions
-from agentd.contracts import Tool
-from agentd.kernel import Kernel
-from agentd.models import FakeModelProvider
-from agentd.policy import LocalPolicy
-from agentd.profiles import ApexCoderProfile
-from agentd.state import Message, ModelResponse, RunState, ToolCall, ToolResult, ToolStep, Workspace
-from agentd.tools import default_tools
+from tinyagent.core.context import ContextConfig, load_project_instructions
+from tinyagent.core.contracts import Tool
+from tinyagent.core.kernel import Kernel
+from tinyagent.core.models import FakeModelProvider
+from tinyagent.core.policy import LocalPolicy
+from tinyagent.core.profiles import ApexCoderProfile
+from tinyagent.core.state import Message, ModelResponse, RunState, ToolCall, ToolResult, ToolStep, Workspace
+from tinyagent.core.tools import default_tools
 
 
 class RecordingModel:

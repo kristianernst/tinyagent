@@ -9,10 +9,13 @@ from pathlib import Path
 
 import pytest
 
-from agentd.model_stream import ModelDelta
-from agentd.runtime import RunController, RuntimeConfig, RuntimeHTTPServer, create_runtime_server
-from agentd.session import SessionStore
-from agentd.state import Message, ModelResponse, RunState, ToolCall
+import tinyagent.cli as cli
+from tinyagent.app.product import ProductHome, WorkspaceStore
+from tinyagent.app.server import create_product_runtime_server
+from tinyagent.core.model_stream import ModelDelta
+from tinyagent.core.state import Message, ModelResponse, RunState, ToolCall
+from tinyagent.runtime.conversation import ConversationStore
+from tinyagent.runtime.server import RunController, RuntimeConfig, RuntimeHTTPServer, create_runtime_server
 
 
 def test_runtime_server_starts_run_streams_reconnects_and_reads_artifact(tmp_path) -> None:
@@ -65,37 +68,137 @@ def test_runtime_default_sse_filters_internal_reasoning_but_keeps_surface_events
         assert "http_request_artifact" not in model_started["data"]
 
 
-def test_runtime_post_runs_can_append_to_session_and_use_prior_context(tmp_path) -> None:
+def test_runtime_post_runs_can_append_to_conversation_and_use_prior_context(tmp_path) -> None:
     with _server(tmp_path) as base:
         first = _request(
             base,
             "POST",
-            "/api/runs",
-            {"task": "first", "run_id": "run_http_session_1", "session_id": "sess_http", "turn_id": "turn_1"},
+            "/api/conversations/conv_http_prior/turns",
+            {"message": "first", "run_id": "run_http_conversation_1", "turn_id": "turn_1"},
         )
-        assert first["session_id"] == "sess_http"
+        assert first["conversation_id"] == "conv_http_prior"
         assert first["turn_id"] == "turn_1"
-        _wait_for_status(base, "run_http_session_1", "completed")
+        _wait_for_status(base, "run_http_conversation_1", "completed")
 
         second = _request(
             base,
             "POST",
-            "/api/runs",
-            {"task": "second", "run_id": "run_http_session_2", "session_id": "sess_http", "turn_id": "turn_2"},
+            "/api/conversations/conv_http_prior/turns",
+            {"message": "second", "run_id": "run_http_conversation_2", "turn_id": "turn_2"},
         )
-        assert second["session_id"] == "sess_http"
+        assert second["conversation_id"] == "conv_http_prior"
         assert second["turn_id"] == "turn_2"
-        _wait_for_status(base, "run_http_session_2", "completed")
+        _wait_for_status(base, "run_http_conversation_2", "completed")
 
-        prior_context = tmp_path / ".tinyagent" / "runs" / "run_http_session_2" / "artifacts" / "prior-context.json"
+        prior_context = tmp_path / ".tinyagent" / "runs" / "run_http_conversation_2" / "artifacts" / "prior-context.json"
         assert prior_context.exists()
         assert "first" in prior_context.read_text()
         assert "Fake run finished: first" in prior_context.read_text()
 
-        sessions = _request(base, "GET", "/api/sessions")
-        assert sessions["sessions"][0]["session_id"] == "sess_http"
-        assert sessions["sessions"][0]["title"] == "first"
-        assert sessions["sessions"][0]["turn_count"] == 2
+        conversations = _request(base, "GET", "/api/conversations")
+        assert conversations["conversations"][0]["conversation_id"] == "conv_http_prior"
+        assert conversations["conversations"][0]["title"] == "first"
+        assert conversations["conversations"][0]["turn_count"] == 2
+
+
+def test_runtime_conversation_start_turn_and_list_turns(tmp_path) -> None:
+    with _server(tmp_path) as base:
+        first = _request(
+            base,
+            "POST",
+            "/api/conversations/conv_http/turns",
+            {"message": "first", "run_id": "run_http_conversation_1", "turn_id": "turn_1"},
+        )
+        assert first["conversation_id"] == "conv_http"
+        assert first["turn_id"] == "turn_1"
+        assert first["events_url"] == "/api/runs/run_http_conversation_1/events"
+        _wait_for_status(base, "run_http_conversation_1", "completed")
+
+        conversations = _request(base, "GET", "/api/conversations")
+        assert conversations["conversations"][0]["conversation_id"] == "conv_http"
+
+        turns = _wait_for_conversation_turns(base, "conv_http", ["turn.started", "turn.completed"])
+        assert turns["conversation_id"] == "conv_http"
+        assert [turn["type"] for turn in turns["turns"]] == ["turn.started", "turn.completed"]
+        assert turns["turns"][0]["conversation_id"] == "conv_http"
+
+
+def test_runtime_product_conversation_root_is_visible_to_cli(tmp_path, capsys, monkeypatch) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("TINYAGENT_HOME", str(home))
+    assert cli.main(["init", "--workspace", str(workspace)]) == 0
+    capsys.readouterr()
+    [workspace_record_path] = list((home / "workspaces").glob("ws_*/workspace.json"))
+    workspace_id = json.loads(workspace_record_path.read_text())["workspace_id"]
+    conversation_root = home / "workspaces" / workspace_id / "conversations"
+
+    with _server(workspace, conversation_root=conversation_root) as base:
+        _request(
+            base,
+            "POST",
+            "/api/conversations/conv_shared/turns",
+            {"message": "shared", "run_id": "run_shared_conversation", "turn_id": "turn_1"},
+        )
+        _wait_for_status(base, "run_shared_conversation", "completed")
+        _wait_for_conversation_turns(base, "conv_shared", ["turn.started", "turn.completed"])
+
+    list_code = cli.main(["conversations", "--workspace", str(workspace), "list"])
+    listed = capsys.readouterr()
+
+    assert list_code == 0
+    assert "conv_shared" in listed.out
+
+
+def test_product_runtime_lists_workspaces_and_scopes_conversations(tmp_path) -> None:
+    home = ProductHome(tmp_path / "home")
+    workspace_a = tmp_path / "workspace-a"
+    workspace_b = tmp_path / "workspace-b"
+    workspace_a.mkdir()
+    workspace_b.mkdir()
+    store = WorkspaceStore(home)
+    record_a = store.register(workspace_a, name="Workspace A")
+    server = create_product_runtime_server(home, port=0, provider="fake", stream=True)
+    base = f"127.0.0.1:{server.server_port}"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        registered = _request(base, "POST", "/api/workspaces", {"path": str(workspace_b), "name": "Workspace B"})
+        record_b = registered["workspace"]
+        assert record_b["name"] == "Workspace B"
+
+        workspaces = _request(base, "GET", "/api/workspaces")
+        assert [workspace["workspace_id"] for workspace in workspaces["workspaces"]] == [
+            record_b["workspace_id"],
+            record_a.workspace_id,
+        ]
+
+        first = _request(
+            base,
+            "POST",
+            "/api/conversations/conv_workspace_a/turns",
+            {
+                "workspace_id": record_a.workspace_id,
+                "message": "first",
+                "run_id": "run_workspace_a",
+                "turn_id": "turn_1",
+            },
+        )
+        assert first["conversation_id"] == "conv_workspace_a"
+        _wait_for_status(base, "run_workspace_a", "completed", workspace_id=record_a.workspace_id)
+
+        conversations_a = _request(base, "GET", f"/api/conversations?workspace_id={record_a.workspace_id}")
+        conversations_b = _request(base, "GET", f"/api/conversations?workspace_id={record_b['workspace_id']}")
+        assert conversations_a["conversations"][0]["conversation_id"] == "conv_workspace_a"
+        assert conversations_b["conversations"] == []
+
+        events = _request(base, "GET", f"/api/runs/run_workspace_a/events.json?workspace_id={record_a.workspace_id}")
+        assert any(event["type"] == "run.completed" for event in events["events"])
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def test_runtime_retains_live_events_briefly_after_run_thread_exits(tmp_path) -> None:
@@ -261,9 +364,10 @@ def test_runtime_cancelled_approval_cannot_be_late_approved(tmp_path) -> None:
 
 
 class _server:
-    def __init__(self, workspace: Path, *, provider_factory=None) -> None:
+    def __init__(self, workspace: Path, *, provider_factory=None, conversation_root: Path | None = None) -> None:
         self.workspace = workspace
         self.provider_factory = provider_factory
+        self.conversation_root = conversation_root
         self.server = None
         self.thread = None
         self.base = ""
@@ -271,7 +375,11 @@ class _server:
     def __enter__(self) -> str:
         try:
             if self.provider_factory is None:
-                self.server = create_runtime_server(self.workspace, port=0, session_root=self.workspace / ".tinyagent" / "sessions")
+                self.server = create_runtime_server(
+                    self.workspace,
+                    port=0,
+                    conversation_root=self.conversation_root or self.workspace / ".tinyagent" / "conversations",
+                )
             else:
                 self.server = RuntimeHTTPServer(
                     ("127.0.0.1", 0),
@@ -282,7 +390,7 @@ class _server:
                             provider_factory=self.provider_factory,
                             stream=True,
                             debug_level=0,
-                            session_store=SessionStore(self.workspace / ".tinyagent" / "sessions"),
+                            conversation_store=ConversationStore(self.workspace / ".tinyagent" / "conversations"),
                         )
                     ),
                 )
@@ -349,11 +457,12 @@ def _sse(base: str, path: str, headers: dict[str, str] | None = None) -> list[di
     return events
 
 
-def _wait_for_status(base: str, run_id: str, status: str, timeout: float = 10) -> dict:
+def _wait_for_status(base: str, run_id: str, status: str, timeout: float = 10, *, workspace_id: str | None = None) -> dict:
     deadline = time.monotonic() + timeout
     latest = {}
+    suffix = f"?workspace_id={workspace_id}" if workspace_id else ""
     while time.monotonic() < deadline:
-        latest = _request(base, "GET", f"/api/runs/{run_id}")
+        latest = _request(base, "GET", f"/api/runs/{run_id}{suffix}")
         if latest.get("status") == status:
             return latest
         time.sleep(0.05)
@@ -400,6 +509,17 @@ def _wait_for_artifact(base: str, run_id: str, path: str, timeout: float = 10) -
             conn.close()
         time.sleep(0.05)
     raise AssertionError(f"artifact {path} not available: {last_error}")
+
+
+def _wait_for_conversation_turns(base: str, conversation_id: str, expected_types: list[str], timeout: float = 10) -> dict:
+    deadline = time.monotonic() + timeout
+    latest = {}
+    while time.monotonic() < deadline:
+        latest = _request(base, "GET", f"/api/conversations/{conversation_id}/turns")
+        if [turn["type"] for turn in latest.get("turns", [])] == expected_types:
+            return latest
+        time.sleep(0.05)
+    raise AssertionError(f"conversation {conversation_id} did not reach turns {expected_types}: {latest}")
 
 
 class _InternalReasoningProvider:

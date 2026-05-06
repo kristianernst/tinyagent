@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from agentd.contracts import Tool
-from agentd.events import (
+from tinyagent.core.contracts import Tool
+from tinyagent.core.events import (
     DURABLE_EVENT_TYPES,
     EVENT_DEBUG_LEVELS,
     EVENT_TYPES,
@@ -22,10 +22,10 @@ from agentd.events import (
     event_debug_level,
     load_events_jsonl,
 )
-from agentd.kernel import Kernel
-from agentd.model_stream import ModelDelta
-from agentd.replay import render_timeline
-from agentd.state import Message, ModelResponse, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, Workspace
+from tinyagent.core.kernel import Kernel
+from tinyagent.core.model_stream import ModelDelta
+from tinyagent.runtime.replay import render_timeline
+from tinyagent.core.state import Message, ModelResponse, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, Workspace
 
 
 class AllowAllPolicy:
@@ -45,7 +45,7 @@ class ExplodingPolicy:
 
 class ApprovalPolicy:
     def evaluate(self, call: ToolCall, state: RunState) -> PolicyDecision:
-        from agentd.state import ApprovalRequest
+        from tinyagent.core.state import ApprovalRequest
 
         return PolicyDecision.needs_approval(
             f"{call.name} requires approval",
@@ -69,7 +69,7 @@ class RunScopeApprovalHandler:
         self.count = 0
 
     def resolve(self, request, state):
-        from agentd.state import ApprovalResolution
+        from tinyagent.core.state import ApprovalResolution
 
         del state
         self.count += 1
