@@ -7,14 +7,14 @@ from pathlib import Path
 
 import pytest
 
-from agentd.contracts import Tool
-from agentd.eval_runner import run_eval_suite
-from agentd.events import LIVE_ONLY_EVENT_TYPES, MemoryEventSink, load_events_jsonl
-from agentd.kernel import Kernel
-from agentd.model_stream import assemble_model_deltas
-from agentd.policy import default_policy
-from agentd.providers.openai_compat import OpenAICompatibleProvider
-from agentd.state import Message, RunState, Workspace
+from tinyagent.core.contracts import Tool
+from tinyagent.evals.runner import run_eval_suite
+from tinyagent.core.events import LIVE_ONLY_EVENT_TYPES, MemoryEventSink, load_events_jsonl
+from tinyagent.core.kernel import Kernel
+from tinyagent.core.model_stream import assemble_model_deltas
+from tinyagent.core.policy import default_policy
+from tinyagent.core.providers.openai_compat import OpenAICompatibleProvider
+from tinyagent.core.state import Message, RunState, Workspace
 
 pytestmark = pytest.mark.integration
 

@@ -19,13 +19,17 @@ export function App() {
     phase,
     approval,
     artifacts,
-    sessions,
-    activeSessionId,
+    workspaces,
+    activeWorkspaceId,
+    conversations,
+    activeConversationId,
     error,
     send,
     stop,
-    newSession,
-    selectSession,
+    addWorkspace,
+    selectWorkspace,
+    newConversation,
+    selectConversation,
     respondToApproval,
   } = useRun();
 
@@ -102,17 +106,17 @@ export function App() {
 
   const isEmpty = turns.length === 0;
   const approvalMode = mode === "yolo" ? "yolo" : "on-request";
-  const conversations: Conversation[] = sessions.map((session) => ({
-    id: session.session_id,
-    title: session.title || "New conversation",
-    time: formatSessionTime(session.updated_at),
+  const sidebarConversations: Conversation[] = conversations.map((conversation) => ({
+    id: conversation.conversation_id,
+    title: conversation.title || "New conversation",
+    time: formatConversationTime(conversation.updated_at),
   }));
 
   const onSend = (text: string) => send(text, approvalMode);
 
   const newChat = () => {
     if (phase !== "idle") void stop();
-    newSession();
+    newConversation();
   };
 
   return (
@@ -120,9 +124,16 @@ export function App() {
       <LeftSidebar
         open={leftOpen}
         onToggle={() => setLeftOpen((o) => !o)}
-        activeChat={activeSessionId ?? ""}
-        conversations={conversations}
-        onPickChat={(id) => void selectSession(id)}
+        activeChat={activeConversationId ?? ""}
+        conversations={sidebarConversations}
+        workspaces={workspaces}
+        activeWorkspaceId={activeWorkspaceId ?? ""}
+        onPickChat={(id) => void selectConversation(id)}
+        onPickWorkspace={selectWorkspace}
+        onAddWorkspace={async (path) => {
+          const workspace = await addWorkspace(path);
+          selectWorkspace(workspace.workspace_id);
+        }}
         onNewChat={newChat}
       />
 
@@ -207,7 +218,7 @@ export function App() {
   );
 }
 
-function formatSessionTime(value: string): string {
+function formatConversationTime(value: string): string {
   const timestamp = Date.parse(value);
   if (Number.isNaN(timestamp)) return "";
   const deltaMs = Date.now() - timestamp;

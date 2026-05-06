@@ -14,16 +14,16 @@ export type RunEvent = {
   artifact_refs: string[];
 };
 
-export type StartRunResponse = {
+export type StartConversationTurnResponse = {
   run_id: string;
   run_path: string;
   status: string;
-  session_id?: string;
+  conversation_id?: string;
   turn_id?: string;
 };
 
-export type SessionSummary = {
-  session_id: string;
+export type ConversationSummary = {
+  conversation_id: string;
   title: string;
   status: "open" | "closed";
   active_turn_id: string | null;
@@ -35,135 +35,172 @@ export type SessionSummary = {
   last_turn_status?: string;
 };
 
+export type WorkspaceSummary = {
+  workspace_id: string;
+  name: string;
+  root: string;
+  kind: string;
+  trust: string;
+  default_provider: string;
+  updated_at: string;
+  last_opened_at: string;
+};
+
 export type ApprovalDecision = "approved" | "denied" | "cancelled" | "expired";
 
 const BASE = "/api";
 
-export async function startRun(
-  task: string,
-  opts: {
-    run_id?: string;
-    approval_mode?: "yolo" | "on-request" | "never";
-    session_id?: string;
-    turn_id?: string;
-    parent_turn_id?: string;
-  } = {}
-): Promise<StartRunResponse> {
-  const res = await fetch(`${BASE}/runs`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ task, ...opts }),
-  });
-  if (!res.ok) {
-    throw new Error(`startRun failed: ${res.status} ${await res.text()}`);
-  }
-  return res.json();
-}
+export class TinyagentClient {
+  constructor(private readonly base = BASE) {}
 
-export async function cancelRun(runId: string, reason = "user_cancelled"): Promise<boolean> {
-  const res = await fetch(`${BASE}/runs/${encodeURIComponent(runId)}/cancel`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ reason }),
-  });
-  if (!res.ok) return false;
-  const body = await res.json();
-  return !!body.cancelled;
-}
-
-export async function decideApproval(
-  runId: string,
-  approvalId: string,
-  decision: ApprovalDecision,
-  scope: "once" | "run" | null = "once"
-): Promise<boolean> {
-  const res = await fetch(`${BASE}/runs/${encodeURIComponent(runId)}/approve`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ approval_id: approvalId, decision, scope }),
-  });
-  if (!res.ok) return false;
-  const body = await res.json();
-  return !!body.resolved;
-}
-
-export async function fetchArtifactText(runId: string, path: string): Promise<string> {
-  const segments = path.split("/").map(encodeURIComponent).join("/");
-  const res = await fetch(`${BASE}/runs/${encodeURIComponent(runId)}/artifacts/${segments}`);
-  if (!res.ok) {
-    throw new Error(`artifact fetch failed: ${res.status}`);
-  }
-  return res.text();
-}
-
-export async function listSessions(): Promise<SessionSummary[]> {
-  const res = await fetch(`${BASE}/sessions`);
-  if (!res.ok) {
-    throw new Error(`listSessions failed: ${res.status} ${await res.text()}`);
-  }
-  const body = await res.json();
-  return Array.isArray(body.sessions) ? body.sessions : [];
-}
-
-export async function fetchRunEvents(runId: string, afterSeq = 0): Promise<RunEvent[]> {
-  const url = `${BASE}/runs/${encodeURIComponent(runId)}/events.json${
-    afterSeq > 0 ? `?after_seq=${afterSeq}` : ""
-  }`;
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`fetchRunEvents failed: ${res.status} ${await res.text()}`);
-  }
-  const body = await res.json();
-  return Array.isArray(body.events) ? body.events : [];
-}
-
-/**
- * Stream a run's SSE events using fetch + ReadableStream so every named event
- * (e.g. `event: model.text.delta`) is delivered to one handler. Returns an
- * AbortController; call .abort() to disconnect.
- */
-export function streamRunEvents(
-  runId: string,
-  onEvent: (event: RunEvent) => void,
-  opts: { afterSeq?: number; onError?: (err: unknown) => void; onClose?: () => void } = {}
-): AbortController {
-  const ctrl = new AbortController();
-  const url = `${BASE}/runs/${encodeURIComponent(runId)}/events${
-    opts.afterSeq ? `?after_seq=${opts.afterSeq}` : ""
-  }`;
-  (async () => {
-    try {
-      const res = await fetch(url, {
-        signal: ctrl.signal,
-        headers: { Accept: "text/event-stream" },
-      });
-      if (!res.ok || !res.body) {
-        throw new Error(`stream failed: ${res.status}`);
-      }
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder("utf-8");
-      let buf = "";
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        let idx;
-        while ((idx = buf.indexOf("\n\n")) !== -1) {
-          const block = buf.slice(0, idx);
-          buf = buf.slice(idx + 2);
-          const ev = parseSseBlock(block);
-          if (ev) onEvent(ev);
-        }
-      }
-    } catch (err) {
-      if ((err as any)?.name === "AbortError") return;
-      opts.onError?.(err);
-    } finally {
-      opts.onClose?.();
+  async listWorkspaces(): Promise<WorkspaceSummary[]> {
+    const res = await fetch(`${this.base}/workspaces`);
+    if (!res.ok) {
+      throw new Error(`listWorkspaces failed: ${res.status} ${await res.text()}`);
     }
-  })();
-  return ctrl;
+    const body = await res.json();
+    return Array.isArray(body.workspaces) ? body.workspaces : [];
+  }
+
+  async registerWorkspace(path: string, name?: string): Promise<WorkspaceSummary> {
+    const res = await fetch(`${this.base}/workspaces`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, name }),
+    });
+    if (!res.ok) {
+      throw new Error(`registerWorkspace failed: ${res.status} ${await res.text()}`);
+    }
+    const body = await res.json();
+    return body.workspace as WorkspaceSummary;
+  }
+
+  async listConversations(workspaceId: string): Promise<ConversationSummary[]> {
+    const res = await fetch(`${this.base}/conversations?workspace_id=${encodeURIComponent(workspaceId)}`);
+    if (!res.ok) {
+      throw new Error(`listConversations failed: ${res.status} ${await res.text()}`);
+    }
+    const body = await res.json();
+    return Array.isArray(body.conversations) ? body.conversations : [];
+  }
+
+  async startConversationTurn(
+    workspaceId: string,
+    conversationId: string,
+    message: string,
+    opts: {
+      run_id?: string;
+      approval_mode?: "yolo" | "on-request" | "never";
+      turn_id?: string;
+      parent_turn_id?: string;
+    } = {}
+  ): Promise<StartConversationTurnResponse> {
+    const res = await fetch(`${this.base}/conversations/${encodeURIComponent(conversationId)}/turns`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workspace_id: workspaceId, message, ...opts }),
+    });
+    if (!res.ok) {
+      throw new Error(`startConversationTurn failed: ${res.status} ${await res.text()}`);
+    }
+    return res.json();
+  }
+
+  async cancelRun(workspaceId: string, runId: string, reason = "user_cancelled"): Promise<boolean> {
+    const res = await fetch(`${this.base}/runs/${encodeURIComponent(runId)}/cancel`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workspace_id: workspaceId, reason }),
+    });
+    if (!res.ok) return false;
+    const body = await res.json();
+    return !!body.cancelled;
+  }
+
+  async decideApproval(
+    workspaceId: string,
+    runId: string,
+    approvalId: string,
+    decision: ApprovalDecision,
+    scope: "once" | "run" | null = "once"
+  ): Promise<boolean> {
+    const res = await fetch(`${this.base}/runs/${encodeURIComponent(runId)}/approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workspace_id: workspaceId, approval_id: approvalId, decision, scope }),
+    });
+    if (!res.ok) return false;
+    const body = await res.json();
+    return !!body.resolved;
+  }
+
+  async fetchArtifactText(workspaceId: string, runId: string, path: string): Promise<string> {
+    const segments = path.split("/").map(encodeURIComponent).join("/");
+    const res = await fetch(
+      `${this.base}/runs/${encodeURIComponent(runId)}/artifacts/${segments}?workspace_id=${encodeURIComponent(workspaceId)}`
+    );
+    if (!res.ok) {
+      throw new Error(`artifact fetch failed: ${res.status}`);
+    }
+    return res.text();
+  }
+
+  async fetchRunEvents(workspaceId: string, runId: string, afterSeq = 0): Promise<RunEvent[]> {
+    const params = new URLSearchParams({ workspace_id: workspaceId });
+    if (afterSeq > 0) params.set("after_seq", String(afterSeq));
+    const res = await fetch(`${this.base}/runs/${encodeURIComponent(runId)}/events.json?${params.toString()}`);
+    if (!res.ok) {
+      throw new Error(`fetchRunEvents failed: ${res.status} ${await res.text()}`);
+    }
+    const body = await res.json();
+    return Array.isArray(body.events) ? body.events : [];
+  }
+
+  streamRunEvents(
+    workspaceId: string,
+    runId: string,
+    onEvent: (event: RunEvent) => void,
+    opts: { afterSeq?: number; onError?: (err: unknown) => void; onClose?: () => void } = {}
+  ): AbortController {
+    const ctrl = new AbortController();
+    const params = new URLSearchParams({ workspace_id: workspaceId });
+    if (opts.afterSeq) params.set("after_seq", String(opts.afterSeq));
+    (async () => {
+      try {
+        const res = await fetch(`${this.base}/runs/${encodeURIComponent(runId)}/events?${params.toString()}`, {
+          signal: ctrl.signal,
+          headers: { Accept: "text/event-stream" },
+        });
+        if (!res.ok || !res.body) {
+          throw new Error(`stream failed: ${res.status}`);
+        }
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        let buf = "";
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          let idx;
+          while ((idx = buf.indexOf("\n\n")) !== -1) {
+            const block = buf.slice(0, idx);
+            buf = buf.slice(idx + 2);
+            const ev = parseSseBlock(block);
+            if (ev) onEvent(ev);
+          }
+        }
+      } catch (err) {
+        if ((err as any)?.name === "AbortError") return;
+        opts.onError?.(err);
+      } finally {
+        opts.onClose?.();
+      }
+    })();
+    return ctrl;
+  }
 }
+
+export const tinyagent = new TinyagentClient();
 
 function parseSseBlock(block: string): RunEvent | null {
   const dataLines: string[] = [];

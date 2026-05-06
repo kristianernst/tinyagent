@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { type FormEvent, useEffect, useState } from "react";
 import {
   IconBolt,
   IconChartArt,
@@ -15,6 +15,7 @@ import {
   IconSidebarR,
 } from "./icons";
 import type { Artifact } from "./lib/useRun";
+import type { WorkspaceSummary } from "./lib/api";
 
 export function SidebarToggle({
   side,
@@ -46,18 +47,37 @@ export function LeftSidebar({
   onToggle,
   activeChat,
   conversations,
+  workspaces,
+  activeWorkspaceId,
   onPickChat,
+  onPickWorkspace,
+  onAddWorkspace,
   onNewChat,
 }: {
   open: boolean;
   onToggle: () => void;
   activeChat: string;
   conversations: Conversation[];
+  workspaces: WorkspaceSummary[];
+  activeWorkspaceId: string;
   onPickChat: (id: string) => void;
+  onPickWorkspace: (id: string) => void;
+  onAddWorkspace: (path: string) => Promise<void>;
   onNewChat: () => void;
 }) {
-  const projects: Project[] = [{ id: "workspace", name: "Workspace", conversations }];
-  const [openProjects, setOpenProjects] = useState<Set<string>>(() => new Set(["workspace"]));
+  const projects: Project[] = workspaces.map((workspace) => ({
+    id: workspace.workspace_id,
+    name: workspace.name,
+    conversations: workspace.workspace_id === activeWorkspaceId ? conversations : [],
+  }));
+  const [openProjects, setOpenProjects] = useState<Set<string>>(() => new Set());
+  const [workspacePath, setWorkspacePath] = useState("");
+  const [workspaceError, setWorkspaceError] = useState("");
+  const [addingWorkspace, setAddingWorkspace] = useState(false);
+  useEffect(() => {
+    if (!activeWorkspaceId) return;
+    setOpenProjects((current) => new Set(current).add(activeWorkspaceId));
+  }, [activeWorkspaceId]);
   const toggleProject = (id: string) =>
     setOpenProjects((s) => {
       const n = new Set(s);
@@ -65,6 +85,21 @@ export function LeftSidebar({
       else n.add(id);
       return n;
     });
+  const submitWorkspace = async (event: FormEvent) => {
+    event.preventDefault();
+    const path = workspacePath.trim();
+    if (!path || addingWorkspace) return;
+    setWorkspaceError("");
+    setAddingWorkspace(true);
+    try {
+      await onAddWorkspace(path);
+      setWorkspacePath("");
+    } catch (err) {
+      setWorkspaceError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setAddingWorkspace(false);
+    }
+  };
 
   return (
     <aside
@@ -93,6 +128,17 @@ export function LeftSidebar({
 
         <div className="sb-scroll">
           <div className="sb-section-label">Projects</div>
+          <form className="sb-workspace-form" onSubmit={submitWorkspace}>
+            <input
+              value={workspacePath}
+              onChange={(event) => setWorkspacePath(event.target.value)}
+              placeholder="Workspace path"
+            />
+            <button type="submit" title="Add workspace" disabled={addingWorkspace || !workspacePath.trim()}>
+              <IconPlus size={12} />
+            </button>
+          </form>
+          {workspaceError && <div className="sb-workspace-error">{workspaceError}</div>}
           {projects.map((p, pi) => {
             const isOpen = openProjects.has(p.id);
             return (
@@ -101,7 +147,13 @@ export function LeftSidebar({
                 className={`sb-project ${isOpen ? "is-open" : ""}`}
                 style={{ ["--i" as any]: pi }}
               >
-                <button className="sb-project-head" onClick={() => toggleProject(p.id)}>
+                <button
+                  className={`sb-project-head ${activeWorkspaceId === p.id ? "is-active" : ""}`}
+                  onClick={() => {
+                    onPickWorkspace(p.id);
+                    toggleProject(p.id);
+                  }}
+                >
                   <IconChev className="sb-chev" size={11} />
                   <IconFolder size={13} />
                   <span className="sb-project-name">{p.name}</span>

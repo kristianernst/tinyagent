@@ -6,11 +6,11 @@ The chat UI is useful because it forces the substrate to prove five things: real
 
 ## 1. The core philosophy I would preserve
 
-Tinyagent’s strongest architectural shape right now is that a run is small, replayable, inspectable, and local. The current project shape matches that: `agentd` owns `Kernel`, `RunState`, `Profile`, `Tool`, `PolicyEngine`, `Transcript`, `Event`, workspace handling, and model providers, while `agentctl` is just a frontend and `chatui` is a newly added consumer over HTTP/SSE. The design note in the branch explicitly says not to optimize for chat UI specifically; CLIs, evals, IDE plugins, and external orchestrators should consume the same surface.
+Tinyagent’s strongest architectural shape right now is that a run is small, replayable, inspectable, and local. The current project shape matches that: `tinyagent.core` owns `Kernel`, `RunState`, `Profile`, `Tool`, `PolicyEngine`, `Transcript`, `Event`, workspace handling, and model providers, while `tinyagent` is just a frontend and `chatui` is a newly added consumer over HTTP/SSE. The design note in the branch explicitly says not to optimize for chat UI specifically; CLIs, evals, IDE plugins, and external orchestrators should consume the same surface.
 
 That means the core should remain:
 
-Small. No heavy web framework or frontend-shaped abstractions in `agentd`.
+Small. No heavy web framework or frontend-shaped abstractions in `tinyagent.core`.
 
 Auditable. Every meaningful decision should be reconstructable from events, transcript, artifacts, and workspace diffs.
 
@@ -54,7 +54,7 @@ That is a strong pattern: streaming is not a frontend concern. Streaming is a mo
 
 The missing pieces are not primarily React pieces.
 
-The first missing piece is shared provider construction. Today, `agentctl run` has `_model_for(...)`, while `agentd/runtime.py` hardcodes fake responses. The runtime, CLI, eval runner, SDK, and any future server mode should all use the same provider factory. The current CLI path already proves this shape: `agentctl run` and `agentctl eval` call `_model_for(...)`; `serve` does not.
+The first missing piece is shared provider construction. Today, `tinyagent run` has `_model_for(...)`, while `tinyagent/runtime/server.py` hardcodes fake responses. The runtime, CLI, eval runner, SDK, and any future server mode should all use the same provider factory. The current CLI path already proves this shape: `tinyagent run` and `tinyagent eval` call `_model_for(...)`; `serve` does not.
 
 The second missing piece is a real visibility/privacy filter at the runtime boundary. Events have `visibility` values of `internal`, `debug`, `user`, and `public`, plus debug-level helpers.  The web UI must not be trusted as the privacy boundary. The server should filter before sending SSE events. The UI can also ignore hidden events defensively, but that is not sufficient.
 
@@ -106,19 +106,19 @@ This keeps the kernel honest. The kernel remains a run engine. The runtime grows
 
 The architecture should have four layers.
 
-Layer 1: `agentd.core`
+Layer 1: `tinyagent.core`
 
 This is the kernel and execution machinery: model calls, tool dispatch, policy, approvals, workspace, sandbox, context, compaction, transcript, events, artifacts.
 
 This layer should not know about HTTP, React, SSE, browser sessions, web sockets, or frontend reducers.
 
-Layer 2: `agentd.runtime`
+Layer 2: `tinyagent.runtime.server`
 
 This is the controller layer: start run, cancel run, approve, list runs, serve artifacts, stream events, create sessions, append messages to sessions, and select providers.
 
 This layer may expose HTTP, but the internal controller should also be callable by an SDK or tests without HTTP.
 
-Layer 3: `agentd.session`
+Layer 3: `tinyagent.runtime.conversation`
 
 This should be small at first. It owns session metadata, turn list, branch/fork pointers, prior-message reconstruction, and home/workspace indexing. It does not execute tools. It calls the runtime to start runs.
 
@@ -134,12 +134,12 @@ The first PR should not implement full sessions. It should make a single run str
 
 Concretely:
 
-Add provider and streaming args to `agentctl serve`.
+Add provider and streaming args to `tinyagent serve`.
 
 Current `serve` only accepts `--workspace`, `--host`, `--port`, and `--run-root`.  It should accept at least:
 
 ```text
-agentctl serve \
+tinyagent serve \
   --provider openai-compatible \
   --workspace . \
   --host 127.0.0.1 \
@@ -148,7 +148,7 @@ agentctl serve \
   --debug 0
 ```
 
-Move provider construction out of `agentctl/cli.py` into `agentd.providers.factory` or similar.
+Move provider construction out of `tinyagent/cli.py` into `tinyagent.core.providers.factory` or similar.
 
 A minimal shape:
 
@@ -371,7 +371,7 @@ Each session turn references a workspace run:
 }
 ```
 
-This avoids forcing `agentctl replay` to learn sessions immediately. Existing run tools keep working. Later, `agentctl session inspect` or `agentctl session replay` can be added as a higher-level view.
+This avoids forcing `tinyagent replay` to learn sessions immediately. Existing run tools keep working. Later, `tinyagent session inspect` or `tinyagent session replay` can be added as a higher-level view.
 
 For branching, copy Pi’s conceptual model, not necessarily its exact implementation: turns can have `parent_turn_id`. A session can be a tree. The active branch is just a pointer to the current leaf. Pi’s docs explicitly use an `id`/`parentId` tree structure to enable branching and navigation. ([Pi][2])
 
@@ -419,7 +419,7 @@ That avoids premature API expansion.
 Start with process-level provider config for `serve`.
 
 ```text
-agentctl serve --provider openai-compatible --stream
+tinyagent serve --provider openai-compatible --stream
 ```
 
 Backed by env vars:
@@ -578,9 +578,9 @@ I would do this in five steps.
 
 Step 1: Make the current run server real.
 
-Add `agentctl serve --provider openai-compatible --stream --debug`.
+Add `tinyagent serve --provider openai-compatible --stream --debug`.
 
-Move provider construction into `agentd`.
+Move provider construction into `tinyagent.core`.
 
 Make `RuntimeConfig` carry provider factory, stream flag, debug level, workspace mode, approval mode, and sandbox mode.
 
@@ -622,7 +622,7 @@ Test that approval request/decision works over HTTP.
 
 Step 4: Add a minimal session ledger.
 
-Create `agentd/session.py` or `agentd/sessions/store.py`.
+Create `tinyagent/runtime/conversation.py` or `tinyagent/runtime/conversation.py`.
 
 Store `session.json` and `turns.jsonl` under `~/.tinyagent/sessions/<session_id>/`.
 
@@ -630,7 +630,7 @@ Each turn creates one run and records the run reference.
 
 Do not add full session SSE yet unless needed.
 
-Add `agentctl session list`, `agentctl session resume`, or HTTP session endpoints only after the store works internally.
+Add `tinyagent session list`, `tinyagent session resume`, or HTTP session endpoints only after the store works internally.
 
 Step 5: Add prior-context injection.
 

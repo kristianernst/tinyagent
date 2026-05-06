@@ -9,19 +9,19 @@ from types import SimpleNamespace
 
 import pytest
 
-from agentd.context import BuiltContext, ContextConfig, estimate_messages_tokens, estimate_tools_tokens
-from agentd.contextfs import read_hints, refresh_contextfs
-from agentd.eval_metrics import evaluate_thresholds, extract_run_metrics
-from agentd.kernel import Kernel
-from agentd.models import FakeModelProvider
-from agentd.observations import Observation
-from agentd.output import write_text_artifact
-from agentd.policy import LocalPolicy, PolicyConfig, PolicyRule
-from agentd.profiles import ApexCoderProfile
-from agentd.run_graph import fork_run
-from agentd.sdk import Agent
-from agentd.state import Message, ModelResponse, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, ToolStep, Workspace
-from agentd.tools import ReadContextTool, ShellTool, default_tools
+from tinyagent.core.context import BuiltContext, ContextConfig, estimate_messages_tokens, estimate_tools_tokens
+from tinyagent.core.contextfs import read_hints, refresh_contextfs
+from tinyagent.evals.metrics import evaluate_thresholds, extract_run_metrics
+from tinyagent.core.kernel import Kernel
+from tinyagent.core.models import FakeModelProvider
+from tinyagent.core.observations import Observation
+from tinyagent.core.output import write_text_artifact
+from tinyagent.core.policy import LocalPolicy, PolicyConfig, PolicyRule
+from tinyagent.core.profiles import ApexCoderProfile
+from tinyagent.runtime.run_graph import fork_run
+from tinyagent.core.sdk import Agent
+from tinyagent.core.state import Message, ModelResponse, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, ToolStep, Workspace
+from tinyagent.core.tools import ReadContextTool, ShellTool, default_tools
 
 
 class RecordingModel:
@@ -1197,39 +1197,8 @@ def test_noncritical_stable_context_respects_budget(tmp_path, monkeypatch) -> No
     assert any(exclusion.item_id == "project:instructions" for exclusion in built.excluded)
 
 
-def test_deprecated_worktree_sandbox_alias_maps_to_workspace_mode(tmp_path) -> None:
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
-    (tmp_path / "hello.txt").write_text("hello\n")
-    subprocess.run(["git", "add", "hello.txt"], cwd=tmp_path, check=True, capture_output=True, text=True)
-    subprocess.run(
-        ["git", "-c", "user.email=tinyagent@example.test", "-c", "user.name=tinyagent", "commit", "-m", "init"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-
-    state = Kernel(
-        model=FakeModelProvider([ModelResponse(content="done", finish_reason="stop")]),
-        profile=ApexCoderProfile(),
-        tools=default_tools(),
-        policy=LocalPolicy(),
-        sandbox_mode="worktree",
-    ).run("use worktree alias", workspace=tmp_path, run_id="run_worktree_sandbox")
-
-    assert state.workspace.root != tmp_path.resolve()
-    assert state.output_dir == tmp_path.resolve() / ".tinyagent" / "runs" / "run_worktree_sandbox"
-    boundary = next(event for event in state.events if event.type == "workspace.boundary")
-    assert boundary.data["mode"] == "worktree"
-    assert boundary.data["effective_mode"] == "worktree"
-    assert boundary.data["sandbox_mode"] == "none"
-    assert boundary.data["sandbox_backend"] == "none"
-    assert boundary.data["sandbox_alias"] == "worktree"
-    assert boundary.data["sandbox_enforced"] is False
-
-
 def test_container_sandbox_mode_fails_setup_until_backend_exists(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("agentd.workspace.detect_container_backend", lambda: None)
+    monkeypatch.setattr("tinyagent.core.workspace.detect_container_backend", lambda: None)
     kernel = Kernel(
         model=FakeModelProvider([ModelResponse(content="done", finish_reason="stop")]),
         profile=ApexCoderProfile(),
@@ -1243,7 +1212,7 @@ def test_container_sandbox_mode_fails_setup_until_backend_exists(tmp_path, monke
 
 
 def test_container_sandbox_mode_records_enforced_backend(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("agentd.workspace.detect_container_backend", lambda: "docker")
+    monkeypatch.setattr("tinyagent.core.workspace.detect_container_backend", lambda: "docker")
     state = Kernel(
         model=FakeModelProvider([ModelResponse(content="done", finish_reason="stop")]),
         profile=ApexCoderProfile(),
@@ -1277,7 +1246,7 @@ def test_shell_execution_envelope_exposes_sandbox_contract(tmp_path) -> None:
 
 
 def test_shell_container_sandbox_wraps_process_with_isolated_home_and_network(tmp_path) -> None:
-    from agentd.tools.builtins.shell import _popen_command
+    from tinyagent.core.tools.builtins.shell import _popen_command
 
     home = tmp_path / "run" / "container-home"
     envelope = SimpleNamespace(
@@ -1313,7 +1282,7 @@ def test_shell_container_sandbox_wraps_process_with_isolated_home_and_network(tm
 
 
 def test_shell_container_timeout_kills_cidfile_container(tmp_path, monkeypatch) -> None:
-    from agentd.tools.builtins.shell import _ProcessLaunch, _terminate_container
+    from tinyagent.core.tools.builtins.shell import _ProcessLaunch, _terminate_container
 
     cidfile = tmp_path / "container.cid"
     cidfile.write_text("abc123\n")
@@ -1323,7 +1292,7 @@ def test_shell_container_timeout_kills_cidfile_container(tmp_path, monkeypatch) 
         calls.append(args)
         return subprocess.CompletedProcess(args, 0, "", "")
 
-    monkeypatch.setattr("agentd.tools.builtins.shell.subprocess.run", fake_run)
+    monkeypatch.setattr("tinyagent.core.tools.builtins.shell.subprocess.run", fake_run)
 
     _terminate_container(_ProcessLaunch(args=["docker"], shell=False, container_backend="docker", cidfile=cidfile))
 
@@ -1331,7 +1300,7 @@ def test_shell_container_timeout_kills_cidfile_container(tmp_path, monkeypatch) 
 
 
 def test_container_image_rejects_option_like_values(monkeypatch) -> None:
-    from agentd.container_sandbox import default_container_image
+    from tinyagent.core.container_sandbox import default_container_image
 
     monkeypatch.setenv("TINYAGENT_CONTAINER_IMAGE", "--privileged")
 

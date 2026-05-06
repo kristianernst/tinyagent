@@ -1,14 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  cancelRun,
-  decideApproval,
-  fetchArtifactText,
-  fetchRunEvents,
-  listSessions,
-  startRun,
-  streamRunEvents,
-} from "./api";
-import type { ApprovalDecision, RunEvent, SessionSummary } from "./api";
+import { tinyagent } from "./api";
+import type { ApprovalDecision, ConversationSummary, RunEvent, WorkspaceSummary } from "./api";
 
 export type ToolStatus = "running" | "done" | "failed" | "blocked" | "cancelled";
 
@@ -114,11 +106,11 @@ const lastPendingModelTextKey = (pending: Record<string, string>): string => {
   return keys.length ? keys[keys.length - 1] : "";
 };
 
-const artifactHref = (runId: string, path: string): string =>
+const artifactHref = (workspaceId: string, runId: string, path: string): string =>
   `/api/runs/${encodeURIComponent(runId)}/artifacts/${path
     .split("/")
     .map(encodeURIComponent)
-    .join("/")}`;
+    .join("/")}?workspace_id=${encodeURIComponent(workspaceId)}`;
 
 const finalAnswerText = (text: string): string =>
   text.replace(/^# Final output\n\n/, "").trimEnd();
@@ -126,26 +118,29 @@ const finalAnswerText = (text: string): string =>
 const stripAnswerSuffix = (answer: string, suffix: string): string =>
   suffix && answer.endsWith(suffix) ? answer.slice(0, -suffix.length).trimEnd() : answer;
 
-const makeSessionId = (): string => {
+const makeConversationId = (): string => {
   const id =
     typeof crypto !== "undefined" && "randomUUID" in crypto
       ? crypto.randomUUID().replace(/-/g, "")
       : `${Date.now()}${Math.random().toString(16).slice(2)}`;
-  return `sess_${id}`;
+  return `conv_${id}`;
 };
 
 export function useRun() {
   const [turns, setTurns] = useState<Turn[]>([]);
   const [approval, setApproval] = useState<Approval | null>(null);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
-  const [sessions, setSessions] = useState<SessionSummary[]>([]);
-  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
+  const [activeWorkspaceId, setActiveWorkspaceId] = useState<string | null>(null);
+  const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   const [phase, setPhase] = useState<"idle" | "thinking" | "streaming">("idle");
   const [error, setError] = useState<string | null>(null);
   const streamRef = useRef<AbortController | null>(null);
   const activeTurnIdRef = useRef<string | null>(null);
   const activeRunIdRef = useRef<string | null>(null);
-  const sessionIdRef = useRef<string | null>(null);
+  const conversationIdRef = useRef<string | null>(null);
+  const workspaceIdRef = useRef<string | null>(null);
   const pendingModelTextRef = useRef<Record<string, string>>({});
   const replayingRef = useRef(false);
   const lastSeqRef = useRef(0);
@@ -157,13 +152,44 @@ export function useRun() {
 
   useEffect(() => () => stopStream(), [stopStream]);
 
-  const refreshSessions = useCallback(() => {
-    void listSessions()
-      .then(setSessions)
+  const refreshWorkspaces = useCallback(() => {
+    void tinyagent.listWorkspaces()
+      .then((rows) => {
+        setWorkspaces(rows);
+        setActiveWorkspaceId((current) => {
+          const next = current && rows.some((workspace) => workspace.workspace_id === current) ? current : rows[0]?.workspace_id ?? null;
+          workspaceIdRef.current = next;
+          return next;
+        });
+      })
       .catch(() => undefined);
   }, []);
 
-  useEffect(() => refreshSessions(), [refreshSessions]);
+  useEffect(() => refreshWorkspaces(), [refreshWorkspaces]);
+
+  const addWorkspace = useCallback(async (path: string) => {
+    const workspace = await tinyagent.registerWorkspace(path);
+    setWorkspaces((rows) => [workspace, ...rows.filter((row) => row.workspace_id !== workspace.workspace_id)]);
+    workspaceIdRef.current = workspace.workspace_id;
+    setActiveWorkspaceId(workspace.workspace_id);
+    return workspace;
+  }, []);
+
+  const refreshConversations = useCallback(() => {
+    const workspaceId = workspaceIdRef.current;
+    if (!workspaceId) {
+      setConversations([]);
+      return;
+    }
+    void tinyagent.listConversations(workspaceId)
+      .then(setConversations)
+      .catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    workspaceIdRef.current = activeWorkspaceId;
+    refreshConversations();
+  }, [activeWorkspaceId, refreshConversations]);
 
   const updateTurn = useCallback((id: string, fn: (t: Turn) => Turn) => {
     setTurns((prev) => prev.map((t) => (t.id === id ? fn(t) : t)));
@@ -339,7 +365,9 @@ export function useRun() {
           }
           const outputPath = typeof data.output_path === "string" ? data.output_path : "";
           if (outputPath) {
-            void fetchArtifactText(event.run_id, outputPath)
+            const workspaceId = workspaceIdRef.current;
+            if (!workspaceId) break;
+            void tinyagent.fetchArtifactText(workspaceId, event.run_id, outputPath)
               .then((artifactText) => {
                 if (!artifactText) return;
                 const finalText = finalAnswerText(artifactText);
@@ -384,7 +412,8 @@ export function useRun() {
             String(data.title ?? path ?? data.name ?? "Artifact") || "Artifact";
           const tool = String(data.tool ?? "");
           const kind: Artifact["kind"] = toolKindFor(tool);
-          const href = path ? artifactHref(event.run_id, path) : undefined;
+          const workspaceId = workspaceIdRef.current;
+          const href = path && workspaceId ? artifactHref(workspaceId, event.run_id, path) : undefined;
           setArtifacts((prev) => {
             const exists = prev.find((a) => a.id === id);
             if (exists) {
@@ -406,26 +435,26 @@ export function useRun() {
           clearActiveRun(turnId);
           setPhase("idle");
           setArtifacts((prev) => prev.map((a) => ({ ...a, state: "done" })));
-          refreshSessions();
+          refreshConversations();
           break;
         }
         case "run.failed": {
           updateTurn(turnId, (t) => ({ ...t, phase: "failed" }));
           clearActiveRun(turnId);
           setPhase("idle");
-          refreshSessions();
+          refreshConversations();
           break;
         }
         case "run.cancelled": {
           updateTurn(turnId, (t) => ({ ...t, phase: "cancelled" }));
           clearActiveRun(turnId);
           setPhase("idle");
-          refreshSessions();
+          refreshConversations();
           break;
         }
       }
     },
-    [clearActiveRun, refreshSessions, updateTurn]
+    [clearActiveRun, refreshConversations, updateTurn]
   );
 
   const send = useCallback(
@@ -433,6 +462,11 @@ export function useRun() {
       if (phase !== "idle") return;
       const trimmed = text.trim();
       if (!trimmed) return;
+      const workspaceId = workspaceIdRef.current;
+      if (!workspaceId) {
+        setError("Select a workspace before starting a conversation.");
+        return;
+      }
 
       const turnId = `turn_${Date.now()}`;
       activeTurnIdRef.current = turnId;
@@ -453,23 +487,22 @@ export function useRun() {
       setPhase("thinking");
 
       try {
-        if (!sessionIdRef.current) {
-          sessionIdRef.current = makeSessionId();
+        if (!conversationIdRef.current) {
+          conversationIdRef.current = makeConversationId();
         }
-        const { run_id, session_id } = await startRun(trimmed, {
+        const { run_id, conversation_id } = await tinyagent.startConversationTurn(workspaceId, conversationIdRef.current, trimmed, {
           approval_mode: mode,
-          session_id: sessionIdRef.current,
           turn_id: turnId,
         });
-        if (session_id) {
-          sessionIdRef.current = session_id;
-          setActiveSessionId(session_id);
-          setSessions((prev) => upsertLocalSession(prev, session_id, trimmed));
+        if (conversation_id) {
+          conversationIdRef.current = conversation_id;
+          setActiveConversationId(conversation_id);
+          setConversations((prev) => upsertLocalConversation(prev, conversation_id, trimmed));
         }
         activeRunIdRef.current = run_id;
         updateTurn(turnId, (t) => ({ ...t, runId: run_id }));
         streamRef.current?.abort();
-        streamRef.current = streamRunEvents(run_id, handleEvent(turnId), {
+        streamRef.current = tinyagent.streamRunEvents(workspaceId, run_id, handleEvent(turnId), {
           afterSeq: lastSeqRef.current,
           onError: (e) => setError(e instanceof Error ? e.message : String(e)),
           onClose: () => {
@@ -489,53 +522,65 @@ export function useRun() {
     [phase, handleEvent, updateTurn]
   );
 
-  const newSession = useCallback(() => {
+  const newConversation = useCallback(() => {
     stopStream();
     activeTurnIdRef.current = null;
     activeRunIdRef.current = null;
-    sessionIdRef.current = null;
+    conversationIdRef.current = null;
     pendingModelTextRef.current = {};
     lastSeqRef.current = 0;
-    setActiveSessionId(null);
+    setActiveConversationId(null);
     setTurns([]);
     setArtifacts([]);
     setApproval(null);
     setError(null);
     setPhase("idle");
-    refreshSessions();
-  }, [refreshSessions, stopStream]);
+    refreshConversations();
+  }, [refreshConversations, stopStream]);
 
-  const selectSession = useCallback(
-    async (sessionId: string) => {
+  const selectWorkspace = useCallback(
+    (workspaceId: string) => {
+      if (phase !== "idle") return;
+      workspaceIdRef.current = workspaceId;
+      setActiveWorkspaceId(workspaceId);
+      newConversation();
+    },
+    [newConversation, phase]
+  );
+
+  const selectConversation = useCallback(
+    async (conversationId: string) => {
       stopStream();
-      const session = sessions.find((item) => item.session_id === sessionId);
-      sessionIdRef.current = sessionId;
+      const conversation = conversations.find((item) => item.conversation_id === conversationId);
+      conversationIdRef.current = conversationId;
       activeTurnIdRef.current = null;
       activeRunIdRef.current = null;
       pendingModelTextRef.current = {};
       lastSeqRef.current = 0;
-      setActiveSessionId(sessionId);
+      setActiveConversationId(conversationId);
       setTurns([]);
       setArtifacts([]);
       setApproval(null);
       setError(null);
       setPhase("idle");
-      if (!session?.last_run_id) return;
+      if (!conversation?.last_run_id) return;
 
       try {
-        const events = await fetchRunEvents(session.last_run_id);
+        const workspaceId = workspaceIdRef.current;
+        if (!workspaceId) return;
+        const events = await tinyagent.fetchRunEvents(workspaceId, conversation.last_run_id);
         const started = events.find((event) => event.type === "run.started");
         const turnId =
           started?.turn_id ||
-          session.active_turn_id ||
+          conversation.active_turn_id ||
           events.find((event) => event.turn_id)?.turn_id ||
-          `loaded_${session.last_run_id}`;
-        const task = String(started?.data?.task || session.title || "New conversation");
+          `loaded_${conversation.last_run_id}`;
+        const task = String(started?.data?.task || conversation.title || "New conversation");
         const startedAt = started?.time ? Date.parse(started.time) : NaN;
         setTurns([
           {
             id: turnId,
-            runId: session.last_run_id,
+            runId: conversation.last_run_id,
             user: task,
             steps: [],
             answer: "",
@@ -556,9 +601,9 @@ export function useRun() {
           );
           if (!sawTerminalEvent) {
             const fallbackPhase: TurnPhase =
-              session.last_turn_status === "cancelled"
+              conversation.last_turn_status === "cancelled"
                 ? "cancelled"
-                : session.last_turn_status === "failed"
+                : conversation.last_turn_status === "failed"
                   ? "failed"
                   : "done";
             updateTurn(turnId, (t) => ({
@@ -576,12 +621,13 @@ export function useRun() {
         setPhase("idle");
       }
     },
-    [handleEvent, sessions, stopStream, updateTurn]
+    [handleEvent, conversations, stopStream, updateTurn]
   );
 
   const stop = useCallback(async () => {
     const runId = activeRunIdRef.current;
-    if (runId) await cancelRun(runId);
+    const workspaceId = workspaceIdRef.current;
+    if (runId && workspaceId) await tinyagent.cancelRun(workspaceId, runId);
     stopStream();
     const turnId = activeTurnIdRef.current;
     if (turnId) updateTurn(turnId, (t) => ({ ...t, phase: "cancelled" }));
@@ -593,7 +639,9 @@ export function useRun() {
   const respondToApproval = useCallback(
     async (decision: ApprovalDecision) => {
       if (!approval) return;
-      await decideApproval(approval.runId, approval.approvalId, decision);
+      const workspaceId = workspaceIdRef.current;
+      if (!workspaceId) return;
+      await tinyagent.decideApproval(workspaceId, approval.runId, approval.approvalId, decision);
       setApproval(null);
     },
     [approval]
@@ -604,29 +652,34 @@ export function useRun() {
     phase,
     approval,
     artifacts,
-    sessions,
-    activeSessionId,
+    workspaces,
+    activeWorkspaceId,
+    conversations,
+    activeConversationId,
     error,
     send,
     stop,
-    newSession,
-    selectSession,
+    addWorkspace,
+    refreshWorkspaces,
+    selectWorkspace,
+    newConversation,
+    selectConversation,
     respondToApproval,
   };
 }
 
-function upsertLocalSession(sessions: SessionSummary[], sessionId: string, title: string): SessionSummary[] {
+function upsertLocalConversation(conversations: ConversationSummary[], conversationId: string, title: string): ConversationSummary[] {
   const now = new Date().toISOString();
-  const existing = sessions.find((session) => session.session_id === sessionId);
+  const existing = conversations.find((conversation) => conversation.conversation_id === conversationId);
   if (existing) {
     return [
       { ...existing, title: existing.title || title, updated_at: now },
-      ...sessions.filter((session) => session.session_id !== sessionId),
+      ...conversations.filter((conversation) => conversation.conversation_id !== conversationId),
     ];
   }
   return [
     {
-      session_id: sessionId,
+      conversation_id: conversationId,
       title,
       status: "open",
       active_turn_id: null,
@@ -635,6 +688,6 @@ function upsertLocalSession(sessions: SessionSummary[], sessionId: string, title
       workspace: "",
       turn_count: 0,
     },
-    ...sessions,
+    ...conversations,
   ];
 }
