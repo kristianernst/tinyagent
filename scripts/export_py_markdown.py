@@ -6,7 +6,7 @@ import argparse
 from pathlib import Path
 
 EXCLUDED_DIRS = {".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tinyagent", ".venv", "__pycache__"}
-CORE_DIRS = {"agentctl", "agentd", "profiles"}
+CORE_DIRS = {"tinyagent", "profiles"}
 
 
 def main() -> int:

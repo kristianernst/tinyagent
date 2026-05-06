@@ -5,20 +5,20 @@ import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from agentd.contracts import Tool
-from agentd.config import VariantSpec
-from agentd.eval_runner import load_eval_cases, render_eval_comparison, render_eval_report, run_eval_comparison, run_eval_suite
-from agentd.models import FakeModelProvider
-from agentd.policy import default_policy
-from agentd.profiles import ApexCoderProfile
-from agentd.run_control import CancelToken
-from agentd.run_record import load_run_record, render_run_inspection
-from agentd.state import Message, ModelResponse, PolicyDecision, RunState, ToolCall, ToolResult
-from agentd.tools import default_tools
+from tinyagent.core.contracts import Tool
+from tinyagent.core.config import VariantSpec
+from tinyagent.evals.runner import load_eval_cases, render_eval_comparison, render_eval_report, run_eval_comparison, run_eval_suite
+from tinyagent.core.models import FakeModelProvider
+from tinyagent.core.policy import default_policy
+from tinyagent.core.profiles import ApexCoderProfile
+from tinyagent.core.run_control import CancelToken
+from tinyagent.runtime.run_record import load_run_record, render_run_inspection
+from tinyagent.core.state import Message, ModelResponse, PolicyDecision, RunState, ToolCall, ToolResult
+from tinyagent.core.tools import default_tools
 
 
 def test_run_record_inspects_completed_run(tmp_path) -> None:
-    from agentd.kernel import Kernel
+    from tinyagent.core.kernel import Kernel
 
     hello = tmp_path / "hello.txt"
     hello.write_text("hello\n")
@@ -223,7 +223,7 @@ def test_eval_comparison_passes_model_config_to_variant_factory(tmp_path) -> Non
 
 
 def test_eval_compare_cli_runs_fake_variants(tmp_path, capsys) -> None:
-    from agentctl.cli import main
+    from tinyagent.cli import main
 
     suite = _write_suite(tmp_path)
     config = tmp_path / "variant.toml"
@@ -240,7 +240,7 @@ def test_eval_compare_cli_runs_fake_variants(tmp_path, capsys) -> None:
 
 
 def test_eval_compare_default_output_dir_preserves_timestamp(tmp_path) -> None:
-    from agentctl.cli import _default_eval_compare_output_dir
+    from tinyagent.cli import _default_eval_compare_output_dir
 
     suite = tmp_path / "suite"
     output_dir = _default_eval_compare_output_dir(suite)
@@ -251,7 +251,7 @@ def test_eval_compare_default_output_dir_preserves_timestamp(tmp_path) -> None:
 
 
 def test_eval_compare_cli_exits_nonzero_for_threshold_failure(tmp_path, capsys) -> None:
-    from agentctl.cli import main
+    from tinyagent.cli import main
 
     suite = _write_suite(tmp_path)
     config = tmp_path / "variant.toml"
@@ -267,8 +267,8 @@ def test_eval_compare_cli_exits_nonzero_for_threshold_failure(tmp_path, capsys) 
 
 
 def test_eval_compare_cli_returns_130_for_sigint_cancellation(tmp_path, monkeypatch) -> None:
-    import agentctl.cli as cli
-    from agentd.eval_runner import EvalComparison
+    import tinyagent.cli as cli
+    from tinyagent.evals.runner import EvalComparison
 
     suite = _write_suite(tmp_path)
 
@@ -340,7 +340,7 @@ def test_eval_config_rejects_invalid_visible_tools_type(tmp_path) -> None:
 
 
 def test_openai_compatible_compare_config_without_model_uses_environment(tmp_path, monkeypatch) -> None:
-    from agentctl.cli import _model_for
+    from tinyagent.cli import _model_for
 
     config = tmp_path / "variant.toml"
     config.write_text('provider = "openai-compatible"\n')

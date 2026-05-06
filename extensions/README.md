@@ -9,7 +9,7 @@ capability.
 
 tinyagent now exposes a minimal explicit extension host. Project-local Python is
 not loaded automatically; callers must opt in by constructing extension objects
-or by calling `agentd.extensions.load_extension_file(path)` and passing the
+or by calling `tinyagent.core.extensions.load_extension_file(path)` and passing the
 result to `Kernel(..., extensions=[...])`.
 
 An extension object exposes hooks and tools:

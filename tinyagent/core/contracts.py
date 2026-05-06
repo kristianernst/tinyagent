@@ -1,0 +1,65 @@
+"""Runtime interfaces for models, profiles, tools, policy, and executors."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any, Protocol
+
+from tinyagent.core.model_stream import ModelDelta
+from tinyagent.core.state import ApprovalRequest, ApprovalResolution, FinishDecision, Message, ModelResponse, PolicyDecision, RunState, ToolCall, ToolResult
+
+
+class Tool(Protocol):
+    """ToolResult.data is small metadata only; large payloads should be artifacts."""
+
+    name: str
+    schema: Mapping[str, Any]
+
+    def run(self, call: ToolCall, state: RunState) -> ToolResult: ...
+
+
+class ModelProvider(Protocol):
+    name: str
+
+    def complete(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState) -> ModelResponse: ...
+
+
+class StreamingModelProvider(ModelProvider, Protocol):
+    def stream(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState) -> Iterable[ModelDelta]: ...
+
+
+class Profile(Protocol):
+    name: str
+
+    def system_prompt(self) -> str: ...
+
+    def build_messages(self, state: RunState) -> Sequence[Message]: ...
+
+    def visible_tools(self, state: RunState, all_tools: Mapping[str, Tool]) -> Sequence[Tool]: ...
+
+    def should_continue(self, state: RunState) -> bool: ...
+
+    def should_finish(self, state: RunState) -> bool: ...
+
+    def before_finish(self, state: RunState, response: ModelResponse) -> FinishDecision: ...
+
+    def should_compact(self, state: RunState) -> bool: ...
+
+    def compact(self, state: RunState) -> None: ...
+
+
+class PolicyEngine(Protocol):
+    def evaluate(self, call: ToolCall, state: RunState) -> PolicyDecision: ...
+
+
+class ApprovalHandler(Protocol):
+    def resolve(self, request: ApprovalRequest, state: RunState) -> ApprovalResolution: ...
+
+
+class Executor(Protocol):
+    def run_tool(self, tool: Tool, call: ToolCall, state: RunState) -> ToolResult: ...
+
+
+class LocalExecutor:
+    def run_tool(self, tool: Tool, call: ToolCall, state: RunState) -> ToolResult:
+        return tool.run(call, state)

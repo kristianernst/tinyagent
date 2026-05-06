@@ -10,16 +10,16 @@ import time
 
 import pytest
 
-from agentd.kernel import Kernel
-from agentd.models import FakeModelProvider
-from agentd.models import ModelSpec
-from agentd.output import MAX_UNTRACKED_DIFF_BYTES, capture_final_diff
-from agentd.policy import LocalPolicy
-from agentd.profiles import ApexCoderProfile
-from agentd.replay import replay_run
-from agentd.run_control import CancelToken
-from agentd.state import ModelResponse, RunBudgets, RunState, ToolCall, ToolResult, Workspace
-from agentd.tools import (
+from tinyagent.core.kernel import Kernel
+from tinyagent.core.models import FakeModelProvider
+from tinyagent.core.models import ModelSpec
+from tinyagent.core.output import MAX_UNTRACKED_DIFF_BYTES, capture_final_diff
+from tinyagent.core.policy import LocalPolicy
+from tinyagent.core.profiles import ApexCoderProfile
+from tinyagent.runtime.replay import replay_run
+from tinyagent.core.run_control import CancelToken
+from tinyagent.core.state import ModelResponse, RunBudgets, RunState, ToolCall, ToolResult, Workspace
+from tinyagent.core.tools import (
     ApplyPatchTool,
     ReadContextTool,
     ListFilesTool,
@@ -32,8 +32,8 @@ from agentd.tools import (
     builtin_tools,
     default_tools,
 )
-from agentd.tools.builtins.patch import apply_openai_patch
-from agentd.tools.repo import MAX_READ_FILE_BYTES, _run_rg_limited, repo_inspect_tools
+from tinyagent.core.tools.builtins.patch import apply_openai_patch
+from tinyagent.core.tools.repo import MAX_READ_FILE_BYTES, _run_rg_limited, repo_inspect_tools
 
 
 def test_list_and_search_exclude_tinyagent_outputs(tmp_path) -> None:
@@ -79,7 +79,7 @@ def test_structured_inspection_tools_emit_artifact_metadata(tmp_path) -> None:
 def test_read_context_allows_recovery_files_and_blocks_raw_artifacts(tmp_path) -> None:
     state = RunState.create("test", Workspace(tmp_path), run_id="run_context_reader")
     state.output_dir.mkdir(parents=True)
-    refresh = __import__("agentd.contextfs", fromlist=["refresh_contextfs"]).refresh_contextfs
+    refresh = __import__("tinyagent.core.contextfs", fromlist=["refresh_contextfs"]).refresh_contextfs
     refresh(state)
     (state.output_dir / "artifacts" / "model-response-0001.json").parent.mkdir(parents=True, exist_ok=True)
     (state.output_dir / "artifacts" / "model-response-0001.json").write_text("{}\n")
@@ -497,7 +497,7 @@ def test_search_repo_rg_uses_sanitized_environment(tmp_path, monkeypatch) -> Non
     fake_rg.chmod(0o755)
     monkeypatch.setenv("OPENAI_API_KEY", "secret")
     monkeypatch.setenv("TINYAGENT_MODEL_API_KEY", "tiny-secret")
-    monkeypatch.setattr("agentd.tools.repo.shutil.which", lambda _name: str(fake_rg))
+    monkeypatch.setattr("tinyagent.core.tools.repo.shutil.which", lambda _name: str(fake_rg))
     state = RunState.create("test", Workspace(tmp_path), run_id="run_test")
 
     result = SearchRepoTool().run(ToolCall(name="search_repo", args={"query": "needle"}), state)
@@ -531,7 +531,7 @@ def test_search_repo_timeout_terminates_rg_before_output(tmp_path) -> None:
 
 
 def test_fallback_search_skips_large_files(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("agentd.tools.repo.shutil.which", lambda _name: None)
+    monkeypatch.setattr("tinyagent.core.tools.repo.shutil.which", lambda _name: None)
     (tmp_path / "large.txt").write_text("needle\n" + ("x" * MAX_READ_FILE_BYTES))
     (tmp_path / "small.txt").write_text("needle\n")
     state = RunState.create("test", Workspace(tmp_path), run_id="run_test")
@@ -653,7 +653,7 @@ def test_write_file_rolls_back_if_atomic_write_fails(tmp_path, monkeypatch) -> N
         del src, dst
         raise OSError("replace failed")
 
-    monkeypatch.setattr("agentd.tools.builtins.edit.os.replace", fail_replace)
+    monkeypatch.setattr("tinyagent.core.tools.builtins.edit.os.replace", fail_replace)
     result = WriteFileTool().run(ToolCall(name="write_file", args={"path": "hello.txt", "content": "after\n"}), state)
 
     assert result.ok is False
@@ -795,7 +795,7 @@ def test_tool_collections_name_builtin_and_repo_groups() -> None:
 
 
 def test_tools_public_export_surface_stays_small() -> None:
-    import agentd.tools as tools
+    import tinyagent.core.tools as tools
 
     assert sorted(tools.__all__) == [
         "ApplyPatchTool",

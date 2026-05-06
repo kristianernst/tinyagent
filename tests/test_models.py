@@ -6,20 +6,20 @@ from pathlib import Path
 
 import pytest
 
-from agentd.contracts import Tool
-from agentd.kernel import Kernel
-from agentd.model_stream import ModelDelta, assemble_model_deltas, parse_chat_completion_chunk
-from agentd.models import (
+from tinyagent.core.contracts import Tool
+from tinyagent.core.kernel import Kernel
+from tinyagent.core.model_stream import ModelDelta, assemble_model_deltas, parse_chat_completion_chunk
+from tinyagent.core.models import (
     FakeModelProvider,
     ModelCapabilities,
     ModelSpec,
     ProviderError,
 )
-from agentd.policy import default_policy
-from agentd.profiles import ApexCoderProfile
-from agentd.providers.openai_compat import OpenAICompatibleConfig, OpenAICompatibleProvider
-from agentd.state import Message, ModelResponse, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, Workspace
-from agentd.tools import default_tools
+from tinyagent.core.policy import default_policy
+from tinyagent.core.profiles import ApexCoderProfile
+from tinyagent.core.providers.openai_compat import OpenAICompatibleConfig, OpenAICompatibleProvider
+from tinyagent.core.state import Message, ModelResponse, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, Workspace
+from tinyagent.core.tools import default_tools
 
 
 class SampleTool:
