@@ -6,3 +6,4 @@ __pycache__/
 .DS_Store
 
 .tinyagent/
+docs/tinyagent-code-export.md
