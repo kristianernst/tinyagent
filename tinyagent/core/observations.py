@@ -31,10 +31,14 @@ def extract_observations(call: ToolCall, result: ToolResult, state: RunState) ->
         return _shell_observations(call, result)
     if call.name == "read_file":
         return _read_file_observations(call, result)
-    if call.name == "read_context":
-        return _read_context_observations(call, result)
-    if call.name == "search_repo":
-        return _search_repo_observations(call, result)
+    if call.name == "context_search":
+        return _context_search_observations(call, result)
+    if call.name == "context_read":
+        return _context_read_observations(call, result)
+    if call.name == "search_code":
+        return _search_code_observations(call, result)
+    if call.name == "load_skill":
+        return _load_skill_observations(call, result)
     if result.data.get("blocked") or (result.failure_kind or result.data.get("failure_kind")) in {"policy_denied", "sandbox_blocked"}:
         return [_block_observation(call, result)]
     if not result.ok:
@@ -148,43 +152,90 @@ def _read_file_observations(call: ToolCall, result: ToolResult) -> list[Observat
     ]
 
 
-def _read_context_observations(call: ToolCall, result: ToolResult) -> list[Observation]:
-    if _is_policy_block(result):
-        return [_block_observation(call, result)]
-    if not result.ok:
-        return [_command_failure_observation(call, result)]
-    path = str(result.data.get("path") or call.args.get("path") or "")
-    return [
-        Observation(
-            kind="context_read",
-            subject=path,
-            summary=f"Read ContextFS recovery file {path}.",
-            refs=_result_refs(result),
-            data={"path": path, "tool_call_id": call.id},
-        )
-    ]
-
-
-def _search_repo_observations(call: ToolCall, result: ToolResult) -> list[Observation]:
+def _context_search_observations(call: ToolCall, result: ToolResult) -> list[Observation]:
     if _is_policy_block(result):
         return [_block_observation(call, result)]
     if not result.ok:
         return [_command_failure_observation(call, result)]
     query = str(result.data.get("query") or call.args.get("query") or "")
-    path = str(result.data.get("path") or call.args.get("path") or ".")
-    match_count = result.data.get("match_count")
-    summary = f"Search for {query!r} in {path} returned {match_count} match(es)."
+    return [
+        Observation(
+            kind="context_search_result",
+            subject=query,
+            summary=f"Context search for {query!r} returned {result.data.get('result_count')} result(s).",
+            refs=_result_refs(result),
+            data={
+                "query": query,
+                "source": result.data.get("source"),
+                "result_count": result.data.get("result_count"),
+                "sources_used": result.data.get("sources_used"),
+                "tool_call_id": call.id,
+            },
+        )
+    ]
+
+
+def _context_read_observations(call: ToolCall, result: ToolResult) -> list[Observation]:
+    if _is_policy_block(result):
+        return [_block_observation(call, result)]
+    if not result.ok:
+        return [_command_failure_observation(call, result)]
+    ref = str(result.data.get("ref") or call.args.get("ref") or "")
+    return [
+        Observation(
+            kind="context_read",
+            subject=ref,
+            summary=f"Read dynamic context ref {ref}.",
+            refs=_result_refs(result),
+            data={
+                "ref": ref,
+                "source": result.data.get("source"),
+                "line_count": result.data.get("line_count"),
+                "tool_call_id": call.id,
+            },
+        )
+    ]
+
+
+def _search_code_observations(call: ToolCall, result: ToolResult) -> list[Observation]:
+    if _is_policy_block(result):
+        return [_block_observation(call, result)]
+    if not result.ok:
+        return [_command_failure_observation(call, result)]
+    query = str(result.data.get("query") or call.args.get("query") or "")
     return [
         Observation(
             kind="search_result",
             subject=query,
-            summary=summary,
+            summary=f"Code search for {query!r} returned {result.data.get('result_count')} result(s).",
             refs=_result_refs(result),
             data={
                 "query": query,
-                "path": path,
-                "match_count": match_count,
-                "truncated": result.data.get("truncated"),
+                "path": result.data.get("path"),
+                "match_count": result.data.get("result_count"),
+                "tool_call_id": call.id,
+            },
+        )
+    ]
+
+
+def _load_skill_observations(call: ToolCall, result: ToolResult) -> list[Observation]:
+    if _is_policy_block(result):
+        return [_block_observation(call, result)]
+    if not result.ok:
+        return [_command_failure_observation(call, result)]
+    name = str(result.data.get("name") or call.args.get("name_or_id") or "")
+    return [
+        Observation(
+            kind="skill_loaded",
+            subject=name,
+            summary=f"Loaded skill {name}.",
+            refs=_result_refs(result),
+            data={
+                "skill_id": result.data.get("skill_id"),
+                "name": name,
+                "source": result.data.get("source"),
+                "path": result.data.get("path"),
                 "tool_call_id": call.id,
             },
         )

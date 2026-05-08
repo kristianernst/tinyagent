@@ -13,8 +13,10 @@ from tinyagent.core.events import LIVE_ONLY_EVENT_TYPES, MemoryEventSink, load_e
 from tinyagent.core.kernel import Kernel
 from tinyagent.core.model_stream import assemble_model_deltas
 from tinyagent.core.policy import default_policy
+from tinyagent.core.profiles import profile_for
 from tinyagent.core.providers.openai_compat import OpenAICompatibleProvider
 from tinyagent.core.state import Message, RunState, Workspace
+from tinyagent.core.tools import default_tools
 
 pytestmark = pytest.mark.integration
 
@@ -114,6 +116,34 @@ def test_real_openai_compatible_eval_smoke(tmp_path) -> None:
     assert eval_run.results[0].success is True
     assert (eval_run.output_dir / "results.jsonl").exists()
     assert (eval_run.output_dir / "report.md").exists()
+
+
+def test_real_openai_compatible_tiny_pi_tool_use_e2e(tmp_path) -> None:
+    provider = _provider_or_skip()
+    workspace = _workspace(tmp_path)
+    (workspace / "hello.txt").write_text("live tool ok\n")
+    kernel = Kernel(
+        model=provider,
+        profile=profile_for("tiny-pi"),
+        tools=default_tools(),
+        policy=default_policy(),
+        stream=False,
+    )
+
+    state = kernel.run(
+        "Read hello.txt using the read_file tool, then answer exactly: live tool ok",
+        workspace=workspace,
+        run_id="real-tiny-pi-tool-smoke",
+    )
+    events = load_events_jsonl(state.output_dir / "events.jsonl")
+
+    assert not state.failed, state.failure_reason
+    assert any(event.type == "model.tool_call.assembly.completed" and event.data.get("tool") == "read_file" for event in events)
+    assert any(
+        event.type == "tool.execution.completed" and event.data.get("tool") == "read_file" and event.data.get("ok") is True
+        for event in events
+    )
+    assert state.final_output.strip()
 
 
 def _provider_or_skip() -> OpenAICompatibleProvider:

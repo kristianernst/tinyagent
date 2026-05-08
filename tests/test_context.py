@@ -105,6 +105,7 @@ def test_apex_context_layers_environment_agents_task_and_budgeted_tools(tmp_path
         "project_instructions",
         "task",
         "context_plan",
+        "dynamic_context_sources",
         "working_state",
         "recent_tool_steps",
     ]
@@ -118,11 +119,40 @@ def test_apex_context_layers_environment_agents_task_and_budgeted_tools(tmp_path
     assert "Prefer rg before grep." in built.messages[2].content
     assert built.messages[3].content == "Task:\ninspect and patch"
     assert "mode: debug" in built.messages[4].content
+    assert "Use context_search" in built.messages[5].content
     recent = built.messages[-1].content
     assert "failed command" in recent
     assert "git status --short" in recent
     assert "Applied patch." in recent
     assert "older-noise" not in recent
+
+
+def test_recent_tool_context_uses_stable_contextfs_refs_for_product_home_output(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    output_dir = tmp_path / "home" / ".tinyagent" / "runs" / "run_product_home_recent"
+    workspace.mkdir()
+    artifact = output_dir / "context" / "shell" / "0001-call_shell.txt"
+    state = RunState.create("inspect product home", Workspace(workspace), run_id="run_product_home_recent", output_dir=output_dir)
+    state.tool_steps.append(
+        ToolStep(
+            call=ToolCall(id="call_shell", name="shell", args={"cmd": "printf x"}),
+            result=ToolResult(
+                tool_name="shell",
+                call_id="call_shell",
+                output="x" * 100,
+                artifact_path="context/shell/0001-call_shell.txt",
+                read_hints=[f"tail -120 {artifact}"],
+            ),
+        )
+    )
+    profile = ApexCoderProfile(context_config=ContextConfig(max_recent_tool_tokens=999_999, compact_at_tokens=999_999))
+
+    built = profile.build_context(state)
+
+    recent = next(message for message in built.messages if message.meta.get("context_layer") == "recent_tool_steps")
+    assert 'context_read({"ref":"contextfs:context/shell/0001-call_shell.txt"})' in recent.content
+    assert str(output_dir) not in recent.content
+    assert str(output_dir.parent.parent) not in recent.content
 
 
 def test_apex_context_includes_prior_conversation_before_current_task(tmp_path, monkeypatch) -> None:

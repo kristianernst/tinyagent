@@ -7,8 +7,21 @@ from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 
-from tinyagent.core.context import BuiltContext, ContextBuilder, ContextConfig, ContextPlan, compact_state
+from tinyagent.core.context import (
+    BuiltContext,
+    ContextBuilder,
+    ContextConfig,
+    ContextItem,
+    ContextPlan,
+    compact_state,
+    estimate_messages_tokens,
+    render_environment_context,
+    render_project_instructions,
+    render_recent_tool_steps,
+)
 from tinyagent.core.context.checkpoint import is_test_command_text
+from tinyagent.core.context.builder import render_conversation_history, render_finish_gate_messages
+from tinyagent.core.context.instructions import load_project_instructions
 from tinyagent.core.contracts import Tool
 from tinyagent.core.state import FinishDecision, Message, ModelResponse, RunState, ToolStep
 
@@ -17,7 +30,30 @@ PROFILE_ROOT = Path(__file__).resolve().parents[1] / "profiles"
 
 class ApexCoderProfile:
     name = "tiny-coder"
-    DEFAULT_VISIBLE_TOOL_NAMES = ("read_file", "read_context", "search_repo", "apply_patch", "shell")
+    profile_variant = "default"
+    context_policy_name = "dynamic-v1"
+    skill_policy_name = "default-v1"
+    tool_surface_name = "default"
+    DEFAULT_VISIBLE_TOOL_NAMES = (
+        "read_file",
+        "context_search",
+        "context_read",
+        "search_code",
+        "list_skills",
+        "load_skill",
+        "mcp_search_tools",
+        "mcp_load_tool",
+        "mcp_call",
+        "mcp_read_resource",
+        "lsp_symbols",
+        "lsp_definition",
+        "lsp_references",
+        "lsp_diagnostics",
+        "todo_read",
+        "todo_write",
+        "apply_patch",
+        "shell",
+    )
 
     def __init__(
         self,
@@ -174,6 +210,167 @@ class ApexCoderProfile:
         return self.context_config.with_model_budget(context_window=context_window, max_output_tokens=max_output_tokens)
 
 
+class TinyPiProfile:
+    name = "tiny-pi"
+    profile_variant = "minimal"
+    context_policy_name = "pi-v1"
+    skill_policy_name = "none"
+    tool_surface_name = "pi-minimal"
+    DEFAULT_VISIBLE_TOOL_NAMES = ("read_file", "apply_patch", "shell")
+
+    def __init__(
+        self,
+        *,
+        recent_results: int = 4,
+        context_config: ContextConfig | None = None,
+        visible_tool_names: Sequence[str] | None = None,
+    ) -> None:
+        self.recent_results = recent_results
+        self.visible_tool_names = tuple(visible_tool_names) if visible_tool_names is not None else self.DEFAULT_VISIBLE_TOOL_NAMES
+        self.context_config = context_config or ContextConfig(
+            project_instruction_max_chars=8_000,
+            max_recent_tool_tokens=2_000,
+            compact_after_tool_steps=12,
+            compact_at_tokens=48_000,
+            reserve_output_tokens=4_000,
+        )
+        self._system_prompt = (
+            "You are tinyagent, a small coding agent working in this workspace. "
+            "Inspect files before editing when needed. Use shell for commands and verification. "
+            "Use the edit tool for file changes. Keep responses concise. Respect policy and sandbox messages. "
+            "Do not claim tests or checks passed unless you ran them and they passed. "
+            "Finish with what changed and what you verified."
+        )
+
+    def system_prompt(self) -> str:
+        return self._system_prompt
+
+    def build_context(self, state: RunState) -> BuiltContext:
+        config = self._context_config_for_state(state)
+        instructions = load_project_instructions(state.workspace.root, config)
+        recent = render_recent_tool_steps(
+            state,
+            config,
+            ContextPlan(mode="edit" if state.tool_steps else "explore", reason="tiny-pi lean context"),
+        )
+        messages = [
+            Message(role="system", content=self.system_prompt()),
+            Message(role="user", content=render_environment_context(state, config)),
+            Message(role="user", content=render_project_instructions(instructions)),
+            Message(role="user", content=f"Task:\n{state.task}"),
+            Message(role="user", content=recent),
+        ]
+        conversation = render_conversation_history(state)
+        if conversation:
+            messages.insert(3, Message(role="user", content=conversation))
+        finish_gate = render_finish_gate_messages(state)
+        if finish_gate:
+            messages.append(Message(role="user", content=finish_gate))
+        included = [
+            _context_item("system:profile", self.system_prompt(), "system_prompt", 1000, stable=True),
+            _context_item("environment:current", str(messages[1].content), "environment", 850, stable=True),
+            _context_item("project:instructions", str(messages[2].content), "project_instructions", 800, stable=True),
+            *([_context_item("conversation:history", conversation, "conversation_history", 925, stable=True)] if conversation else []),
+            _context_item("task:current", f"Task:\n{state.task}", "task", 950, stable=True),
+            _context_item("recent_tools:preview", recent, "recent_tool_steps", 600, stable=True),
+            *([_context_item("finish_gate:messages", finish_gate, "finish_gate", 780)] if finish_gate else []),
+        ]
+        return BuiltContext(
+            messages=messages,
+            token_estimate=estimate_messages_tokens(messages),
+            static_context_chars=sum(len(str(message.content)) for message in messages),
+            tool_context_chars=len(recent),
+            project_instruction_chars=instructions.chars,
+            included=included,
+            context_plan=ContextPlan(mode="explore", reason="tiny-pi lean context"),
+        )
+
+    def plan_next_context(self, state: RunState) -> ContextPlan:
+        return ContextPlan(mode="edit" if state.tool_steps else "explore", reason="tiny-pi lean context")
+
+    def build_messages(self, state: RunState) -> Sequence[Message]:
+        return self.build_context(state).messages
+
+    def visible_tools(self, state: RunState, all_tools: Mapping[str, Tool]) -> Sequence[Tool]:
+        tool_names = _edit_style_visible_tool_names(state, self.visible_tool_names, default=self.DEFAULT_VISIBLE_TOOL_NAMES)
+        return [all_tools[name] for name in tool_names if name in all_tools]
+
+    def should_continue(self, state: RunState) -> bool:
+        return not state.done
+
+    def should_finish(self, state: RunState) -> bool:
+        return False
+
+    def before_finish(self, state: RunState, response: ModelResponse) -> FinishDecision:
+        content = response.content or ""
+        edited_index = _latest_index(state.tool_steps, _is_successful_mutation)
+        if _claims_tests_passed(content):
+            verification_index = _latest_index(state.tool_steps, _is_successful_verification)
+            if verification_index is None or (edited_index is not None and verification_index < edited_index):
+                return FinishDecision.blocked(
+                    "finish blocked: final answer claims tests passed without current passing verification evidence",
+                    "Do not claim tests passed unless a relevant passing verification command exists after the latest edit.",
+                )
+        failed_verification_index = _latest_index(state.tool_steps, _is_failed_verification)
+        if failed_verification_index is not None:
+            next_success = _latest_index(state.tool_steps, _is_successful_verification)
+            if (next_success is None or next_success < failed_verification_index) and not _mentions_failure(content):
+                return FinishDecision.blocked(
+                    "finish blocked: failed verification was not reported",
+                    "Report the failed verification or continue investigating.",
+                )
+        last_step = state.tool_steps[-1] if state.tool_steps else None
+        if last_step is not None and not last_step.result.ok and not _mentions_failure(content):
+            return FinishDecision.blocked(
+                "finish blocked: last tool failed and final answer did not report it",
+                "The last tool failed. Report the failure/current state before finalizing, or continue investigating.",
+            )
+        blocked_index = _latest_index(
+            state.tool_steps,
+            lambda step: (step.result.failure_kind or step.result.data.get("failure_kind")) in {"policy_denied", "sandbox_blocked"},
+        )
+        if blocked_index is not None and not _mentions_limitation(content):
+            return FinishDecision.blocked(
+                "finish blocked: policy/sandbox limitation was not reported",
+                "A policy or sandbox limitation occurred. Mention it explicitly or request approval before finalizing.",
+            )
+        return FinishDecision.allowed()
+
+    def should_compact(self, state: RunState) -> bool:
+        new_steps = len(state.tool_steps) - state.context_checkpoint_tool_step_count
+        return new_steps > 0 and (
+            new_steps >= self.context_config.compact_after_tool_steps
+            or state.context_token_estimate >= self.context_config.effective_compact_at_tokens
+        )
+
+    def compact(self, state: RunState) -> None:
+        compact_state(state, self._context_config_for_state(state))
+
+    def _context_config_for_state(self, state: RunState) -> ContextConfig:
+        capabilities = (state.model_spec or {}).get("capabilities")
+        if not isinstance(capabilities, dict):
+            return self.context_config
+        context_window = capabilities.get("context_window")
+        max_output_tokens = capabilities.get("max_output_tokens")
+        if not isinstance(context_window, int) or not isinstance(max_output_tokens, int):
+            return self.context_config
+        return self.context_config.with_model_budget(context_window=context_window, max_output_tokens=max_output_tokens)
+
+
+def profile_for(
+    name: str | None = None,
+    *,
+    visible_tool_names: Sequence[str] | None = None,
+    context_config: ContextConfig | None = None,
+):
+    normalized = (name or "tiny-coder").strip().lower()
+    if normalized in {"tiny-coder", "default", "apex", "apex-coder"}:
+        return ApexCoderProfile(visible_tool_names=visible_tool_names, context_config=context_config)
+    if normalized in {"tiny-pi", "pi", "minimal"}:
+        return TinyPiProfile(visible_tool_names=visible_tool_names, context_config=context_config)
+    raise ValueError(f"Unknown profile: {name}")
+
+
 def _latest_index(steps: list[ToolStep], predicate) -> int | None:
     for index in range(len(steps) - 1, -1, -1):
         if predicate(steps[index]):
@@ -182,16 +379,36 @@ def _latest_index(steps: list[ToolStep], predicate) -> int | None:
 
 
 def _visible_tool_names_for_state(state: RunState, configured: Sequence[str]) -> tuple[str, ...]:
-    if tuple(configured) != ApexCoderProfile.DEFAULT_VISIBLE_TOOL_NAMES:
+    return _edit_style_visible_tool_names(state, configured, default=ApexCoderProfile.DEFAULT_VISIBLE_TOOL_NAMES)
+
+
+def _edit_style_visible_tool_names(state: RunState, configured: Sequence[str], *, default: Sequence[str]) -> tuple[str, ...]:
+    if tuple(configured) != tuple(default):
         return tuple(configured)
     edit_style = str((state.model_spec or {}).get("edit_style") or "apply_patch")
     match edit_style:
         case "str_replace":
-            return ("read_file", "read_context", "search_repo", "str_replace_edit", "shell")
+            return _replace_default_edit_tool(default, "str_replace_edit")
         case "whole_file":
-            return ("read_file", "read_context", "search_repo", "write_file", "shell")
+            return _replace_default_edit_tool(default, "write_file")
         case _:
-            return ApexCoderProfile.DEFAULT_VISIBLE_TOOL_NAMES
+            return tuple(default)
+
+
+def _replace_default_edit_tool(default: Sequence[str], edit_tool: str) -> tuple[str, ...]:
+    return tuple(edit_tool if name == "apply_patch" else name for name in default)
+
+
+def _context_item(item_id: str, text: str, source: str, priority: int, *, stable: bool = False) -> ContextItem:
+    return ContextItem(
+        id=item_id,
+        role="user",
+        text=text,
+        source=source,
+        priority=priority,
+        token_estimate=max(1, len(text) // 4),
+        stable=stable,
+    )
 
 
 def _is_successful_mutation(step: ToolStep) -> bool:
@@ -250,6 +467,15 @@ def _is_successful_verification(step: ToolStep) -> bool:
     )
 
 
+def _is_failed_verification(step: ToolStep) -> bool:
+    if step.call.name != "shell" or step.result.ok:
+        return False
+    cmd = str(step.call.args.get("cmd", ""))
+    return is_test_command_text(cmd) or any(
+        token in cmd.lower() for token in ("-m pytest", "-m unittest", "npm test", "cargo test", "go test", "ruff", "mypy")
+    )
+
+
 def _mentions_verification_limitation(content: str) -> bool:
     text = content.lower()
     return any(phrase in text for phrase in ("could not run", "unable to run", "did not run", "not run", "verification unavailable"))
@@ -271,4 +497,12 @@ def _mentions_limitation(content: str) -> bool:
 
 
 def _claims_tests_passed(content: str) -> bool:
-    return re.search(r"\b(tests?|checks?|verification)\s+(passed|pass|green|succeeded)", content.lower()) is not None
+    text = content.lower()
+    return any(
+        re.search(pattern, text) is not None
+        for pattern in (
+            r"\b(?:tests?|test suite|checks?|verification)\s+(?:are\s+|is\s+)?(?:passing|passed|pass|green|succeeded)",
+            r"\b(?:passing|passed|green|succeeded)\s+(?:tests?|test suite|checks?|verification)",
+            r"\b(?:all|the)\s+(?:tests?|checks?)\s+(?:are\s+|were\s+)?(?:passing|passed|green)",
+        )
+    )

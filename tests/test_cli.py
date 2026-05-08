@@ -73,6 +73,9 @@ def test_tinyagent_serve_uses_runtime_server_options(tmp_path, capsys, monkeypat
         workspace_mode,
         approval_mode,
         sandbox_mode,
+        profile,
+        profile_override,
+        memory_enabled,
     ):
         calls.append(
             (
@@ -87,6 +90,9 @@ def test_tinyagent_serve_uses_runtime_server_options(tmp_path, capsys, monkeypat
                 workspace_mode,
                 approval_mode,
                 sandbox_mode,
+                profile,
+                profile_override,
+                memory_enabled,
             )
         )
         return FakeServer()
@@ -117,6 +123,8 @@ def test_tinyagent_serve_uses_runtime_server_options(tmp_path, capsys, monkeypat
             "yolo",
             "--sandbox-mode",
             "none",
+            "--profile",
+            "tiny-pi",
         ]
     )
     captured = capsys.readouterr()
@@ -137,6 +145,9 @@ def test_tinyagent_serve_uses_runtime_server_options(tmp_path, capsys, monkeypat
             "current",
             "yolo",
             "none",
+            "tiny-pi",
+            True,
+            False,
         ),
         ("closed",),
     ]
@@ -498,6 +509,40 @@ def test_tinyagent_run_uses_registered_default_provider_without_overwriting(tmp_
     assert updated["default_provider"] == "openai-compatible"
 
 
+def test_tinyagent_run_uses_registered_default_profile_when_profile_omitted(tmp_path, capsys, monkeypatch) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("TINYAGENT_HOME", str(home))
+
+    assert cli.main(["init", "--workspace", str(workspace)]) == 0
+    capsys.readouterr()
+    [workspace_record_path] = list((home / "workspaces").glob("ws_*/workspace.json"))
+    record = json.loads(workspace_record_path.read_text())
+    record["default_profile"] = "tiny-pi"
+    workspace_record_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+
+    exit_code = cli.main(["run", "answer", "--workspace", str(workspace), "--provider", "fake", "--run-id", "run_profile_default"])
+    captured = capsys.readouterr()
+    events = (next((home / "workspaces").glob("ws_*/runs/run_profile_default/events.jsonl"))).read_text().splitlines()
+    started = next(json.loads(line) for line in events if json.loads(line)["type"] == "run.started")
+
+    assert exit_code == 0
+    assert "Fake run finished: answer" in captured.out
+    assert started["data"]["profile"] == "tiny-pi"
+
+
+def test_tinyagent_run_reports_unknown_profile_without_traceback(tmp_path, capsys) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    exit_code = cli.main(["run", "answer", "--workspace", str(workspace), "--provider", "fake", "--profile", "missing"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert captured.out == "run error: Unknown profile: missing\n"
+
+
 def test_tinyagent_run_explicit_provider_preserves_registered_default(tmp_path, capsys, monkeypatch) -> None:
     home = tmp_path / "home"
     workspace = tmp_path / "workspace"
@@ -641,8 +686,11 @@ def test_tinyagent_serve_uses_product_conversation_root(tmp_path, capsys, monkey
         workspace_mode,
         approval_mode,
         sandbox_mode,
+        profile,
+        profile_override,
+        memory_enabled,
     ):
-        calls.append((Path(home_arg.root), provider, host, port, stream, debug_level, workspace_mode, approval_mode, sandbox_mode))
+        calls.append((Path(home_arg.root), provider, host, port, stream, debug_level, workspace_mode, approval_mode, sandbox_mode, profile, profile_override, memory_enabled))
         return FakeServer()
 
     monkeypatch.setattr(cli, "create_product_runtime_server", fake_create_product_runtime_server)
@@ -665,6 +713,9 @@ def test_tinyagent_serve_uses_product_conversation_root(tmp_path, capsys, monkey
             "current",
             "yolo",
             "none",
+            "tiny-coder",
+            False,
+            False,
         ),
         ("closed",),
     ]

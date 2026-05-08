@@ -17,6 +17,7 @@ from tinyagent.core.models import (
 )
 from tinyagent.core.policy import default_policy
 from tinyagent.core.profiles import ApexCoderProfile
+from tinyagent.core.providers.factory import ProviderRegistry, ProviderSpec, provider_for
 from tinyagent.core.providers.openai_compat import OpenAICompatibleConfig, OpenAICompatibleProvider
 from tinyagent.core.state import Message, ModelResponse, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, Workspace
 from tinyagent.core.tools import default_tools
@@ -112,6 +113,30 @@ def test_fake_provider_returns_responses_in_order() -> None:
 
     with pytest.raises(ProviderError, match="no response left"):
         provider.complete([], [], _state_stub())
+
+
+def test_provider_registry_can_create_registered_provider() -> None:
+    class CustomFactory:
+        kind = "custom"
+
+        def create(self, spec, task, env=None):
+            del env
+            return FakeModelProvider([ModelResponse(content=f"{spec.model}:{task}")], model=spec.model or "custom")
+
+    registry = ProviderRegistry()
+    registry.register(CustomFactory())
+
+    provider = registry.create(ProviderSpec(kind="custom", model="m"), "task")
+
+    assert registry.kinds() == ("custom",)
+    assert provider.complete([], [], _state_stub()).content == "m:task"
+
+
+def test_default_provider_factory_records_adapter_metadata() -> None:
+    provider = provider_for(ProviderSpec(kind="fake", model="fake-model"), "task")
+
+    assert provider.model == "fake-model"
+    assert provider.adapter == "tinyagent.fake.v1"
 
 
 def test_fake_provider_stream_assembles_same_final_response() -> None:
@@ -229,6 +254,7 @@ def test_openai_compatible_provider_merges_extra_body_without_overriding_stream_
     assert payload["stream_options"] == {"debug": True, "include_usage": True}
     assert provider.capabilities.tool_protocol == "chat_completions"
     assert provider.capabilities.input_budget_tokens == 120_000
+    assert provider.model_spec.to_json_dict()["adapter"] == "tinyagent.openai_compat.v1"
 
 
 def test_openai_compatible_provider_preserves_explicit_thinking_budget_tokens() -> None:
@@ -299,8 +325,23 @@ def test_model_spec_drives_context_budget_and_visible_tools(tmp_path) -> None:
     ).run("use spec", workspace=tmp_path, run_id="run_model_spec")
 
     assert state.failed is False
-    assert provider.tools == ["read_file", "read_context", "search_repo", "str_replace_edit", "shell"]
+    assert provider.tools == [
+        "read_file",
+        "context_search",
+        "context_read",
+        "search_code",
+        "list_skills",
+        "load_skill",
+        "str_replace_edit",
+        "shell",
+    ]
     assert state.model_spec["edit_style"] == "str_replace"
+    started = next(event for event in state.events if event.type == "run.started")
+    assert started.data["provider"] == "anthropic"
+    assert started.data["model"] == "claude-test"
+    assert started.data["protocol"] == "anthropic"
+    assert started.data["capabilities"]["context_window"] == 20_000
+    assert started.data["adapter"] == "unknown"
     report_event = next(event for event in state.events if event.type == "context.report.written")
     report = json.loads((state.output_dir / report_event.data["context_report_artifact"]).read_text())
     assert report["budget"] == 18_000

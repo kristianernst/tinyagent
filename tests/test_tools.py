@@ -10,21 +10,19 @@ import time
 
 import pytest
 
+from tinyagent.core.index import SearchCodeTool, WorkspaceIndexManager
 from tinyagent.core.kernel import Kernel
-from tinyagent.core.models import FakeModelProvider
-from tinyagent.core.models import ModelSpec
+from tinyagent.core.models import FakeModelProvider, ModelSpec
 from tinyagent.core.output import MAX_UNTRACKED_DIFF_BYTES, capture_final_diff
 from tinyagent.core.policy import LocalPolicy
-from tinyagent.core.profiles import ApexCoderProfile
-from tinyagent.runtime.replay import replay_run
+from tinyagent.core.profiles import ApexCoderProfile, TinyPiProfile, profile_for
 from tinyagent.core.run_control import CancelToken
-from tinyagent.core.state import ModelResponse, RunBudgets, RunState, ToolCall, ToolResult, Workspace
+from tinyagent.core.context import estimate_messages_tokens, estimate_tools_tokens
+from tinyagent.core.state import Message, ModelResponse, RunBudgets, RunState, ToolCall, ToolResult, ToolStep, Workspace
 from tinyagent.core.tools import (
     ApplyPatchTool,
-    ReadContextTool,
     ListFilesTool,
     ReadFileTool,
-    SearchRepoTool,
     ShellTool,
     StrReplaceEditTool,
     WriteFileTool,
@@ -33,18 +31,20 @@ from tinyagent.core.tools import (
     default_tools,
 )
 from tinyagent.core.tools.builtins.patch import apply_openai_patch
-from tinyagent.core.tools.repo import MAX_READ_FILE_BYTES, _run_rg_limited, repo_inspect_tools
+from tinyagent.core.tools.repo import MAX_READ_FILE_BYTES, repo_inspect_tools
+from tinyagent.runtime.replay import replay_run
 
 
-def test_list_and_search_exclude_tinyagent_outputs(tmp_path) -> None:
+def test_list_and_code_search_exclude_tinyagent_outputs(tmp_path) -> None:
     (tmp_path / "hello.txt").write_text("needle\n")
     trace_dir = tmp_path / ".tinyagent" / "runs" / "run_test"
     trace_dir.mkdir(parents=True)
     (trace_dir / "events.jsonl").write_text("needle\n")
     state = RunState.create("test", Workspace(tmp_path), run_id="run_test")
+    state.workspace_index = WorkspaceIndexManager.for_workspace(tmp_path)
 
     listed = ListFilesTool().run(ToolCall(name="list_files"), state)
-    searched = SearchRepoTool().run(ToolCall(name="search_repo", args={"query": "needle"}), state)
+    searched = SearchCodeTool().run(ToolCall(name="search_code", args={"query": "needle"}), state)
 
     assert listed.ok is True
     assert "hello.txt" in listed.output
@@ -52,16 +52,20 @@ def test_list_and_search_exclude_tinyagent_outputs(tmp_path) -> None:
     assert searched.ok is True
     assert "hello.txt" in searched.output
     assert ".tinyagent" not in searched.output
-    assert [event.type for event in state.events] == ["files.listed", "artifact.created", "search.completed"]
+    assert [event.type for event in state.events] == [
+        "files.listed",
+        "index.sync.started",
+        "index.sync.completed",
+        "code.search.completed",
+    ]
 
 
-def test_structured_inspection_tools_emit_artifact_metadata(tmp_path) -> None:
+def test_read_file_emits_artifact_metadata(tmp_path) -> None:
     (tmp_path / "hello.txt").write_text("needle\n" * 30)
     state = RunState.create("test", Workspace(tmp_path), run_id="run_structured_inspection")
     state.budgets = RunBudgets(max_command_output_chars_visible=80)
 
     read = ReadFileTool().run(ToolCall(name="read_file", args={"path": "hello.txt", "max_lines": 30}), state)
-    search = SearchRepoTool().run(ToolCall(name="search_repo", args={"query": "needle", "max_matches": 5}), state)
 
     assert read.ok is True
     assert read.artifact_path and read.artifact_path.startswith("context/read_file/")
@@ -69,28 +73,6 @@ def test_structured_inspection_tools_emit_artifact_metadata(tmp_path) -> None:
     assert read.read_hints
     assert read.data["path"] == "hello.txt"
     assert read.data["line_count"] == 30
-    assert search.ok is True
-    assert search.artifact_path
-    assert search.data["output_artifact"] == search.artifact_path
-    assert search.truncated is True
-    assert search.read_hints
-
-
-def test_read_context_allows_recovery_files_and_blocks_raw_artifacts(tmp_path) -> None:
-    state = RunState.create("test", Workspace(tmp_path), run_id="run_context_reader")
-    state.output_dir.mkdir(parents=True)
-    refresh = __import__("tinyagent.core.contextfs", fromlist=["refresh_contextfs"]).refresh_contextfs
-    refresh(state)
-    (state.output_dir / "artifacts" / "model-response-0001.json").parent.mkdir(parents=True, exist_ok=True)
-    (state.output_dir / "artifacts" / "model-response-0001.json").write_text("{}\n")
-
-    index = ReadContextTool().run(ToolCall(name="read_context", args={"path": "context/INDEX.md"}), state)
-    raw_model = ReadContextTool().run(ToolCall(name="read_context", args={"path": "artifacts/model-response-0001.json"}), state)
-
-    assert index.ok is True
-    assert "context/task.md" in index.output
-    assert raw_model.ok is False
-    assert "not an allowed recovery file" in raw_model.output
 
 
 def test_read_file_and_apply_patch_protect_current_run_artifacts(tmp_path) -> None:
@@ -134,21 +116,14 @@ def test_custom_output_dir_is_excluded_from_list_search_and_final_diff(tmp_path)
     state = RunState.create("test", Workspace(tmp_path), run_id="run_custom", output_dir=output_dir)
 
     listed = ListFilesTool().run(ToolCall(name="list_files"), state)
-    searched = SearchRepoTool().run(ToolCall(name="search_repo", args={"query": "needle"}), state)
     listed_output_dir = ListFilesTool().run(ToolCall(name="list_files", args={"path": "run-output"}), state)
-    searched_output_dir = SearchRepoTool().run(ToolCall(name="search_repo", args={"query": "needle", "path": "run-output"}), state)
     capture_final_diff(state)
 
     assert listed.ok is True
-    assert searched.ok is True
     assert listed_output_dir.ok is True
-    assert searched_output_dir.ok is True
     assert "real.txt" in listed.output
-    assert "real.txt" in searched.output
     assert "run-output" not in listed.output
-    assert "run-output" not in searched.output
     assert listed_output_dir.output == ""
-    assert searched_output_dir.output == "No matches."
     assert "real.txt" in state.final_diff
     assert "run-output" not in state.final_diff
 
@@ -391,7 +366,7 @@ def test_local_policy_blocks_explicit_current_run_artifact_search_paths(tmp_path
     policy = LocalPolicy()
 
     listed = policy.evaluate(ToolCall(name="list_files", args={"path": ".tinyagent/runs/run_test"}), state)
-    searched = policy.evaluate(ToolCall(name="search_repo", args={"path": ".tinyagent/runs/run_test", "query": "secret"}), state)
+    searched = policy.evaluate(ToolCall(name="search_code", args={"path": ".tinyagent/runs/run_test", "query": "secret"}), state)
 
     assert listed.allowed is False
     assert "current run artifacts" in listed.reason
@@ -480,63 +455,14 @@ def test_shell_timeout_terminates_process_group_children(tmp_path) -> None:
     assert result.data["capability"] == "process"
 
 
-def test_search_repo_rg_uses_sanitized_environment(tmp_path, monkeypatch) -> None:
-    fake_rg = tmp_path / "fake-rg"
-    fake_rg.write_text(
-        "\n".join(
-            [
-                f"#!{sys.executable}",
-                "import os",
-                "print(os.environ.get('OPENAI_API_KEY', 'missing'))",
-                "print(os.environ.get('TINYAGENT_MODEL_API_KEY', 'missing'))",
-                "print(os.environ.get('HOME', 'missing'))",
-                "print(os.environ.get('PYTHONDONTWRITEBYTECODE', 'missing'))",
-            ]
-        )
-    )
-    fake_rg.chmod(0o755)
-    monkeypatch.setenv("OPENAI_API_KEY", "secret")
-    monkeypatch.setenv("TINYAGENT_MODEL_API_KEY", "tiny-secret")
-    monkeypatch.setattr("tinyagent.core.tools.repo.shutil.which", lambda _name: str(fake_rg))
-    state = RunState.create("test", Workspace(tmp_path), run_id="run_test")
-
-    result = SearchRepoTool().run(ToolCall(name="search_repo", args={"query": "needle"}), state)
-
-    assert result.ok is True
-    assert result.output.splitlines() == ["missing", "missing", str(state.output_dir / "home"), "1"]
-
-
-def test_search_repo_timeout_terminates_rg_before_output(tmp_path) -> None:
-    fake_rg = tmp_path / "slow-rg"
-    fake_rg.write_text(
-        "\n".join(
-            [
-                "#!/usr/bin/env python3",
-                "import time",
-                "time.sleep(5)",
-                "print('late match')",
-            ]
-        )
-    )
-    fake_rg.chmod(0o755)
-    state = RunState.create("test", Workspace(tmp_path), budgets=RunBudgets(max_shell_timeout_seconds=1), run_id="run_test")
-
-    started = time.monotonic()
-    lines, truncated, timed_out = _run_rg_limited(state, str(fake_rg), "needle", ".", max_matches=10)
-
-    assert time.monotonic() - started < 3
-    assert lines == []
-    assert truncated is True
-    assert timed_out is True
-
-
-def test_fallback_search_skips_large_files(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("tinyagent.core.tools.repo.shutil.which", lambda _name: None)
+def test_search_code_python_fallback_skips_large_files(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("tinyagent.core.index.rg.shutil.which", lambda _name: None)
     (tmp_path / "large.txt").write_text("needle\n" + ("x" * MAX_READ_FILE_BYTES))
     (tmp_path / "small.txt").write_text("needle\n")
     state = RunState.create("test", Workspace(tmp_path), run_id="run_test")
+    state.workspace_index = WorkspaceIndexManager.for_workspace(tmp_path)
 
-    result = SearchRepoTool().run(ToolCall(name="search_repo", args={"query": "needle"}), state)
+    result = SearchCodeTool().run(ToolCall(name="search_code", args={"query": "needle"}), state)
 
     assert result.ok is True
     assert "small.txt" in result.output
@@ -757,39 +683,83 @@ def test_apex_profile_caches_system_prompt(tmp_path) -> None:
     assert profile.system_prompt() == "first"
 
 
+def _default_kernel_tools() -> dict[str, object]:
+    kernel = Kernel(
+        model=FakeModelProvider([ModelResponse(content="done")]),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+    )
+    return kernel.tools
+
+
 def test_apex_profile_exposes_structured_inspection_edit_and_shell_by_default(tmp_path) -> None:
     state = RunState.create("test", Workspace(tmp_path), run_id="run_test")
-    tools = {tool.name: tool for tool in default_tools()}
+    tools = _default_kernel_tools()
 
     visible = ApexCoderProfile().visible_tools(state, tools)
 
-    assert [tool.name for tool in visible] == ["read_file", "read_context", "search_repo", "apply_patch", "shell"]
+    assert [tool.name for tool in visible] == [
+        "read_file",
+        "context_search",
+        "context_read",
+        "search_code",
+        "list_skills",
+        "load_skill",
+        "apply_patch",
+        "shell",
+    ]
 
 
 def test_apex_profile_selects_claude_like_edit_tool_from_model_spec(tmp_path) -> None:
     state = RunState.create("test", Workspace(tmp_path), run_id="run_test")
     state.model_spec = ModelSpec(provider="anthropic", model="claude", protocol="anthropic", edit_style="str_replace").to_json_dict()
-    tools = {tool.name: tool for tool in default_tools()}
+    tools = _default_kernel_tools()
 
     visible = ApexCoderProfile().visible_tools(state, tools)
 
-    assert [tool.name for tool in visible] == ["read_file", "read_context", "search_repo", "str_replace_edit", "shell"]
+    assert [tool.name for tool in visible] == [
+        "read_file",
+        "context_search",
+        "context_read",
+        "search_code",
+        "list_skills",
+        "load_skill",
+        "str_replace_edit",
+        "shell",
+    ]
 
 
 def test_apex_profile_selects_generic_write_file_tool_from_model_spec(tmp_path) -> None:
     state = RunState.create("test", Workspace(tmp_path), run_id="run_test")
     state.model_spec = ModelSpec(provider="generic", model="text", edit_style="whole_file").to_json_dict()
-    tools = {tool.name: tool for tool in default_tools()}
+    tools = _default_kernel_tools()
 
     visible = ApexCoderProfile().visible_tools(state, tools)
 
-    assert [tool.name for tool in visible] == ["read_file", "read_context", "search_repo", "write_file", "shell"]
+    assert [tool.name for tool in visible] == [
+        "read_file",
+        "context_search",
+        "context_read",
+        "search_code",
+        "list_skills",
+        "load_skill",
+        "write_file",
+        "shell",
+    ]
 
 
 def test_tool_collections_name_builtin_and_repo_groups() -> None:
     assert [tool.name for tool in builtin_tools()] == ["shell", "apply_patch", "str_replace_edit", "write_file"]
-    assert [tool.name for tool in repo_inspect_tools()] == ["read_file", "list_files", "search_repo"]
-    assert [tool.name for tool in all_tools()] == ["shell", "apply_patch", "str_replace_edit", "write_file", "read_file", "list_files", "search_repo", "read_context"]
+    assert [tool.name for tool in repo_inspect_tools()] == ["read_file", "list_files"]
+    assert [tool.name for tool in all_tools()] == [
+        "shell",
+        "apply_patch",
+        "str_replace_edit",
+        "write_file",
+        "read_file",
+        "list_files",
+    ]
     assert [tool.name for tool in default_tools()] == [tool.name for tool in all_tools()]
     assert "finish" not in {tool.name for tool in default_tools()}
 
@@ -800,9 +770,7 @@ def test_tools_public_export_surface_stays_small() -> None:
     assert sorted(tools.__all__) == [
         "ApplyPatchTool",
         "ListFilesTool",
-        "ReadContextTool",
         "ReadFileTool",
-        "SearchRepoTool",
         "ShellTool",
         "StrReplaceEditTool",
         "WriteFileTool",
@@ -816,12 +784,89 @@ def test_tools_public_export_surface_stays_small() -> None:
 
 def test_apex_profile_visible_tools_are_overridable_for_ablations(tmp_path) -> None:
     state = RunState.create("test", Workspace(tmp_path), run_id="run_test")
-    tools = {tool.name: tool for tool in default_tools()}
-    profile = ApexCoderProfile(visible_tool_names=("shell", "apply_patch", "read_file", "search_repo"))
+    tools = _default_kernel_tools()
+    profile = ApexCoderProfile(visible_tool_names=("shell", "apply_patch", "read_file", "search_code"))
 
     visible = profile.visible_tools(state, tools)
 
-    assert [tool.name for tool in visible] == ["shell", "apply_patch", "read_file", "search_repo"]
+    assert [tool.name for tool in visible] == ["shell", "apply_patch", "read_file", "search_code"]
+
+
+def test_tiny_pi_profile_has_minimal_tool_surface_and_context(tmp_path) -> None:
+    state = RunState.create("test", Workspace(tmp_path), run_id="run_tiny_pi")
+    tools = _default_kernel_tools()
+
+    profile = TinyPiProfile()
+    visible = profile.visible_tools(state, tools)
+    context = profile.build_context(state)
+    combined = "\n".join(str(message.content) for message in context.messages)
+
+    assert [tool.name for tool in visible] == ["read_file", "apply_patch", "shell"]
+    assert estimate_tools_tokens(visible) < estimate_tools_tokens(ApexCoderProfile().visible_tools(state, tools))
+    assert estimate_messages_tokens(context.messages) < estimate_messages_tokens(ApexCoderProfile().build_messages(state))
+    assert "Dynamic context sources:" not in combined
+    assert "ContextFS index" not in combined
+
+
+def test_tiny_pi_profile_renders_finish_gate_and_prior_conversation(tmp_path) -> None:
+    state = RunState.create(
+        "follow up",
+        Workspace(tmp_path),
+        run_id="run_tiny_pi_conversation",
+        prior_messages=(Message(role="user", content="previous turn"),),
+    )
+    state.finish_gate_messages.append("Do not claim tests passed.")
+
+    combined = "\n".join(str(message.content) for message in TinyPiProfile().build_context(state).messages)
+
+    assert "previous turn" in combined
+    assert "Do not claim tests passed." in combined
+    assert "Dynamic context sources:" not in combined
+
+
+def test_tiny_pi_profile_selects_model_specific_edit_tool(tmp_path) -> None:
+    state = RunState.create("test", Workspace(tmp_path), run_id="run_tiny_pi_edit_style")
+    state.model_spec = ModelSpec(provider="anthropic", model="claude", protocol="anthropic", edit_style="str_replace").to_json_dict()
+    tools = _default_kernel_tools()
+
+    visible = TinyPiProfile().visible_tools(state, tools)
+
+    assert [tool.name for tool in visible] == ["read_file", "str_replace_edit", "shell"]
+
+
+def test_profile_for_aliases_and_errors() -> None:
+    assert isinstance(profile_for("tiny-coder"), ApexCoderProfile)
+    assert isinstance(profile_for("pi"), TinyPiProfile)
+    with pytest.raises(ValueError, match="Unknown profile"):
+        profile_for("unknown")
+
+
+def test_tiny_pi_truthfulness_gate_without_strict_apex_finish_gate(tmp_path) -> None:
+    state = RunState.create("test", Workspace(tmp_path), run_id="run_tiny_pi_finish")
+    state.tool_steps.append(
+        ToolStep(
+            ToolCall(name="apply_patch"),
+            ToolResult(tool_name="apply_patch", output="patched", ok=True, metadata={"paths": ["hello.txt"]}),
+        )
+    )
+    profile = TinyPiProfile()
+
+    allowed = profile.before_finish(state, ModelResponse(content="Changed hello.txt.", finish_reason="stop"))
+    blocked = profile.before_finish(state, ModelResponse(content="Changed hello.txt. Tests passed.", finish_reason="stop"))
+    blocked_suite = profile.before_finish(
+        state,
+        ModelResponse(content="Changed hello.txt. The test suite passes.", finish_reason="stop"),
+    )
+    blocked_checks = profile.before_finish(
+        state,
+        ModelResponse(content="Changed hello.txt. Checks are green.", finish_reason="stop"),
+    )
+
+    assert allowed.allow is True
+    assert blocked.allow is False
+    assert blocked_suite.allow is False
+    assert blocked_checks.allow is False
+    assert "tests passed" in blocked.reason
 
 
 @pytest.mark.parametrize(
@@ -860,7 +905,16 @@ def test_apex_profile_blocks_registered_but_hidden_tools(tmp_path, tool_name, ar
     assert result.data == {
         "blocked": True,
         "error_type": "ToolNotVisible",
-        "visible_tools": ["apply_patch", "read_context", "read_file", "search_repo", "shell"],
+        "visible_tools": [
+            "apply_patch",
+            "context_read",
+            "context_search",
+            "list_skills",
+            "load_skill",
+            "read_file",
+            "search_code",
+            "shell",
+        ],
     }
     hidden_events = [event for event in state.events if event.data.get("tool_call_id") == hidden_call.id]
     assert [event.type for event in hidden_events] == [
@@ -1106,7 +1160,11 @@ def test_fake_provider_trace_shells_patches_answers_with_content_and_captures_di
     assert event_types[-1] == "run.completed"
     assert "turn.completed" in event_types
     patch_result = next(result for result in state.tool_results if result.tool_name == "apply_patch")
-    shell_result = next(result for step, result in [(step, step.result) for step in state.tool_steps] if step.call.args.get("cmd") == "cat hello.txt")
+    shell_result = next(
+        result
+        for step, result in [(step, step.result) for step in state.tool_steps]
+        if step.call.args.get("cmd") == "cat hello.txt"
+    )
     assert (state.output_dir / patch_result.data["output_artifact"]).exists()
     assert (state.output_dir / shell_result.data["output_artifact"]).read_text() == "hello tinyagent\n"
 
@@ -1199,7 +1257,16 @@ def test_golden_trace_covers_context_artifacts_tool_args_shell_artifact_and_untr
     assert (state.output_dir / model_request.data["logical_request_artifact"]).exists()
     assert (state.output_dir / model_response.data["response_artifact"]).exists()
     logical_request = json.loads((state.output_dir / model_request.data["logical_request_artifact"]).read_text())
-    assert [tool["name"] for tool in logical_request["tools"]] == ["read_file", "read_context", "search_repo", "apply_patch", "shell"]
+    assert [tool["name"] for tool in logical_request["tools"]] == [
+        "read_file",
+        "context_search",
+        "context_read",
+        "search_code",
+        "list_skills",
+        "load_skill",
+        "apply_patch",
+        "shell",
+    ]
     final_context = (state.output_dir / model_requests[-1].data["context_artifact"]).read_text()
     assert "Tool: shell" in final_context
     assert "created.txt" in final_context

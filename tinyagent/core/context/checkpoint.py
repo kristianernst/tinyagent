@@ -166,8 +166,8 @@ def _artifact_description(step: ToolStep) -> str:
         return f"apply_patch output for {', '.join(str(path) for path in paths)}"
     if step.call.name == "read_file":
         return f"read_file output for {step.result.data.get('path', '')}"
-    if step.call.name == "search_repo":
-        return f"search_repo output for {step.result.data.get('query', '')!r}"
+    if step.call.name == "search_code":
+        return f"search_code output for {step.result.data.get('query', '')!r}"
     return f"{step.call.name} output"
 
 
