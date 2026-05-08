@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Literal
 
 from tinyagent.core.contracts import PolicyEngine
+from tinyagent.core.index.safety import parse_code_ref
 from tinyagent.core.state import ApprovalRequest, PolicyDecision, RunState, ToolCall
 from tinyagent.core.tools import patch_paths, resolve_workspace_path
 
@@ -35,11 +36,71 @@ class LocalPolicy:
                 case "list_files":
                     resolve_workspace_path(state, call.args.get("path", "."), allow_run_artifacts=self.allow_run_artifacts)
                     return PolicyDecision.allow("list_files path is inside workspace")
-                case "search_repo":
-                    resolve_workspace_path(state, call.args.get("path", "."), allow_run_artifacts=self.allow_run_artifacts)
-                    return PolicyDecision.allow("search_repo path is inside workspace")
-                case "read_context":
-                    return PolicyDecision.allow("read_context path is constrained to safe ContextFS recovery files")
+                case "search_code":
+                    resolve_workspace_path(state, call.args.get("path", "."), allow_run_artifacts=False)
+                    return PolicyDecision.allow("search_code path is inside workspace", permission="workspace_index")
+                case "context_search":
+                    source = str(call.args.get("source") or "*")
+                    for permission, target, reason, risk in _context_search_checks(source):
+                        decision = self._decision(call, state, permission, target, reason=reason, risk=risk)
+                        if not decision.allowed:
+                            return decision
+                    return self._decision(call, state, "context_search", source, reason="dynamic context search")
+                case "context_read":
+                    ref = str(call.args.get("ref") or "*")
+                    if ref.startswith("workspace_index:"):
+                        code_ref = ref.removeprefix("workspace_index:")
+                        if not code_ref.startswith("code:"):
+                            return PolicyDecision.deny(f"Unsupported workspace index ref: {ref}", permission="context_read")
+                        path_part, _line = parse_code_ref(code_ref)
+                        resolve_workspace_path(state, path_part, allow_run_artifacts=False)
+                    for permission, target, reason, risk in _context_read_checks(ref):
+                        decision = self._decision(call, state, permission, target, reason=reason, risk=risk)
+                        if not decision.allowed:
+                            return decision
+                    return self._decision(call, state, "context_read", ref, reason="dynamic context read")
+                case "list_skills":
+                    return self._decision(call, state, "skill", "list", reason="skill catalogue read")
+                case "load_skill":
+                    target = str(call.args.get("name_or_id") or "*")
+                    return self._decision(call, state, "skill", target, reason="skill instruction read")
+                case "mcp_search_tools" | "mcp_load_tool":
+                    server = str(call.args.get("server") or "*") or "*"
+                    decision = self._decision(call, state, "mcp_server", server, reason="MCP catalogue access")
+                    return _network_guard_if_allowed(self.config, decision, call, state, target=f"mcp:{server}")
+                case "mcp_call":
+                    server = str(call.args.get("server") or "*") or "*"
+                    tool = str(call.args.get("tool") or "*") or "*"
+                    decision = self._decision(
+                        call,
+                        state,
+                        "mcp_tool",
+                        f"{server}.{tool}",
+                        reason="MCP tool call",
+                        action_kind="network",
+                        risk="medium",
+                    )
+                    return _network_guard_if_allowed(self.config, decision, call, state, target=f"mcp:{server}")
+                case "mcp_read_resource":
+                    server = str(call.args.get("server") or "*") or "*"
+                    uri = str(call.args.get("uri") or "*") or "*"
+                    decision = self._decision(
+                        call,
+                        state,
+                        "mcp_resource",
+                        f"{server}:{uri}",
+                        reason="MCP resource read",
+                        action_kind="network",
+                        risk="medium",
+                    )
+                    return _network_guard_if_allowed(self.config, decision, call, state, target=f"mcp:{server}")
+                case "lsp_symbols" | "lsp_definition" | "lsp_references" | "lsp_diagnostics":
+                    path = str(call.args.get("path") or "*") or "*"
+                    if path != "*":
+                        resolve_workspace_path(state, path, allow_run_artifacts=False)
+                    return self._decision(call, state, "lsp", path, reason="LSP code-intelligence query")
+                case "todo_read" | "todo_write":
+                    return self._decision(call, state, "working_memory", "run", reason="run-scoped working memory access")
                 case "apply_patch" | "str_replace_edit" | "write_file":
                     return self._evaluate_patch(call, state)
                 case "shell":
@@ -47,6 +108,30 @@ class LocalPolicy:
         except Exception as exc:
             return PolicyDecision.deny(str(exc))
         return PolicyDecision.deny(f"Unknown tool for policy: {call.name}")
+
+    def _decision(
+        self,
+        call: ToolCall,
+        state: RunState,
+        permission: str,
+        target: str,
+        *,
+        reason: str,
+        action_kind: str = "unknown",
+        risk: str = "low",
+        command: str | None = None,
+    ) -> PolicyDecision:
+        return _decision_from_action(
+            _resolve_permission(self.config, permission, target),
+            call,
+            state,
+            reason=reason,
+            permission=permission,
+            target=target,
+            action_kind=action_kind,
+            risk=risk,
+            command=command,
+        )
 
     def _evaluate_patch(self, call: ToolCall, state: RunState) -> PolicyDecision:
         if call.name in {"str_replace_edit", "write_file"}:
@@ -91,75 +176,69 @@ class LocalPolicy:
                 return PolicyDecision.deny(reason, matched_rule=pattern, permission="bash")
         protected_write = _protected_tinyagent_write(cmd)
         if protected_write:
-            return _decision_from_action(
-                _resolve_permission(self.config, "contextfs_write", protected_write),
+            return self._decision(
                 call,
                 state,
+                "contextfs_write",
+                protected_write,
                 reason=f"shell write to protected .tinyagent evidence is denied: {protected_write}",
-                permission="contextfs_write",
-                target=protected_write,
                 action_kind="workspace_escape",
                 risk="high",
                 command=cmd,
             )
         env_access = _env_file_access(cmd)
         if env_access:
-            return _decision_from_action(
-                _resolve_permission(self.config, "secrets", env_access),
+            return self._decision(
                 call,
                 state,
+                "secrets",
+                env_access,
                 reason=f"access to protected environment file is denied: {env_access}",
-                permission="secrets",
-                target=env_access,
                 action_kind="workspace_escape",
                 risk="high",
                 command=cmd,
             )
         protected_output_write = _protected_output_write(cmd, state)
         if protected_output_write:
-            return _decision_from_action(
-                _resolve_permission(self.config, "run_artifact_write", protected_output_write),
+            return self._decision(
                 call,
                 state,
+                "run_artifact_write",
+                protected_output_write,
                 reason=f"shell write to protected run evidence is denied: {protected_output_write}",
-                permission="run_artifact_write",
-                target=protected_output_write,
                 action_kind="workspace_escape",
                 risk="high",
                 command=cmd,
             )
         redirect_escape = _outside_redirect_target(cmd, state)
         if redirect_escape:
-            return _decision_from_action(
-                _resolve_permission(self.config, "external_directory", redirect_escape),
+            return self._decision(
                 call,
                 state,
+                "external_directory",
+                redirect_escape,
                 reason=f"shell redirects outside workspace envelope: {redirect_escape}",
-                permission="external_directory",
-                target=redirect_escape,
                 action_kind="workspace_escape",
                 risk="high",
                 command=cmd,
             )
         if _NETWORK_SHELL_PATTERN.search(lower):
-            return _decision_from_action(
-                _resolve_permission(self.config, "network", cmd),
+            return self._decision(
                 call,
                 state,
+                "network",
+                cmd,
                 reason="network-looking shell command is denied by default",
-                permission="network",
-                target=cmd,
                 action_kind="network",
                 risk="high",
                 command=cmd,
             )
-        return _decision_from_action(
-            _resolve_permission(self.config, "bash", cmd),
+        return self._decision(
             call,
             state,
+            "bash",
+            cmd,
             reason="shell command passed local policy",
-            permission="bash",
-            target=cmd,
             action_kind="shell",
             risk="low",
             command=cmd,
@@ -307,6 +386,72 @@ def _looks_like_env_path(value: str) -> bool:
     return any(part == ".env" or part.startswith(".env.") for part in parts)
 
 
+def _mcp_server_from_context_ref(ref: str) -> str:
+    local = ref.removeprefix("mcp_tools:")
+    if local.startswith("mcp-tool:"):
+        return local.removeprefix("mcp-tool:").split("/", 1)[0] or "*"
+    if local.startswith("mcp-resource:"):
+        return local.removeprefix("mcp-resource:").split("/", 1)[0] or "*"
+    return "*"
+
+
+PolicyCheck = tuple[str, str, str, str]
+
+
+def _context_search_checks(source: str) -> tuple[PolicyCheck, ...]:
+    checks: list[PolicyCheck] = []
+    if source in {"*", "skills"}:
+        checks.append(("skill", "list", "skill catalogue search through dynamic context", "low"))
+    if source in {"*", "memory"}:
+        checks.append(("working_memory", "run", "working memory search through dynamic context", "low"))
+    if source in {"*", "memory"}:
+        checks.append(("working_memory", "files", "file-backed memory search through dynamic context", "low"))
+    if source == "mcp_tools":
+        checks.append(("mcp_server", "*", "MCP catalogue search through dynamic context", "medium"))
+    if source in {"*", "lsp_symbols"}:
+        checks.append(("lsp", "*", "LSP symbol search through dynamic context", "low"))
+    return tuple(checks)
+
+
+def _context_read_checks(ref: str) -> tuple[PolicyCheck, ...]:
+    if ref.startswith("skills:"):
+        target = ref.removeprefix("skills:").split("/", 1)[0] or "*"
+        return (("skill", target, "skill instruction read through dynamic context", "low"),)
+    if ref.startswith("mcp_tools:"):
+        return (("mcp_server", _mcp_server_from_context_ref(ref), "MCP catalogue read through dynamic context", "medium"),)
+    if ref.startswith("memory:"):
+        target = ref.removeprefix("memory:").split("/", 1)[0] or "*"
+        if target in {"todo", "todo/current"}:
+            return (("working_memory", "run", "working memory read through dynamic context", "low"),)
+        return (("working_memory", "files", "file-backed memory read through dynamic context", "low"),)
+    if ref.startswith("lsp_symbols:"):
+        return (("lsp", "*", "LSP symbol read through dynamic context", "low"),)
+    return ()
+
+
+def _network_guard_if_allowed(
+    config: PolicyConfig,
+    decision: PolicyDecision,
+    call: ToolCall,
+    state: RunState,
+    *,
+    target: str,
+) -> PolicyDecision:
+    if not decision.allowed:
+        return decision
+    network = _decision_from_action(
+        _resolve_permission(config, "network", target),
+        call,
+        state,
+        reason="MCP access also requires network permission",
+        permission="network",
+        target=target,
+        action_kind="network",
+        risk="medium",
+    )
+    return network if not network.allowed else decision
+
+
 def _resolve_permission(config: PolicyConfig, permission: str, target: str) -> ResolvedPolicyRule:
     action = config.default
     matched_rule = f"{permission}.default_{action}"
@@ -410,6 +555,22 @@ def default_policy_config() -> PolicyConfig:
             PolicyRule("secrets", "./.env*", "deny"),
             PolicyRule("secrets", "*/.env*", "deny"),
             PolicyRule("external_directory", "*", "ask"),
+            PolicyRule("context_search", "*", "allow"),
+            PolicyRule("context_read", "contextfs:*", "allow"),
+            PolicyRule("context_read", "conversation:*", "allow"),
+            PolicyRule("context_read", "past_runs:*", "allow"),
+            PolicyRule("context_read", "skills:*", "allow"),
+            PolicyRule("context_read", "workspace_index:*", "allow"),
+            PolicyRule("context_read", "mcp_tools:*", "allow"),
+            PolicyRule("context_read", "memory:*", "allow"),
+            PolicyRule("context_read", "lsp_symbols:*", "allow"),
+            PolicyRule("skill", "*", "allow"),
+            PolicyRule("mcp_server", "*", "ask"),
+            PolicyRule("mcp_tool", "*", "ask"),
+            PolicyRule("mcp_resource", "*", "ask"),
+            PolicyRule("lsp", "*", "ask"),
+            PolicyRule("working_memory", "run", "allow"),
+            PolicyRule("working_memory", "files", "allow"),
             PolicyRule("bash", "git status*", "allow"),
             PolicyRule("bash", "git diff*", "allow"),
             PolicyRule("bash", "rg *", "allow"),

@@ -3,18 +3,22 @@ from __future__ import annotations
 import json
 import sys
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from tinyagent.core.contracts import Tool
-from tinyagent.core.config import VariantSpec
-from tinyagent.evals.runner import load_eval_cases, render_eval_comparison, render_eval_report, run_eval_comparison, run_eval_suite
+from tinyagent.core.events import Event
 from tinyagent.core.models import FakeModelProvider
 from tinyagent.core.policy import default_policy
-from tinyagent.core.profiles import ApexCoderProfile
+from tinyagent.core.profiles import ApexCoderProfile, profile_for
+from tinyagent.core.resources import ResourceLoader
 from tinyagent.core.run_control import CancelToken
-from tinyagent.runtime.run_record import load_run_record, render_run_inspection
-from tinyagent.core.state import Message, ModelResponse, PolicyDecision, RunState, ToolCall, ToolResult
+from tinyagent.core.state import Message, ModelResponse, PolicyDecision, RunState, ToolCall, ToolResult, Workspace
 from tinyagent.core.tools import default_tools
+from tinyagent.evals.runner import load_eval_cases, render_eval_comparison, render_eval_report, run_eval_comparison, run_eval_suite
+from tinyagent.evals.metrics import extract_run_metrics
+from tinyagent.evals.variants import VariantSpec, validate_supported_eval_compare
+from tinyagent.runtime.run_record import load_run_record, render_run_inspection
 
 
 def test_run_record_inspects_completed_run(tmp_path) -> None:
@@ -64,8 +68,14 @@ def test_eval_suite_runs_cases_and_writes_report(tmp_path) -> None:
     assert (output_dir / "report.md").exists()
     result = json.loads((output_dir / "results.jsonl").read_text().splitlines()[0])
     assert result["case_id"] == "read-file"
+    assert result["model_call_count"] == 2
+    assert result["tool_schema_tokens"] > 0
+    assert result["model_call_token_estimates"]
+    assert result["invariant_failure_count"] == 0
     assert "context-read" not in render_eval_report(eval_run)
-    assert "read-file" in (output_dir / "report.md").read_text()
+    report = (output_dir / "report.md").read_text()
+    assert "read-file" in report
+    assert "## Harness Diagnostics" in report
 
 
 def test_eval_suite_stops_after_cancelled_case_and_skips_validation(tmp_path) -> None:
@@ -152,8 +162,14 @@ def test_eval_comparison_runs_fake_variants_and_writes_metadata(tmp_path) -> Non
     suite = _write_suite(tmp_path)
     baseline = tmp_path / "baseline.toml"
     contextfs = tmp_path / "contextfs.toml"
-    baseline.write_text('provider = "fake"\nmodel = "baseline"\nvisible_tools = ["read_file", "search_repo", "apply_patch", "shell"]\n')
-    contextfs.write_text('provider = "fake"\nmodel = "contextfs"\nvisible_tools = ["read_file", "read_context", "search_repo", "apply_patch", "shell"]\n')
+    baseline.write_text(
+        'provider = "fake"\nmodel = "baseline"\nvisible_tools = ["read_file", "search_code", "apply_patch", "shell"]\n'
+    )
+    contextfs.write_text(
+        'provider = "fake"\n'
+        'model = "contextfs"\n'
+        'visible_tools = ["read_file", "context_search", "context_read", "search_code", "apply_patch", "shell"]\n'
+    )
     output_dir = tmp_path / "compare-output"
 
     comparison = run_eval_comparison(
@@ -161,7 +177,7 @@ def test_eval_comparison_runs_fake_variants_and_writes_metadata(tmp_path) -> Non
         output_dir=output_dir,
         variants=[VariantSpec.parse(f"baseline={baseline}"), VariantSpec.parse(f"contextfs={contextfs}")],
         model_factory=lambda _config, task: FakeModelProvider(_fake_eval_responses(task)),
-        profile_factory=lambda config: ApexCoderProfile(visible_tool_names=config.visible_tools or None),
+        profile_factory=lambda config: profile_for(config.profile, visible_tool_names=config.visible_tools or None),
         tools_factory=lambda _config: default_tools(),
         policy_factory=lambda _config: default_policy(),
     )
@@ -169,8 +185,10 @@ def test_eval_comparison_runs_fake_variants_and_writes_metadata(tmp_path) -> Non
 
     assert [run.variant_name for run in comparison.variants] == ["baseline", "contextfs"]
     assert "Tinyagent Eval Comparison" in report
+    assert "## Profile Metrics" in report
+    assert "## Trace Metrics" in report
     assert "config_hash" in report
-    assert "visible_tools: read_file, read_context, search_repo, apply_patch, shell" in report
+    assert "visible_tools: read_file, context_search, context_read, search_code, apply_patch, shell" in report
     assert comparison.variants[0].results[0].run_id == "baseline-read-file"
     assert (output_dir / "comparison.md").exists()
     assert (output_dir / "comparison.json").exists()
@@ -178,6 +196,123 @@ def test_eval_comparison_runs_fake_variants_and_writes_metadata(tmp_path) -> Non
     assert variant_metadata["suite_hash"]
     assert "git_dirty" in variant_metadata
     assert "git_untracked_hash" in variant_metadata
+    comparison_json = json.loads((output_dir / "comparison.json").read_text())
+    summaries = {variant["name"]: variant["summary"] for variant in comparison_json["variants"]}
+    assert summaries["contextfs"]["tool_schema_tokens"] > summaries["baseline"]["tool_schema_tokens"]
+    assert summaries["contextfs"]["visible_tool_count"] > summaries["baseline"]["visible_tool_count"]
+
+
+def test_eval_comparison_profiles_surface_context_deltas(tmp_path) -> None:
+    suite = _write_suite(tmp_path)
+    coder = tmp_path / "coder.toml"
+    pi = tmp_path / "pi.toml"
+    coder.write_text(
+        'provider = "fake"\n'
+        'model = "coder"\n'
+        'profile = "tiny-coder"\n'
+        'profile_variant = "default"\n'
+        'context_policy = "dynamic-v1"\n'
+        'tool_surface = "default"\n'
+    )
+    pi.write_text(
+        'provider = "fake"\n'
+        'model = "pi"\n'
+        'profile = "tiny-pi"\n'
+        'profile_variant = "minimal"\n'
+        'context_policy = "pi-v1"\n'
+        'tool_surface = "pi-minimal"\n'
+    )
+    output_dir = tmp_path / "compare-profiles"
+
+    run_eval_comparison(
+        suite,
+        output_dir=output_dir,
+        variants=[VariantSpec.parse(f"coder={coder}"), VariantSpec.parse(f"pi={pi}")],
+        model_factory=lambda _config, task: FakeModelProvider(_fake_eval_responses(task)),
+        profile_factory=lambda config: profile_for(config.profile, visible_tool_names=config.visible_tools or None),
+        tools_factory=lambda _config: default_tools(),
+        policy_factory=lambda _config: default_policy(),
+        resources_factory=lambda config: ResourceLoader().load(suite, profile=config.profile),
+    )
+
+    report = (output_dir / "comparison.md").read_text()
+    comparison_json = json.loads((output_dir / "comparison.json").read_text())
+    summaries = {variant["name"]: variant["summary"] for variant in comparison_json["variants"]}
+
+    assert "## Profile Metrics" in report
+    assert "| pi | tiny-pi |" in report
+    assert summaries["coder"]["tool_schema_tokens"] > summaries["pi"]["tool_schema_tokens"]
+    assert summaries["coder"]["visible_tool_count"] > summaries["pi"]["visible_tool_count"]
+    assert summaries["pi"]["visible_tools"] == ["apply_patch", "read_file", "shell"]
+
+
+def test_eval_comparison_can_run_tiny_pi_variant_with_resources(tmp_path) -> None:
+    suite = _write_suite(tmp_path)
+    pi = tmp_path / "pi.toml"
+    pi.write_text(
+        'provider = "fake"\n'
+        'model = "pi"\n'
+        'profile = "tiny-pi"\n'
+        'profile_variant = "minimal"\n'
+        'context_policy = "pi-v1"\n'
+        'tool_surface = "pi-minimal"\n'
+    )
+
+    comparison = run_eval_comparison(
+        suite,
+        output_dir=tmp_path / "compare-pi",
+        variants=[VariantSpec.parse(f"pi={pi}")],
+        model_factory=lambda _config, task: FakeModelProvider(_fake_eval_responses(task)),
+        profile_factory=lambda config: profile_for(config.profile, visible_tool_names=config.visible_tools or None),
+        tools_factory=lambda _config: default_tools(),
+        policy_factory=lambda _config: default_policy(),
+        resources_factory=lambda config: ResourceLoader().load(suite, profile=config.profile),
+    )
+
+    events = json.loads((Path(comparison.variants[0].results[0].run_path) / "events.jsonl").read_text().splitlines()[0])
+    assert events["data"]["profile"] == "tiny-pi"
+    assert events["data"]["profile_visible_tools"] == ["read_file", "apply_patch", "shell"]
+
+
+def test_eval_metrics_treat_code_search_as_pre_edit_inspection(tmp_path) -> None:
+    run = tmp_path / "run"
+    run.mkdir()
+    state = RunState.create("metrics", Workspace(tmp_path), run_id="run_metrics", output_dir=run)
+    state.emit("code.search.completed", {"query": "needle", "refs": ["code:hello.py#L1"]})
+    state.emit("patch.applied", {"ok": True, "paths": ["hello.py"], "tool_call_id": "call_patch"})
+
+    metrics = extract_run_metrics(run)
+
+    assert metrics.inspected_before_edit is True
+
+
+def test_eval_metrics_time_to_first_tool_uses_model_tool_selection(tmp_path) -> None:
+    run = tmp_path / "run"
+    run.mkdir()
+    start = datetime(2026, 5, 8, tzinfo=UTC)
+    events = [
+        Event(type="run.started", run_id="run_metrics", seq=1, time=start),
+        Event(type="model.call.started", run_id="run_metrics", seq=2, time=start + timedelta(seconds=0.5), data={"model_call_id": "model-call-1"}),
+        Event(
+            type="model.tool_call.assembly.completed",
+            run_id="run_metrics",
+            seq=3,
+            time=start + timedelta(seconds=1),
+            data={"model_call_id": "model-call-1", "tool_call_id": "call-1", "tool": "shell"},
+        ),
+        Event(type="model.call.completed", run_id="run_metrics", seq=4, time=start + timedelta(seconds=1.1), data={"model_call_id": "model-call-1"}),
+        Event(type="policy.evaluated", run_id="run_metrics", seq=5, time=start + timedelta(seconds=1.2), data={"tool_call_id": "call-1", "kind": "allow"}),
+        Event(type="tool.execution.started", run_id="run_metrics", seq=6, time=start + timedelta(seconds=2), data={"tool_call_id": "call-1"}),
+        Event(type="tool.execution.completed", run_id="run_metrics", seq=7, time=start + timedelta(seconds=10), data={"tool_call_id": "call-1", "ok": True}),
+        Event(type="artifact.finalization.started", run_id="run_metrics", seq=8, time=start + timedelta(seconds=10.1)),
+        Event(type="artifact.finalization.completed", run_id="run_metrics", seq=9, time=start + timedelta(seconds=10.2)),
+        Event(type="run.completed", run_id="run_metrics", seq=10, time=start + timedelta(seconds=11)),
+    ]
+    (run / "events.jsonl").write_text("".join(json.dumps(event.to_json_dict(), sort_keys=True) + "\n" for event in events))
+
+    metrics = extract_run_metrics(run)
+
+    assert metrics.time_to_first_tool_seconds == 1.0
 
 
 def test_eval_comparison_passes_model_config_to_variant_factory(tmp_path) -> None:
@@ -214,7 +349,7 @@ def test_eval_comparison_passes_model_config_to_variant_factory(tmp_path) -> Non
         output_dir=tmp_path / "compare-models",
         variants=[VariantSpec.parse(f"baseline={baseline}"), VariantSpec.parse(f"alternate={alternate}")],
         model_factory=model_for_config,
-        profile_factory=lambda config: ApexCoderProfile(visible_tool_names=config.visible_tools or None),
+        profile_factory=lambda config: profile_for(config.profile, visible_tool_names=config.visible_tools or None),
         tools_factory=lambda _config: default_tools(),
         policy_factory=lambda _config: default_policy(),
     )
@@ -272,7 +407,18 @@ def test_eval_compare_cli_returns_130_for_sigint_cancellation(tmp_path, monkeypa
 
     suite = _write_suite(tmp_path)
 
-    def cancel_comparison(suite_path, *, output_dir, variants, model_factory, profile_factory, tools_factory, policy_factory, cancel_token, **kwargs):
+    def cancel_comparison(
+        suite_path,
+        *,
+        output_dir,
+        variants,
+        model_factory,
+        profile_factory,
+        tools_factory,
+        policy_factory,
+        cancel_token,
+        **kwargs,
+    ):
         del output_dir, variants, model_factory, profile_factory, tools_factory, policy_factory, kwargs
         cancel_token.cancel("sigint")
         return EvalComparison(suite_path=suite_path, output_dir=tmp_path / "cancelled", variants=[])
@@ -305,7 +451,7 @@ def test_eval_comparison_rejects_unsupported_config_fields(tmp_path) -> None:
             output_dir=tmp_path / "compare-output",
             variants=[VariantSpec.parse(f"bad={config}")],
             model_factory=lambda _config, task: FakeModelProvider(_fake_eval_responses(task)),
-            profile_factory=lambda config: ApexCoderProfile(visible_tool_names=config.visible_tools or None),
+            profile_factory=lambda config: profile_for(config.profile, visible_tool_names=config.visible_tools or None),
             tools_factory=lambda _config: default_tools(),
             policy_factory=lambda _config: default_policy(),
         )
@@ -313,6 +459,56 @@ def test_eval_comparison_rejects_unsupported_config_fields(tmp_path) -> None:
         assert "Unsupported eval config fields: context" in str(exc)
     else:
         raise AssertionError("expected unsupported config field to be rejected")
+
+
+def test_eval_config_accepts_default_profile_placeholders(tmp_path) -> None:
+    config = tmp_path / "variant.toml"
+    config.write_text(
+        'provider = "fake"\n'
+        'profile = "tiny-coder"\n'
+        'profile_variant = "default"\n'
+        'context_policy = "dynamic-v1"\n'
+        'tool_surface = "default"\n'
+    )
+
+    variant = VariantSpec.parse(f"baseline={config}")
+    validate_supported_eval_compare(variant.config)
+
+    assert variant.config.profile_variant == "default"
+    assert variant.config.context_policy == "dynamic-v1"
+    assert variant.config.tool_surface == "default"
+
+
+def test_eval_config_accepts_tiny_pi_profile_placeholders(tmp_path) -> None:
+    config = tmp_path / "variant.toml"
+    config.write_text(
+        'provider = "fake"\n'
+        'profile = "tiny-pi"\n'
+        'profile_variant = "minimal"\n'
+        'context_policy = "pi-v1"\n'
+        'tool_surface = "pi-minimal"\n'
+    )
+
+    variant = VariantSpec.parse(f"pi={config}")
+    validate_supported_eval_compare(variant.config)
+
+    assert variant.config.profile == "tiny-pi"
+    assert variant.config.profile_variant == "minimal"
+    assert variant.config.context_policy == "pi-v1"
+    assert variant.config.tool_surface == "pi-minimal"
+
+
+def test_eval_config_rejects_unknown_profile_variant(tmp_path) -> None:
+    config = tmp_path / "variant.toml"
+    config.write_text('provider = "fake"\nprofile_variant = "claude-like"\n')
+    variant = VariantSpec.parse(f"bad={config}")
+
+    try:
+        validate_supported_eval_compare(variant.config)
+    except ValueError as exc:
+        assert "Unsupported eval profile_variant: claude-like" in str(exc)
+    else:
+        raise AssertionError("expected unsupported profile variant to be rejected")
 
 
 def test_eval_comparison_rejects_unknown_config_fields(tmp_path) -> None:
@@ -365,7 +561,7 @@ def test_eval_comparison_rejects_on_request_approval_mode(tmp_path) -> None:
             output_dir=tmp_path / "compare-output",
             variants=[VariantSpec.parse(f"bad={config}")],
             model_factory=lambda _config, task: FakeModelProvider(_fake_eval_responses(task)),
-            profile_factory=lambda config: ApexCoderProfile(visible_tool_names=config.visible_tools or None),
+            profile_factory=lambda config: profile_for(config.profile, visible_tool_names=config.visible_tools or None),
             tools_factory=lambda _config: default_tools(),
             policy_factory=lambda _config: default_policy(),
         )

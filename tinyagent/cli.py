@@ -15,15 +15,18 @@ from uuid import uuid4
 from tinyagent import __version__
 from tinyagent.app.product import ProductHome, WorkspaceStore, render_doctor
 from tinyagent.app.server import create_product_runtime_server
-from tinyagent.core.config import VariantSpec
 from tinyagent.core.events import ConsoleTextSink, JsonlStreamSink, debug_level_from_env
+from tinyagent.core.evolution import accept_candidate, create_prompt_experiment, create_skill_experiment, render_experiment_report
 from tinyagent.core.ids import validate_run_id
 from tinyagent.core.kernel import Kernel
+from tinyagent.core.memory import MemoryStore
 from tinyagent.core.models import ProviderError
 from tinyagent.core.policy import default_policy
-from tinyagent.core.profiles import ApexCoderProfile
-from tinyagent.core.providers.factory import ProviderSpec, provider_for
+from tinyagent.core.profiles import profile_for
+from tinyagent.core.providers.factory import DEFAULT_PROVIDER_REGISTRY, ProviderSpec, provider_for
+from tinyagent.core.resources import ResourceLoader, ResourceLoaderConfig
 from tinyagent.core.run_control import CancelToken, RunCancelled
+from tinyagent.core.skills.drafts import draft_from_run, eval_draft, install_draft, list_drafts, reject_draft, show_draft
 from tinyagent.core.state import ApprovalRequest, ApprovalResolution, Message, RunState
 from tinyagent.core.tools import default_tools
 from tinyagent.evals.runner import (
@@ -35,6 +38,7 @@ from tinyagent.evals.runner import (
     run_eval_comparison,
     run_eval_suite,
 )
+from tinyagent.evals.variants import VariantSpec
 from tinyagent.runtime.conversation import ConversationStore
 from tinyagent.runtime.replay import replay_run
 from tinyagent.runtime.run_graph import fork_run
@@ -51,11 +55,13 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
     run_parser = subparsers.add_parser("run", help="Run an agent task.")
     run_parser.add_argument("task", help="Task for the agent.")
-    run_parser.add_argument("--provider", choices=["fake", "openai-compatible"], default="fake")
+    run_parser.add_argument("--provider", choices=DEFAULT_PROVIDER_REGISTRY.kinds(), default="fake")
     run_parser.add_argument("--workspace", default=".")
     run_parser.add_argument("--workspace-mode", choices=["auto", "worktree", "current"], default="auto")
     run_parser.add_argument("--approval-mode", choices=["never", "on-request", "yolo"], default="yolo")
     run_parser.add_argument("--sandbox-mode", choices=["none", "container", "native"], default="none")
+    run_parser.add_argument("--profile", help="Profile to run, e.g. tiny-coder or tiny-pi.")
+    run_parser.add_argument("--memory", action="store_true", help="Enable explicit file-backed memory context.")
     run_parser.add_argument("--reasoning-json", help="JSON object passed as the provider's top-level reasoning parameter.")
     run_parser.add_argument("--run-id")
     run_parser.add_argument("--output-dir", type=Path)
@@ -83,7 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor_parser = subparsers.add_parser("doctor", help="Check local tinyagent setup.")
     doctor_parser.add_argument("--workspace", default=".")
-    doctor_parser.add_argument("--provider", choices=["fake", "openai-compatible"], default="fake")
+    doctor_parser.add_argument("--provider", choices=DEFAULT_PROVIDER_REGISTRY.kinds(), default="fake")
     doctor_parser.add_argument("--port", type=int, default=8765)
 
     workspaces_parser = subparsers.add_parser("workspaces", help="Manage registered workspaces.")
@@ -118,7 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--workspace", help="Register an initial workspace before serving.")
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=8765)
-    serve_parser.add_argument("--provider", choices=["fake", "openai-compatible"], default="fake")
+    serve_parser.add_argument("--provider", choices=DEFAULT_PROVIDER_REGISTRY.kinds(), default="fake")
     serve_parser.add_argument("--model")
     serve_parser.add_argument("--reasoning-json", help="JSON object passed as the provider's top-level reasoning parameter.")
     serve_parser.add_argument("--stream", action="store_true", help="Stream model deltas through the runtime event stream.")
@@ -130,16 +136,20 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--workspace-mode", choices=["auto", "worktree", "current"], default="current")
     serve_parser.add_argument("--approval-mode", choices=["never", "on-request", "yolo"], default="yolo")
     serve_parser.add_argument("--sandbox-mode", choices=["none", "container", "native"], default="none")
+    serve_parser.add_argument("--profile", default="tiny-coder", help="Default runtime profile.")
+    serve_parser.add_argument("--memory", action="store_true", help="Enable explicit file-backed memory context.")
 
     eval_parser = subparsers.add_parser("eval", help="Run a local eval suite.")
     eval_parser.add_argument("suite_path", type=Path, help="Directory containing eval cases.")
-    eval_parser.add_argument("--provider", choices=["fake", "openai-compatible"], default="fake")
+    eval_parser.add_argument("--provider", choices=DEFAULT_PROVIDER_REGISTRY.kinds(), default="fake")
     eval_parser.add_argument("--reasoning-json", help="JSON object passed as the provider's top-level reasoning parameter.")
     eval_parser.add_argument("--output-dir", type=Path)
     eval_parser.add_argument("--thresholds", type=Path)
     eval_parser.add_argument("--workspace-mode", choices=["auto", "worktree", "current"], default="current")
     eval_parser.add_argument("--approval-mode", choices=["never", "on-request", "yolo"], default="yolo")
     eval_parser.add_argument("--sandbox-mode", choices=["none", "container", "native"], default="none")
+    eval_parser.add_argument("--profile", default="tiny-coder", help="Profile to run, e.g. tiny-coder or tiny-pi.")
+    eval_parser.add_argument("--memory", action="store_true", help="Enable explicit file-backed memory context.")
     eval_parser.add_argument(
         "--stream",
         choices=["off", "text", "jsonl"],
@@ -151,6 +161,52 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Live stream verbosity. Defaults to TINYAGENT_DEBUG or 0.",
     )
+
+    skills_parser = subparsers.add_parser("skills", help="Manage reviewable skill drafts.")
+    skills_parser.add_argument("--workspace", default=".")
+    skills_subparsers = skills_parser.add_subparsers(dest="skills_command")
+    draft_parser = skills_subparsers.add_parser("draft-from-run", help="Create a reviewable skill draft from a completed run.")
+    draft_parser.add_argument("run_path", type=Path)
+    draft_parser.add_argument("--debug-artifacts", action="store_true")
+    skills_subparsers.add_parser("list-drafts", help="List skill drafts.")
+    show_draft_parser = skills_subparsers.add_parser("show-draft", help="Show a skill draft SKILL.md.")
+    show_draft_parser.add_argument("draft_id")
+    eval_draft_parser = skills_subparsers.add_parser("eval-draft", help="Run a baseline-vs-draft eval comparison.")
+    eval_draft_parser.add_argument("draft_id")
+    eval_draft_parser.add_argument("--suite", required=True, type=Path)
+    eval_draft_parser.add_argument("--output-dir", type=Path)
+    eval_draft_parser.add_argument("--provider", choices=DEFAULT_PROVIDER_REGISTRY.kinds(), default="fake")
+    eval_draft_parser.add_argument("--profile", default="tiny-coder")
+    install_draft_parser = skills_subparsers.add_parser("install-draft", help="Install a reviewed draft into project skills.")
+    install_draft_parser.add_argument("draft_id")
+    install_draft_parser.add_argument("--replace", action="store_true")
+    reject_draft_parser = skills_subparsers.add_parser("reject-draft", help="Move a draft to the rejected archive.")
+    reject_draft_parser.add_argument("draft_id")
+
+    memory_parser = subparsers.add_parser("memory", help="Read and write explicit memory files.")
+    memory_parser.add_argument("--workspace", default=".")
+    memory_subparsers = memory_parser.add_subparsers(dest="memory_command")
+    memory_read = memory_subparsers.add_parser("read", help="Read a memory file.")
+    memory_read.add_argument("name")
+    memory_append = memory_subparsers.add_parser("append", help="Append text to a memory file.")
+    memory_append.add_argument("name")
+    memory_append.add_argument("text")
+    memory_open = memory_subparsers.add_parser("open", help="Print the path to a memory file.")
+    memory_open.add_argument("name")
+
+    evolve_parser = subparsers.add_parser("evolve", help="Create out-of-tree evolution experiments.")
+    evolve_parser.add_argument("--workspace", default=".")
+    evolve_subparsers = evolve_parser.add_subparsers(dest="evolve_command")
+    evolve_skill = evolve_subparsers.add_parser("skill", help="Scaffold a skill evolution experiment.")
+    evolve_skill.add_argument("skill_id")
+    evolve_skill.add_argument("--suite", required=True, type=Path)
+    evolve_prompt = evolve_subparsers.add_parser("prompt", help="Scaffold a prompt evolution experiment.")
+    evolve_prompt.add_argument("prompt_id")
+    evolve_prompt.add_argument("--suite", required=True, type=Path)
+    evolve_report = evolve_subparsers.add_parser("report", help="Show an evolution report.")
+    evolve_report.add_argument("experiment_id")
+    evolve_accept = evolve_subparsers.add_parser("accept", help="Accept a reviewed candidate.")
+    evolve_accept.add_argument("candidate_id")
 
     return parser
 
@@ -281,6 +337,8 @@ def main(argv: list[str] | None = None) -> int:
                 product_workspace_record = store.register(Path(args.workspace), trust="untrusted")
                 if not _has_cli_option(argv, "--provider") and product_workspace_record.default_provider:
                     args.provider = product_workspace_record.default_provider
+                if args.command == "run" and not _has_cli_option(argv, "--profile") and product_workspace_record.default_profile:
+                    args.profile = product_workspace_record.default_profile
                 args.workspace = product_workspace_record.root
                 args.conversation_root = home.workspaces_dir / product_workspace_record.workspace_id / "conversations"
                 if args.command == "run":
@@ -309,11 +367,17 @@ def main(argv: list[str] | None = None) -> int:
         except ProviderError as exc:
             print(f"provider error: {exc}")
             return 1
+        try:
+            profile = profile_for(args.profile)
+        except ValueError as exc:
+            print(f"run error: {exc}")
+            return 1
         kernel = Kernel(
             model=model,
-            profile=ApexCoderProfile(),
+            profile=profile,
             tools=default_tools(),
             policy=default_policy(),
+            resources=ResourceLoader(ResourceLoaderConfig(memory_enabled=args.memory)).load(Path(args.workspace), profile=profile.name),
             approval_handler=_CliApprovalHandler() if args.approval_mode == "on-request" else None,
             stream=args.stream != "off",
             event_sink=_stream_sink(args.stream, debug_level),
@@ -414,6 +478,9 @@ def main(argv: list[str] | None = None) -> int:
                 workspace_mode=args.workspace_mode,
                 approval_mode=args.approval_mode,
                 sandbox_mode=args.sandbox_mode,
+                profile=args.profile,
+                profile_override=_has_cli_option(argv, "--profile"),
+                memory_enabled=args.memory,
             )
         except (ProviderError, ValueError) as exc:
             print(f"serve error: {exc}")
@@ -437,13 +504,19 @@ def main(argv: list[str] | None = None) -> int:
         cancel_token = CancelToken()
         try:
             with _sigint_cancel(cancel_token):
+                try:
+                    profile = profile_for(args.profile)
+                except ValueError as exc:
+                    print(f"eval error: {exc}")
+                    return 1
                 eval_run = run_eval_suite(
                     args.suite_path,
                     output_dir=output_dir,
                     model_factory=lambda task: _model_for(args.provider, task, reasoning_json=args.reasoning_json),
-                    profile=ApexCoderProfile(),
+                    profile=profile,
                     tools=default_tools(),
                     policy=default_policy(),
+                    resources=ResourceLoader(ResourceLoaderConfig(memory_enabled=args.memory)).load(args.suite_path, profile=profile.name),
                     stream=args.stream != "off",
                     event_sink=_stream_sink(args.stream, debug_level),
                     cancel_token=cancel_token,
@@ -463,6 +536,93 @@ def main(argv: list[str] | None = None) -> int:
         for failure in threshold_failures:
             print(f"threshold failed: {failure}")
         return 0 if all(result.success for result in eval_run.results) and not threshold_failures else 1
+
+    if args.command == "skills":
+        workspace = Path(args.workspace).expanduser().resolve()
+        try:
+            if args.skills_command == "draft-from-run":
+                draft = draft_from_run(args.run_path, workspace=workspace, debug_artifacts=args.debug_artifacts)
+                print(f"created skill draft: {draft.draft_id}")
+                print(draft.path)
+                return 0
+            if args.skills_command == "list-drafts":
+                for draft in list_drafts(workspace=workspace):
+                    print(f"{draft.draft_id}\t{draft.name}\t{draft.source_run_id}\t{draft.status}")
+                return 0
+            if args.skills_command == "show-draft":
+                print(show_draft(args.draft_id, workspace=workspace), end="")
+                return 0
+            if args.skills_command == "eval-draft":
+                profile = profile_for(args.profile)
+                output_dir = args.output_dir or workspace / ".tinyagent" / "evolution" / "experiments" / f"draft-{args.draft_id}-eval"
+                comparison = eval_draft(
+                    args.draft_id,
+                    workspace=workspace,
+                    suite_path=args.suite,
+                    output_dir=output_dir,
+                    model_factory=lambda task: _model_for(args.provider, task),
+                    profile=profile,
+                    tools=default_tools(),
+                    policy=default_policy(),
+                )
+                print(render_eval_comparison(comparison), end="")
+                return 0
+            if args.skills_command == "install-draft":
+                path = install_draft(args.draft_id, workspace=workspace, replace=args.replace)
+                print(f"installed skill: {path}")
+                return 0
+            if args.skills_command == "reject-draft":
+                path = reject_draft(args.draft_id, workspace=workspace)
+                print(f"rejected skill draft: {path}")
+                return 0
+        except (OSError, ValueError, FileExistsError, FileNotFoundError) as exc:
+            print(f"skills error: {exc}")
+            return 1
+        parser.error("skills subcommand required")
+
+    if args.command == "memory":
+        store = MemoryStore(Path(args.workspace))
+        try:
+            if args.memory_command == "read":
+                print(store.read(args.name).content, end="")
+                return 0
+            if args.memory_command == "append":
+                item = store.append(args.name, args.text)
+                print(item.path)
+                return 0
+            if args.memory_command == "open":
+                item = store.ensure(args.name)
+                print(item.path)
+                return 0
+        except (OSError, ValueError) as exc:
+            print(f"memory error: {exc}")
+            return 1
+        parser.error("memory subcommand required")
+
+    if args.command == "evolve":
+        workspace = Path(args.workspace).expanduser().resolve()
+        try:
+            if args.evolve_command == "skill":
+                experiment = create_skill_experiment(workspace=workspace, skill_id=args.skill_id, suite_path=args.suite)
+                print(f"created evolution experiment: {experiment.experiment_id}")
+                print(experiment.path)
+                return 0
+            if args.evolve_command == "prompt":
+                experiment = create_prompt_experiment(workspace=workspace, prompt_id=args.prompt_id, suite_path=args.suite)
+                print(f"created evolution experiment: {experiment.experiment_id}")
+                print(experiment.path)
+                return 0
+            if args.evolve_command == "report":
+                print(render_experiment_report(workspace=workspace, experiment_id=args.experiment_id), end="")
+                return 0
+            if args.evolve_command == "accept":
+                path = accept_candidate(workspace=workspace, candidate_id=args.candidate_id)
+                print(f"accepted candidate: {path}")
+                return 0
+        except (OSError, KeyError, ValueError, FileExistsError, FileNotFoundError) as exc:
+            print(f"evolve error: {exc}")
+            return 1
+        parser.error("evolve subcommand required")
 
     parser.error(f"unknown command '{args.command}'")
     return 2
@@ -485,9 +645,10 @@ def _main_eval_compare(argv: list[str]) -> int:
                 output_dir=output_dir,
                 variants=variants,
                 model_factory=lambda config, task: _model_for(config.provider, task, model_name=config.model),
-                profile_factory=lambda config: ApexCoderProfile(visible_tool_names=config.visible_tools or None),
+                profile_factory=lambda config: profile_for(config.profile, visible_tool_names=config.visible_tools or None),
                 tools_factory=lambda _config: default_tools(),
                 policy_factory=lambda _config: default_policy(),
+                resources_factory=lambda config: ResourceLoader().load(args.suite_path, profile=config.profile),
                 cancel_token=cancel_token,
             )
     except RunCancelled:

@@ -35,6 +35,7 @@ class ContextBuilder:
         context_plan = render_context_plan(plan)
         observations = render_observations(state, plan)
         finish_gate = render_finish_gate_messages(state)
+        dynamic_sources = render_dynamic_context_sources(state)
         contextfs_index_path, contextfs_index = render_contextfs_index(state)
         checkpoint = render_context_checkpoint(state)
         recent_tools = render_recent_tool_steps(state, self.config, plan)
@@ -50,6 +51,7 @@ class ContextBuilder:
             _item("context:observations", "user", observations, "observations", 870, stable=True)
             if observations
             else None,
+            _item("context:sources", "user", dynamic_sources, "dynamic_context_sources", 845, stable=True),
             _item("contextfs:index", "user", contextfs_index, "contextfs_index", 900, stable=True)
             if contextfs_index
             else None,
@@ -211,7 +213,21 @@ def render_contextfs_index(state: RunState) -> tuple[str | None, str]:
     path = state.output_dir / relative
     if not path.exists():
         return None, ""
-    return relative, "\n".join(["ContextFS index:", "", path.read_text()])
+    index = path.read_text()
+    return relative, "\n".join(["ContextFS index (bounded; use context_search for details):", "", _bounded_text(index, 4_000)])
+
+
+def render_dynamic_context_sources(state: RunState) -> str:
+    from tinyagent.core.context_sources import context_registry_for_state
+
+    registry = context_registry_for_state(state)
+    lines = [
+        "Dynamic context sources:",
+        "Use context_search to discover refs and context_read to read them.",
+    ]
+    for source in registry.list_sources():
+        lines.append(f"- {source.name}: {_bounded_text(source.description, 220)}")
+    return "\n".join(lines)
 
 
 def render_finish_gate_messages(state: RunState) -> str:
@@ -327,9 +343,10 @@ def _render_tool_step(step: ToolStep, state: RunState) -> str:
     artifact = result.artifact_path or result.data.get("context_artifact") or result.data.get("output_artifact")
     if artifact:
         lines.append(f"Artifact: {artifact}")
-    if result.read_hints:
+    read_hints = _model_visible_read_hints(state, artifact, result.read_hints)
+    if read_hints:
         lines.append("Suggested read:")
-        lines.extend(f"- {hint}" for hint in result.read_hints)
+        lines.extend(f"- {hint}" for hint in read_hints)
     small_data = _small_tool_data(result.data)
     if small_data:
         lines.append(f"Data: {_small_json(small_data, max_chars=500)}")
@@ -340,6 +357,14 @@ def _render_tool_step(step: ToolStep, state: RunState) -> str:
         ]
     )
     return "\n".join(lines)
+
+
+def _model_visible_read_hints(state: RunState, artifact: object, read_hints: Sequence[str]) -> list[str]:
+    if isinstance(artifact, str):
+        if artifact.startswith("context/") or artifact.startswith(("artifacts/context-checkpoint-", "artifacts/workspace-delta-")):
+            return [f'context_read({{"ref":"contextfs:{artifact}"}})']
+    output_dir = state.output_dir.as_posix()
+    return [hint for hint in read_hints if output_dir not in hint]
 
 
 def _is_diff_or_status_step(step: ToolStep) -> bool:
@@ -358,6 +383,12 @@ def _small_json(value: object, *, max_chars: int = 2_000) -> str:
     if len(encoded) <= max_chars:
         return encoded
     return json.dumps({"_truncated": True, "json_chars": len(encoded), "preview": encoded[:max_chars]}, sort_keys=True)
+
+
+def _bounded_text(value: str, max_chars: int) -> str:
+    if len(value) <= max_chars:
+        return value
+    return value[: max(0, max_chars - 3)] + "..."
 
 
 def _small_tool_data(data: dict[str, Any]) -> dict[str, Any]:

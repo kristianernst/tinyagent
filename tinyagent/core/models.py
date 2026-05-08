@@ -51,6 +51,7 @@ class ModelSpec:
     provider: str
     model: str
     protocol: Literal["chat_completions", "responses", "anthropic", "gemini"] = "chat_completions"
+    adapter: str = "unknown"
     edit_style: Literal["apply_patch", "str_replace", "whole_file"] = "apply_patch"
     prompt_variant: str = "default"
     tokenizer: str = "heuristic"
@@ -61,6 +62,7 @@ class ModelSpec:
             "provider": self.provider,
             "model": self.model,
             "protocol": self.protocol,
+            "adapter": self.adapter,
             "edit_style": self.edit_style,
             "prompt_variant": self.prompt_variant,
             "tokenizer": self.tokenizer,
@@ -84,13 +86,15 @@ def model_spec(model: object) -> ModelSpec:
     protocol = capabilities.tool_protocol if capabilities.tool_protocol in {"chat_completions", "responses"} else "chat_completions"
     provider = str(getattr(model, "name", model.__class__.__name__))
     model_name = str(getattr(model, "model", provider))
-    return ModelSpec(provider=provider, model=model_name, protocol=protocol, capabilities=capabilities)
+    adapter = str(getattr(model, "adapter", "unknown"))
+    return ModelSpec(provider=provider, model=model_name, protocol=protocol, adapter=adapter, capabilities=capabilities)
 
 
 class FakeModelProvider:
     """Deterministic provider for tests and offline harness runs."""
 
     name = "fake"
+    adapter = "tinyagent.fake.v1"
     capabilities = ModelCapabilities()
 
     def __init__(self, responses: Sequence[ModelResponse], *, model: str = "fake") -> None:

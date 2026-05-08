@@ -7,34 +7,78 @@ import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Protocol
 
 from tinyagent.core.contracts import ModelProvider
 from tinyagent.core.models import FakeModelProvider, ProviderError
 from tinyagent.core.providers.openai_compat import OpenAICompatibleProvider
 from tinyagent.core.state import ModelResponse, ToolCall
 
-ProviderKind = Literal["fake", "openai-compatible"]
-
 
 @dataclass(frozen=True)
 class ProviderSpec:
-    kind: ProviderKind
+    kind: str
     model: str | None = None
     reasoning: dict[str, Any] | None = None
 
 
+class ProviderFactory(Protocol):
+    kind: str
+
+    def create(self, spec: ProviderSpec, task: str, env: Mapping[str, str] | None = None) -> ModelProvider: ...
+
+
+class ProviderRegistry:
+    def __init__(self, factories: Mapping[str, ProviderFactory] | None = None) -> None:
+        self._factories = dict(factories or {})
+
+    def register(self, factory: ProviderFactory) -> None:
+        if not factory.kind:
+            raise ValueError("provider factory kind is required")
+        self._factories[factory.kind] = factory
+
+    def create(self, spec: ProviderSpec, task: str, env: Mapping[str, str] | None = None) -> ModelProvider:
+        factory = self._factories.get(spec.kind)
+        if factory is None:
+            raise ProviderError(f"Unknown provider: {spec.kind}")
+        return factory.create(spec, task, env)
+
+    def kinds(self) -> tuple[str, ...]:
+        return tuple(sorted(self._factories))
+
+
 def provider_for(spec: ProviderSpec, task: str, env: Mapping[str, str] | None = None) -> ModelProvider:
-    if spec.kind == "fake":
+    return DEFAULT_PROVIDER_REGISTRY.create(spec, task, env)
+
+
+def register_provider_factory(factory: ProviderFactory) -> None:
+    DEFAULT_PROVIDER_REGISTRY.register(factory)
+
+
+class FakeProviderFactory:
+    kind = "fake"
+
+    def create(self, spec: ProviderSpec, task: str, env: Mapping[str, str] | None = None) -> ModelProvider:
+        del env
         return FakeModelProvider(_fake_responses(task), model=spec.model or "fake")
-    if spec.kind == "openai-compatible":
+
+
+class OpenAICompatibleProviderFactory:
+    kind = "openai-compatible"
+
+    def create(self, spec: ProviderSpec, task: str, env: Mapping[str, str] | None = None) -> ModelProvider:
+        del task
         values = dict(os.environ if env is None else env)
         if spec.model:
             values["TINYAGENT_MODEL_NAME"] = spec.model
         if spec.reasoning is not None:
             values["TINYAGENT_MODEL_REASONING_JSON"] = json.dumps(spec.reasoning, sort_keys=True)
         return OpenAICompatibleProvider.from_env(values)
-    raise ProviderError(f"Unknown provider: {spec.kind}")
+
+
+DEFAULT_PROVIDER_REGISTRY = ProviderRegistry()
+DEFAULT_PROVIDER_REGISTRY.register(FakeProviderFactory())
+DEFAULT_PROVIDER_REGISTRY.register(OpenAICompatibleProviderFactory())
 
 
 def _fake_responses(task: str) -> list[ModelResponse]:

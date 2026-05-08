@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import re
 import shutil
 import subprocess
@@ -13,15 +13,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from tinyagent.core.config import RunConfig, VariantSpec
+from tinyagent.core.config import RunConfig
 from tinyagent.core.contracts import ModelProvider, PolicyEngine, Profile, Tool
-from tinyagent.evals.metrics import evaluate_thresholds, extract_run_metrics
 from tinyagent.core.events import EventSink
 from tinyagent.core.kernel import Kernel
+from tinyagent.core.resources import LoadedResources
 from tinyagent.core.run_control import CancelToken
-from tinyagent.runtime.run_record import RunRecord, load_run_record
 from tinyagent.core.state import ApprovalMode
 from tinyagent.core.workspace import SandboxModeInput, WorkspaceMode
+from tinyagent.evals.metrics import evaluate_thresholds, extract_run_metrics
+from tinyagent.evals.variants import VariantSpec, validate_supported_eval_compare
+from tinyagent.runtime.run_record import RunRecord, load_run_record
 
 ModelFactory = Callable[[str], ModelProvider]
 VariantModelFactory = Callable[[RunConfig, str], ModelProvider]
@@ -50,19 +52,30 @@ class EvalResult:
     workspace_path: str
     duration_seconds: float
     turn_count: int
+    model_call_count: int
     tool_call_count: int
     command_count: int
     patch_count: int
     final_diff_chars: int
     context_token_estimate: int = 0
+    static_prompt_tokens: int = 0
+    tool_schema_tokens: int = 0
+    model_call_token_estimates: list[int] | None = None
+    profile_visible_tools: list[str] | None = None
     tool_error_count: int = 0
     tool_error_kinds: dict[str, int] | None = None
+    unknown_tool_count: int = 0
+    invalid_tool_args_count: int = 0
     policy_denials: int = 0
     sandbox_blocks: int = 0
     finish_gate_blocks: int = 0
+    approval_request_count: int = 0
+    hidden_artifact_fetch_failures: int = 0
     artifact_bytes_written: int = 0
     compaction_count: int = 0
     repeated_tool_call_count: int = 0
+    time_to_first_tool_seconds: float = 0.0
+    time_to_first_edit_seconds: float = 0.0
     inspected_before_edit: bool = False
     diff_after_edit: bool = False
     verification_after_edit: bool = False
@@ -70,6 +83,16 @@ class EvalResult:
     output_truncation_count: int = 0
     large_output_artifact_count: int = 0
     recent_tool_context_chars: int = 0
+    context_search_count: int = 0
+    context_read_count: int = 0
+    search_code_count: int = 0
+    skill_list_count: int = 0
+    skill_load_count: int = 0
+    mcp_search_count: int = 0
+    mcp_load_count: int = 0
+    mcp_call_count: int = 0
+    invariant_failure_count: int = 0
+    invariant_failures: list[str] | None = None
     harness_findings: list[str] | None = None
     failure_reason: str = ""
     validation_output_path: str = ""
@@ -105,6 +128,7 @@ def run_eval_suite(
     variant_name: str = "",
     variant_metadata: dict[str, Any] | None = None,
     run_id_prefix: str = "",
+    resources: LoadedResources | None = None,
 ) -> EvalRun:
     suite_path = suite_path.expanduser().resolve()
     output_dir = output_dir.expanduser().resolve()
@@ -136,6 +160,7 @@ def run_eval_suite(
             approval_mode=approval_mode,
             sandbox_mode=sandbox_mode,
             run_id_prefix=run_id_prefix,
+            resources=resources,
         )
         results.append(result)
         if result.status == "cancelled":
@@ -192,6 +217,7 @@ def render_eval_report(eval_run: EvalRun) -> str:
         f"successes: {passed}",
         f"solve_rate: {passed / total if total else 0:.3f}",
         f"tool_errors: {sum(result.tool_error_count for result in eval_run.results)}",
+        f"invariant_failures: {sum(result.invariant_failure_count for result in eval_run.results)}",
         f"policy_denials: {sum(result.policy_denials for result in eval_run.results)}",
         f"finish_gate_blocks: {sum(result.finish_gate_blocks for result in eval_run.results)}",
         f"progress_guard_interventions: {sum(result.progress_guard_interventions for result in eval_run.results)}",
@@ -237,6 +263,29 @@ def render_eval_report(eval_run: EvalRun) -> str:
         lines.extend(["", "## Harness Findings"])
         for finding, count in sorted(finding_counts.items()):
             lines.append(f"- {finding}: {count}")
+    invariant_counts: dict[str, int] = {}
+    for result in eval_run.results:
+        for failure in result.invariant_failures or []:
+            invariant_counts[failure] = invariant_counts.get(failure, 0) + 1
+    if invariant_counts:
+        lines.extend(["", "## Invariant Failures"])
+        for failure, count in sorted(invariant_counts.items()):
+            lines.append(f"- {failure}: {count}")
+    diagnostics = _diagnostic_totals(eval_run.results)
+    if any(value for value in diagnostics.values()):
+        lines.extend(["", "## Harness Diagnostics"])
+        for key, value in diagnostics.items():
+            if isinstance(value, float):
+                if value:
+                    lines.append(f"- {key}: {value:.3f}")
+            elif value:
+                lines.append(f"- {key}: {value}")
+    mechanism_totals = _mechanism_totals(eval_run.results)
+    if any(mechanism_totals.values()):
+        lines.extend(["", "## Mechanism Metrics"])
+        for key, value in mechanism_totals.items():
+            if value:
+                lines.append(f"- {key}: {value}")
     failures = [result for result in eval_run.results if not result.success]
     if failures:
         lines.extend(["", "## Failures"])
@@ -250,7 +299,7 @@ def check_eval_thresholds(eval_run: EvalRun, threshold_path: Path) -> list[str]:
     return evaluate_thresholds([result.to_json_dict() for result in eval_run.results], threshold_path)
 
 
-def check_eval_comparison_thresholds(comparison: "EvalComparison", threshold_path: Path) -> list[str]:
+def check_eval_comparison_thresholds(comparison: EvalComparison, threshold_path: Path) -> list[str]:
     failures: list[str] = []
     for run in comparison.variants:
         for failure in check_eval_thresholds(run, threshold_path):
@@ -282,6 +331,7 @@ def run_eval_comparison(
     stream: bool = False,
     event_sink: EventSink | None = None,
     cancel_token: CancelToken | None = None,
+    resources_factory: Callable[[RunConfig], LoadedResources | None] | None = None,
 ) -> EvalComparison:
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -295,7 +345,7 @@ def run_eval_comparison(
         seen_names.add(variant.name)
         variant_dir = output_dir / variant.name
         config = variant.config
-        config.validate_supported_eval_compare()
+        validate_supported_eval_compare(config)
         suite_path_resolved = suite_path.expanduser().resolve()
         metadata = {
             **variant.metadata(),
@@ -318,6 +368,7 @@ def run_eval_comparison(
             variant_name=variant.name,
             variant_metadata=metadata,
             run_id_prefix=variant.name,
+            resources=resources_factory(config) if resources_factory is not None else None,
         )
         runs.append(run)
         if cancel_token is not None and cancel_token.cancelled:
@@ -349,6 +400,40 @@ def render_eval_comparison(comparison: EvalComparison) -> str:
             f"{summary['sandbox_blocks']} | {summary['finish_gate_blocks']} | {summary['compactions']} | "
             f"{metadata.get('config_hash', '')} | {str(metadata.get('git_sha', ''))[:12]} |"
         )
+    lines.extend(
+        [
+            "",
+            "## Profile Metrics",
+            "",
+            "| Variant | Profile | Visible tools | Solve | Validation | Static prompt tok | Tool schema tok | Context tok | Model calls | Tool calls | Repeated cmds | Diff after edit | Verification after edit | Finish blocks | Policy | Approvals | Invariants |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for run in comparison.variants:
+        summary = _variant_summary(run)
+        metadata = run.variant_metadata or {}
+        config = metadata.get("config", {})
+        profile = str(config.get("profile", "") or "tiny-coder") if isinstance(config, dict) else "tiny-coder"
+        lines.append(
+            "| "
+            f"{run.variant_name} | {profile} | "
+            f"{summary['visible_tool_count']} | "
+            f"{summary['solve_rate']:.3f} | {summary['validation_rate']:.3f} | "
+            f"{summary['static_prompt_tokens']} | {summary['tool_schema_tokens']} | {summary['context_token_estimate']} | "
+            f"{summary['model_calls']} | {summary['tool_calls']} | {summary['repeated_tool_calls']} | "
+            f"{summary['diff_after_edit']} | {summary['verification_after_edit']} | "
+            f"{summary['finish_gate_blocks']} | {summary['policy_denials']} | {summary['approval_requests']} | "
+            f"{summary['invariant_failures']} |"
+        )
+    diagnostics = _diagnostic_totals([result for run in comparison.variants for result in run.results])
+    if any(value for value in diagnostics.values()):
+        lines.extend(["", "## Trace Metrics"])
+        for key, value in diagnostics.items():
+            if isinstance(value, float):
+                if value:
+                    lines.append(f"- {key}: {value:.3f}")
+            elif value:
+                lines.append(f"- {key}: {value}")
     if len(comparison.variants) >= 2:
         base = _variant_summary(comparison.variants[0])
         lines.extend(["", "## Deltas"])
@@ -357,6 +442,8 @@ def render_eval_comparison(comparison: EvalComparison) -> str:
             lines.append(
                 f"- {run.variant_name}: solve_rate {current['solve_rate'] - base['solve_rate']:+.3f}, "
                 f"tool_errors {current['tool_errors'] - base['tool_errors']:+d}, "
+                f"tool_schema_tokens {current['tool_schema_tokens'] - base['tool_schema_tokens']:+d}, "
+                f"visible_tools {current['visible_tool_count'] - base['visible_tool_count']:+d}, "
                 f"finish_blocks {current['finish_gate_blocks'] - base['finish_gate_blocks']:+d}"
             )
     finding_counts: dict[str, int] = {}
@@ -368,6 +455,12 @@ def render_eval_comparison(comparison: EvalComparison) -> str:
         lines.extend(["", "## Harness Categories"])
         for finding, count in sorted(finding_counts.items()):
             lines.append(f"- {finding}: {count}")
+    mechanism_totals = _mechanism_totals([result for run in comparison.variants for result in run.results])
+    if any(mechanism_totals.values()):
+        lines.extend(["", "## Mechanism Metrics"])
+        for key, value in mechanism_totals.items():
+            if value:
+                lines.append(f"- {key}: {value}")
     lines.extend(["", "## Metadata"])
     for run in comparison.variants:
         metadata = run.variant_metadata or {}
@@ -378,6 +471,10 @@ def render_eval_comparison(comparison: EvalComparison) -> str:
                 f"- provider: {config.get('provider', '')}",
                 f"- model: {config.get('model', '')}",
                 f"- profile: {config.get('profile', '')}",
+                f"- profile_variant: {config.get('profile_variant', '')}",
+                f"- context_policy: {config.get('context_policy', '')}",
+                f"- tool_surface: {config.get('tool_surface', '')}",
+                f"- effective_visible_tools: {', '.join(_variant_summary(run)['visible_tools'])}",
                 f"- visible_tools: {', '.join(config.get('visible_tools', []) or [])}",
                 f"- workspace_mode: {config.get('workspace_mode', '')}",
                 f"- sandbox_mode: {config.get('sandbox_mode', '')}",
@@ -412,6 +509,7 @@ def _run_case(
     approval_mode: ApprovalMode,
     sandbox_mode: SandboxModeInput,
     run_id_prefix: str,
+    resources: LoadedResources | None,
 ) -> EvalResult:
     case_dir = case.case_dir or suite_path / case.id
     _prepare_workspace(case_dir, workspace_dir, setup_git=case.setup_git)
@@ -425,6 +523,7 @@ def _run_case(
         workspace_mode=workspace_mode,
         approval_mode=approval_mode,
         sandbox_mode=sandbox_mode,
+        resources=resources,
     )
     run_id = f"{run_id_prefix}-{case.id}" if run_id_prefix else case.id
     state = kernel.run(
@@ -529,19 +628,30 @@ def _result_from_record(
         workspace_path=str(workspace_dir),
         duration_seconds=record.duration_seconds,
         turn_count=record.turn_count,
+        model_call_count=record.model_call_count,
         tool_call_count=record.tool_call_count,
         command_count=record.command_count,
         patch_count=record.patch_count,
         final_diff_chars=record.final_diff_chars,
         context_token_estimate=metrics.context_token_estimate,
+        static_prompt_tokens=metrics.static_prompt_tokens,
+        tool_schema_tokens=metrics.tool_schema_tokens,
+        model_call_token_estimates=metrics.model_call_token_estimates,
+        profile_visible_tools=metrics.profile_visible_tools,
         tool_error_count=metrics.tool_error_count,
         tool_error_kinds=metrics.tool_error_kinds,
+        unknown_tool_count=metrics.unknown_tool_count,
+        invalid_tool_args_count=metrics.invalid_tool_args_count,
         policy_denials=metrics.policy_denials,
         sandbox_blocks=metrics.sandbox_blocks,
         finish_gate_blocks=metrics.finish_gate_blocks,
+        approval_request_count=metrics.approval_request_count,
+        hidden_artifact_fetch_failures=metrics.hidden_artifact_fetch_failures,
         artifact_bytes_written=metrics.artifact_bytes_written,
         compaction_count=metrics.compaction_count,
         repeated_tool_call_count=metrics.repeated_tool_call_count,
+        time_to_first_tool_seconds=metrics.time_to_first_tool_seconds,
+        time_to_first_edit_seconds=metrics.time_to_first_edit_seconds,
         inspected_before_edit=metrics.inspected_before_edit,
         diff_after_edit=metrics.diff_after_edit,
         verification_after_edit=metrics.verification_after_edit,
@@ -549,6 +659,16 @@ def _result_from_record(
         output_truncation_count=metrics.output_truncation_count,
         large_output_artifact_count=metrics.large_output_artifact_count,
         recent_tool_context_chars=metrics.recent_tool_context_chars,
+        context_search_count=metrics.context_search_count,
+        context_read_count=metrics.context_read_count,
+        search_code_count=metrics.search_code_count,
+        skill_list_count=metrics.skill_list_count,
+        skill_load_count=metrics.skill_load_count,
+        mcp_search_count=metrics.mcp_search_count,
+        mcp_load_count=metrics.mcp_load_count,
+        mcp_call_count=metrics.mcp_call_count,
+        invariant_failure_count=metrics.invariant_failure_count,
+        invariant_failures=metrics.invariant_failures,
         harness_findings=metrics.harness_findings,
         failure_reason=record.failure_reason,
         validation_output_path=validation_output_path,
@@ -607,18 +727,64 @@ def _variant_summary(run: EvalRun) -> dict[str, Any]:
     successes = sum(1 for result in run.results if result.success)
     validation_attempts = sum(1 for result in run.results if result.validation_attempted)
     validations = sum(1 for result in run.results if result.validation_attempted and result.validation_ok)
+    visible_tools = sorted({tool for result in run.results for tool in (result.profile_visible_tools or [])})
     return {
         "cases": total,
         "successes": successes,
         "solve_rate": successes / total if total else 0.0,
         "validation_attempts": validation_attempts,
         "validation_rate": validations / validation_attempts if validation_attempts else 0.0,
+        "visible_tools": visible_tools,
+        "visible_tool_count": len(visible_tools),
+        "model_calls": sum(result.model_call_count for result in run.results),
         "tool_calls": sum(result.tool_call_count for result in run.results),
         "tool_errors": sum(result.tool_error_count for result in run.results),
+        "unknown_tools": sum(result.unknown_tool_count for result in run.results),
+        "invalid_tool_args": sum(result.invalid_tool_args_count for result in run.results),
         "policy_denials": sum(result.policy_denials for result in run.results),
+        "approval_requests": sum(result.approval_request_count for result in run.results),
         "sandbox_blocks": sum(result.sandbox_blocks for result in run.results),
         "finish_gate_blocks": sum(result.finish_gate_blocks for result in run.results),
         "compactions": sum(result.compaction_count for result in run.results),
+        "repeated_tool_calls": sum(result.repeated_tool_call_count for result in run.results),
+        "static_prompt_tokens": max((result.static_prompt_tokens for result in run.results), default=0),
+        "tool_schema_tokens": max((result.tool_schema_tokens for result in run.results), default=0),
+        "context_token_estimate": max((result.context_token_estimate for result in run.results), default=0),
+        "diff_after_edit": sum(1 for result in run.results if result.diff_after_edit),
+        "verification_after_edit": sum(1 for result in run.results if result.verification_after_edit),
+        "invariant_failures": sum(result.invariant_failure_count for result in run.results),
+    }
+
+
+def _mechanism_totals(results: list[EvalResult]) -> dict[str, int]:
+    return {
+        "context_search_count": sum(result.context_search_count for result in results),
+        "context_read_count": sum(result.context_read_count for result in results),
+        "search_code_count": sum(result.search_code_count for result in results),
+        "skill_list_count": sum(result.skill_list_count for result in results),
+        "skill_load_count": sum(result.skill_load_count for result in results),
+        "mcp_search_count": sum(result.mcp_search_count for result in results),
+        "mcp_load_count": sum(result.mcp_load_count for result in results),
+        "mcp_call_count": sum(result.mcp_call_count for result in results),
+    }
+
+
+def _diagnostic_totals(results: list[EvalResult]) -> dict[str, int | float]:
+    tool_latencies = [result.time_to_first_tool_seconds for result in results if result.time_to_first_tool_seconds]
+    edit_latencies = [result.time_to_first_edit_seconds for result in results if result.time_to_first_edit_seconds]
+    return {
+        "invariant_failure_count": sum(result.invariant_failure_count for result in results),
+        "repeated_tool_call_count": sum(result.repeated_tool_call_count for result in results),
+        "unknown_tool_count": sum(result.unknown_tool_count for result in results),
+        "invalid_tool_args_count": sum(result.invalid_tool_args_count for result in results),
+        "approval_request_count": sum(result.approval_request_count for result in results),
+        "output_truncation_count": sum(result.output_truncation_count for result in results),
+        "large_output_artifact_count": sum(result.large_output_artifact_count for result in results),
+        "hidden_artifact_fetch_failures": sum(result.hidden_artifact_fetch_failures for result in results),
+        "max_context_token_estimate": max((result.context_token_estimate for result in results), default=0),
+        "max_tool_schema_tokens": max((result.tool_schema_tokens for result in results), default=0),
+        "avg_time_to_first_tool_seconds": sum(tool_latencies) / len(tool_latencies) if tool_latencies else 0.0,
+        "avg_time_to_first_edit_seconds": sum(edit_latencies) / len(edit_latencies) if edit_latencies else 0.0,
     }
 
 

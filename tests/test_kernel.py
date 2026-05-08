@@ -84,6 +84,12 @@ class CancellingApprovalHandler:
         raise AssertionError("unreachable")
 
 
+class ExplodingApprovalHandler:
+    def resolve(self, request, state):
+        del request, state
+        raise RuntimeError("boom")
+
+
 class BasicProfile:
     name = "test-profile"
 
@@ -556,6 +562,48 @@ def test_cancel_during_approval_wait_marks_active_step_only(tmp_path) -> None:
         types,
         ["approval.requested", "step.started", "step.cancel.requested", "step.cancelled", "turn.interrupted", "run.cancelled"],
     )
+
+
+def test_approval_handler_exception_closes_wait_step_and_denies(tmp_path) -> None:
+    call = ToolCall(name="noop")
+    model = StaticModel([ModelResponse(tool_calls=[call]), ModelResponse(content="done", finish_reason="stop")])
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[NoopTool()],
+        policy=ApprovalPolicy(),
+        approval_handler=ExplodingApprovalHandler(),
+        approval_mode="on-request",
+    )
+
+    state = kernel.run("approval handler error", workspace=tmp_path)
+
+    types = event_types(state)
+    assert state.failed is False
+    assert state.final_output == "done"
+    assert state.current_step_kind is None
+    assert state.current_step_id is None
+    assert state.current_model_call_id is None
+    assert state.pending_approvals == {}
+    assert "approval.requested" in types
+    assert "step.started" in types
+    assert "step.failed" in types
+    assert "approval.resolved" in types
+    assert "tool.execution.started" not in types
+    assert_subsequence(types, ["approval.requested", "step.started", "step.failed", "approval.resolved"])
+    approval_step_closures = [
+        event
+        for event in state.events
+        if event.type in {"step.completed", "step.failed", "step.cancelled", "step.timeout", "step.idle_timeout"}
+        and event.data.get("step_kind") == "approval_wait"
+    ]
+    assert len(approval_step_closures) == 1
+    failed_step = next(event for event in state.events if event.type == "step.failed" and event.data.get("step_kind") == "approval_wait")
+    assert failed_step.data["approval_id"] == f"approval_{call.id}"
+    assert failed_step.data["reason"] == "boom"
+    resolution = next(event for event in state.events if event.type == "approval.resolved")
+    assert resolution.data["decision"] == "denied"
+    assert "approval handler error: boom" == resolution.data["reason"]
 
 
 def test_policy_exception_fails_closed_and_records_tool_result(tmp_path) -> None:

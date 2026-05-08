@@ -252,6 +252,9 @@ class RunState:
     context_checkpoint_tool_step_count: int = 0
     context_token_estimate: int = 0
     compaction_count: int = 0
+    skill_registry: Any | None = None
+    context_registry: Any | None = None
+    workspace_index: Any | None = None
     transcript: Transcript = field(default_factory=_default_transcript)
     observations: list[Observation] = field(default_factory=list)
     finish_gate_messages: list[str] = field(default_factory=list)

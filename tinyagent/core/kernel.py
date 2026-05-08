@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 from uuid import uuid4
 
 from tinyagent.core.context import BuiltContext, estimate_messages_tokens, estimate_tools_tokens, message_text
+from tinyagent.core.context_sources import ContextReadTool, ContextRegistry, ContextSearchTool, default_context_sources
 from tinyagent.core.contextfs import refresh_contextfs
 from tinyagent.core.contracts import ApprovalHandler, Executor, LocalExecutor, ModelProvider, PolicyEngine, Profile, Tool
 from tinyagent.core.events import EventSink, json_safe
 from tinyagent.core.extensions import Extension, ExtensionHost
+from tinyagent.core.hook_runner import HookErrorPolicy, HookRunner
 from tinyagent.core.hooks import TinyHook
+from tinyagent.core.index import SearchCodeTool, WorkspaceIndexManager
 from tinyagent.core.model_stream import complete_model_call
 from tinyagent.core.models import model_spec
 from tinyagent.core.observations import Observation, extract_observations
@@ -29,7 +33,10 @@ from tinyagent.core.output import (
     write_run_outputs,
 )
 from tinyagent.core.progress import ProgressGuard
+from tinyagent.core.resources import LoadedResources
 from tinyagent.core.run_control import CancelToken, RunCancelled
+from tinyagent.core.skills import SkillRegistry, default_skill_sources
+from tinyagent.core.skills.tools import ListSkillsTool, LoadSkillTool
 from tinyagent.core.state import (
     ApprovalGrant,
     ApprovalMode,
@@ -50,7 +57,6 @@ from tinyagent.core.workspace import SandboxModeInput, WorkspaceMode, prepare_wo
 from tinyagent.core.workspace_delta import WorkspaceDeltaObserver
 
 MAX_EVENT_DATA_CHARS = 4_000
-HookErrorPolicy = Literal["fail", "record"]
 
 
 class Kernel:
@@ -73,14 +79,29 @@ class Kernel:
         sandbox_mode: SandboxModeInput = "none",
         hooks: Sequence[TinyHook] = (),
         extensions: Sequence[Extension] = (),
+        resources: LoadedResources | None = None,
         hook_error_policy: HookErrorPolicy = "fail",
         progress_guard: ProgressGuard | None = None,
         workspace_delta_observer: WorkspaceDeltaObserver | None = None,
+        workspace_index_manager: WorkspaceIndexManager | None = None,
     ) -> None:
-        extension_host = ExtensionHost(extensions)
+        loaded_extensions = tuple(resources.extensions) if resources is not None else ()
+        extension_host = ExtensionHost((*loaded_extensions, *tuple(extensions)))
+        base_skill_sources = default_skill_sources() if resources is None or resources.skill_sources is None else resources.skill_sources
+        skill_registry = SkillRegistry((*base_skill_sources, *extension_host.skills()))
+        self.skill_registry = skill_registry
+        resource_context_sources = resources.context_sources if resources is not None else ()
+        self.context_registry = ContextRegistry((*default_context_sources(skill_registry), *resource_context_sources, *extension_host.context_sources()))
         self.model = model
         self.profile = profile
-        self.tools = {tool.name: tool for tool in (*tools, *extension_host.tools())}
+        base_tools = {tool.name: tool for tool in (*tools, *extension_host.tools())}
+        if _uses_default_tool_surface(base_tools):
+            base_tools["list_skills"] = ListSkillsTool(skill_registry)
+            base_tools["load_skill"] = LoadSkillTool(skill_registry)
+            base_tools["context_search"] = ContextSearchTool(self.context_registry)
+            base_tools["context_read"] = ContextReadTool(self.context_registry)
+            base_tools["search_code"] = SearchCodeTool()
+        self.tools = base_tools
         self.policy = policy
         self.approval_handler = approval_handler
         self.executor = executor or LocalExecutor()
@@ -92,8 +113,10 @@ class Kernel:
         self.sandbox_mode = sandbox_mode
         self.hooks = (*tuple(hooks), *extension_host.hooks())
         self.hook_error_policy = hook_error_policy
+        self.hook_runner = HookRunner(self.hooks, error_policy=hook_error_policy)
         self.progress_guard = progress_guard or ProgressGuard()
         self.workspace_delta_observer = workspace_delta_observer or WorkspaceDeltaObserver()
+        self.workspace_index_manager = workspace_index_manager
 
     def run(
         self,
@@ -135,6 +158,9 @@ class Kernel:
             prior_messages=prior_messages,
         )
         state.workspace_envelope = prepared_workspace.envelope
+        state.skill_registry = self.skill_registry
+        state.workspace_index = self.workspace_index_manager or WorkspaceIndexManager.for_workspace(prepared_workspace.workspace.root)
+        state.context_registry = self.context_registry
         state.model_spec = model_spec(self.model).to_json_dict()
         state.approval_mode = approval_mode or self.approval_mode
         state.status = "running"
@@ -145,10 +171,18 @@ class Kernel:
 
         try:
             self._run_hooks(state, "on_run_start", state)
+            profile_metadata = _profile_trace_metadata(self.profile, state, self.tools)
+            model_metadata = dict(state.model_spec)
             state.emit(
                 "run.started",
                 {
                     "task": task,
+                    "provider": model_metadata.get("provider"),
+                    "model": model_metadata.get("model"),
+                    "protocol": model_metadata.get("protocol"),
+                    "adapter": model_metadata.get("adapter"),
+                    "capabilities": model_metadata.get("capabilities"),
+                    **profile_metadata,
                     "workspace_root": str(state.workspace.root),
                     "original_workspace_root": (
                         str(state.workspace_envelope.original_root)
@@ -190,6 +224,7 @@ class Kernel:
                 state.emit("shell.preflight.completed", state.shell_preflight)
             index_path = refresh_contextfs(state)
             state.emit("contextfs.index.updated", {"path": index_path, "phase": "startup"})
+            self._sync_workspace_index(state, mode="fast", paths=None, phase="startup")
             state.raise_if_cancelled()
             state.start_turn("turn-0001")
             self._run_loop(state, stream=use_stream)
@@ -252,6 +287,8 @@ class Kernel:
                     "visible_tools": [tool.name for tool in visible_tools],
                     "model_spec": spec.to_json_dict(),
                     "token_estimate": built_context.token_estimate,
+                    "model_call_token_estimate": actual_token_estimate,
+                    "tool_schema_tokens": estimate_tools_tokens(visible_tools),
                     "static_context_chars": built_context.static_context_chars,
                     "tool_context_chars": built_context.tool_context_chars,
                     "project_instruction_chars": built_context.project_instruction_chars,
@@ -674,6 +711,7 @@ class Kernel:
     def _record_workspace_delta(self, state: RunState, call: ToolCall, result: ToolResult, delta) -> None:
         payload = {"tool_call_id": call.id, "tool": call.name, "ok": result.ok, "failure_kind": result.failure_kind, **delta.to_json_dict()}
         state.emit("workspace.delta.completed", payload)
+        self._sync_workspace_index(state, mode="overlay-fast", paths=delta.paths, phase="workspace_delta", tool_call_id=call.id)
         state.emit(
             "workspace.mutation.detected",
             payload,
@@ -704,6 +742,41 @@ class Kernel:
             )
         )
         state.emit("observation.recorded", state.observations[-1].to_json_dict(), artifact_refs=list(state.observations[-1].refs))
+
+    def _sync_workspace_index(
+        self,
+        state: RunState,
+        *,
+        mode: str,
+        paths: Sequence[str] | None,
+        phase: str,
+        tool_call_id: str | None = None,
+    ) -> None:
+        if not isinstance(state.workspace_index, WorkspaceIndexManager):
+            return
+        status = state.workspace_index.status()
+        payload: dict[str, Any] = {"mode": mode, "backend": status.backend, "phase": phase}
+        if tool_call_id is not None:
+            payload["tool_call_id"] = tool_call_id
+        if paths is not None:
+            payload["path_count"] = len(paths)
+        state.emit("index.sync.started", payload)
+        try:
+            sync = state.workspace_index.sync(root=state.workspace.root, paths=paths, mode=mode)  # type: ignore[arg-type]
+            state.emit(
+                "index.sync.completed" if not sync.error else "index.sync.failed",
+                {
+                    **payload,
+                    "mode": sync.mode,
+                    "backend": sync.backend,
+                    "synced_file_count": sync.synced_file_count,
+                    "stale_file_count": sync.stale_file_count,
+                    "duration_ms": sync.duration_ms,
+                    "error": sync.error,
+                },
+            )
+        except Exception as exc:
+            state.emit("index.sync.failed", {**payload, "error": str(exc)})
 
     def _record_tool_result(self, state: RunState, call: ToolCall, result: ToolResult) -> None:
         if result.data.get("cancelled"):
@@ -870,8 +943,12 @@ class Kernel:
                     decision="denied",
                     reason=f"approval handler error: {exc}",
                 )
+                state.finish_step("failed", data={"approval_id": approval.approval_id, "reason": str(exc)})
             else:
-                state.finish_step("completed", data={"approval_id": approval.approval_id, "decision": resolution.decision})
+                if resolution.decision == "cancelled":
+                    state.finish_step("cancelled", data={"approval_id": approval.approval_id, "decision": resolution.decision})
+                else:
+                    state.finish_step("completed", data={"approval_id": approval.approval_id, "decision": resolution.decision})
         else:
             resolution = ApprovalResolution(
                 approval_id=approval.approval_id,
@@ -1141,134 +1218,25 @@ class Kernel:
     def _before_finish(self, state: RunState, response: ModelResponse) -> FinishDecision:
         before_finish = getattr(self.profile, "before_finish", None)
         decision = before_finish(state, response) if callable(before_finish) else FinishDecision.allowed()
-        for hook in self.hooks:
-            method = getattr(hook, "before_finish", None)
-            if not callable(method):
-                continue
-            name = _hook_name(hook)
-            state.emit("hook.started", {"hook": name, "method": "before_finish"})
-            try:
-                decision = method(state, response, decision)
-            except Exception as exc:
-                state.emit("hook.failed", {"hook": name, "method": "before_finish", "reason": str(exc)}, visibility="user")
-                self._handle_hook_error(state, name, "before_finish", exc)
-            else:
-                state.emit("hook.completed", {"hook": name, "method": "before_finish"})
-        return decision
+        return self.hook_runner.before_finish(state, response, decision)
 
     def _run_hooks(self, state: RunState, method_name: str, *args) -> None:
-        for hook in self.hooks:
-            method = getattr(hook, method_name, None)
-            if not callable(method):
-                continue
-            name = _hook_name(hook)
-            state.emit("hook.started", {"hook": name, "method": method_name})
-            try:
-                method(*args)
-            except Exception as exc:
-                state.emit("hook.failed", {"hook": name, "method": method_name, "reason": str(exc)}, visibility="user")
-                self._handle_hook_error(state, name, method_name, exc)
-            else:
-                state.emit("hook.completed", {"hook": name, "method": method_name})
+        self.hook_runner.call_void(state, method_name, *args)
 
     def _on_context(self, state: RunState, built_context: BuiltContext) -> BuiltContext:
-        current = built_context
-        for hook in self.hooks:
-            method = getattr(hook, "on_context", None)
-            if not callable(method):
-                continue
-            name = _hook_name(hook)
-            state.emit("hook.started", {"hook": name, "method": "on_context"})
-            try:
-                current = method(state, current)
-            except Exception as exc:
-                state.emit("hook.failed", {"hook": name, "method": "on_context", "reason": str(exc)}, visibility="user")
-                self._handle_hook_error(state, name, "on_context", exc)
-            else:
-                state.emit("hook.completed", {"hook": name, "method": "on_context"})
-        return current
+        return self.hook_runner.on_context(state, built_context)
 
     def _after_model_response(self, state: RunState, response: ModelResponse) -> ModelResponse:
-        current = response
-        for hook in self.hooks:
-            method = getattr(hook, "after_model_response", None)
-            if not callable(method):
-                continue
-            name = _hook_name(hook)
-            state.emit("hook.started", {"hook": name, "method": "after_model_response"})
-            try:
-                current = method(state, current)
-            except Exception as exc:
-                state.emit("hook.failed", {"hook": name, "method": "after_model_response", "reason": str(exc)}, visibility="user")
-                self._handle_hook_error(state, name, "after_model_response", exc)
-            else:
-                state.emit("hook.completed", {"hook": name, "method": "after_model_response"})
-        return current
+        return self.hook_runner.after_model_response(state, response)
 
     def _before_model_call(self, state: RunState, messages: list[Message], tools: list[Tool]) -> tuple[list[Message], list[Tool]]:
-        current_messages: list[Message] = messages
-        current_tools: list[Tool] = tools
-        for hook in self.hooks:
-            method = getattr(hook, "before_model_call", None)
-            if not callable(method):
-                continue
-            name = _hook_name(hook)
-            state.emit("hook.started", {"hook": name, "method": "before_model_call"})
-            try:
-                returned = method(state, current_messages, current_tools)
-                if isinstance(returned, tuple) and len(returned) == 2:
-                    current_messages = list(returned[0])
-                    current_tools = list(returned[1])
-            except Exception as exc:
-                state.emit("hook.failed", {"hook": name, "method": "before_model_call", "reason": str(exc)}, visibility="user")
-                self._handle_hook_error(state, name, "before_model_call", exc)
-            else:
-                state.emit("hook.completed", {"hook": name, "method": "before_model_call"})
-        return current_messages, current_tools
+        return self.hook_runner.before_model_call(state, messages, tools)
 
     def _before_tool_call(self, state: RunState, call: ToolCall, decision: PolicyDecision) -> ToolCall | ToolResult | None:
-        current: ToolCall | ToolResult | None = call
-        for hook in self.hooks:
-            method = getattr(hook, "before_tool_call", None)
-            if not callable(method):
-                continue
-            name = _hook_name(hook)
-            state.emit("hook.started", {"hook": name, "method": "before_tool_call"})
-            try:
-                returned = method(state, current if isinstance(current, ToolCall) else call, decision)
-                current = returned if returned is not None else current
-            except Exception as exc:
-                state.emit("hook.failed", {"hook": name, "method": "before_tool_call", "reason": str(exc)}, visibility="user")
-                self._handle_hook_error(state, name, "before_tool_call", exc)
-            else:
-                state.emit("hook.completed", {"hook": name, "method": "before_tool_call"})
-            if isinstance(current, ToolResult):
-                return current
-        return current if isinstance(current, ToolCall) and current != call else None
+        return self.hook_runner.before_tool_call(state, call, decision)
 
     def _after_tool_result(self, state: RunState, result: ToolResult) -> ToolResult:
-        current = result
-        for hook in self.hooks:
-            method = getattr(hook, "after_tool_result", None)
-            if not callable(method):
-                continue
-            name = _hook_name(hook)
-            state.emit("hook.started", {"hook": name, "method": "after_tool_result"})
-            try:
-                current = method(state, current)
-            except Exception as exc:
-                state.emit("hook.failed", {"hook": name, "method": "after_tool_result", "reason": str(exc)}, visibility="user")
-                self._handle_hook_error(state, name, "after_tool_result", exc)
-            else:
-                state.emit("hook.completed", {"hook": name, "method": "after_tool_result"})
-        return current
-
-    def _handle_hook_error(self, state: RunState, hook_name: str, method_name: str, exc: Exception) -> None:
-        if self.hook_error_policy == "record":
-            return
-        reason = f"hook {hook_name}.{method_name} failed: {exc}"
-        state.fail(reason)
-        raise RuntimeError(reason) from exc
+        return self.hook_runner.after_tool_result(state, result)
 
 
 def _small_event_data(data: dict[str, Any]) -> dict[str, Any]:
@@ -1316,8 +1284,25 @@ def _context_budget(profile: Profile, state: RunState, capabilities=None) -> int
     return state.context_token_estimate
 
 
-def _hook_name(hook: TinyHook) -> str:
-    return str(getattr(hook, "name", hook.__class__.__name__))
+def _profile_trace_metadata(profile: Profile, state: RunState, tools: Mapping[str, Tool]) -> dict[str, Any]:
+    visible_tools = [tool.name for tool in profile.visible_tools(state, tools)]
+    system_prompt = profile.system_prompt()
+    return {
+        "profile": profile.name,
+        "profile_variant": str(getattr(profile, "profile_variant", "default")),
+        "system_prompt_hash": hashlib.sha256(system_prompt.encode()).hexdigest()[:12],
+        "profile_visible_tools": visible_tools,
+        "context_policy": str(getattr(profile, "context_policy_name", "dynamic-v1")),
+        "skill_policy": str(getattr(profile, "skill_policy_name", "default-v1")),
+        "tool_surface": str(getattr(profile, "tool_surface_name", "default")),
+    }
+
+
+def _uses_default_tool_surface(tools: Mapping[str, Tool]) -> bool:
+    return _DEFAULT_TOOL_SENTINELS.issubset(tools)
+
+
+_DEFAULT_TOOL_SENTINELS = frozenset({"shell", "apply_patch", "str_replace_edit", "write_file", "read_file", "list_files"})
 
 
 def _yolo_resolution(approval: ApprovalRequest) -> ApprovalResolution:

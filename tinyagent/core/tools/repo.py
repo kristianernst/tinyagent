@@ -2,28 +2,22 @@
 
 from __future__ import annotations
 
-import os
-import selectors
-import shutil
-import subprocess
-import time
 from pathlib import Path
 
 from tinyagent.core.contextfs import model_readable_path, read_hints, write_context_tool_output
 from tinyagent.core.contracts import Tool
+from tinyagent.core.index.safety import EXCLUDED_INDEX_DIRS, MAX_INDEX_FILE_BYTES, is_excluded_index_path
 from tinyagent.core.state import RunState, ToolCall, ToolResult
 from tinyagent.core.tools.core import (
     error_result,
     is_relative_to,
     relative_workspace_path,
     resolve_workspace_path,
-    tool_env,
     visible_output,
-    write_tool_output_artifact,
 )
 
-EXCLUDED_SEARCH_DIRS = frozenset({".git", ".tinyagent"})
-MAX_READ_FILE_BYTES = 1_000_000
+EXCLUDED_SEARCH_DIRS = EXCLUDED_INDEX_DIRS
+MAX_READ_FILE_BYTES = MAX_INDEX_FILE_BYTES
 
 
 class ReadFileTool:
@@ -148,87 +142,8 @@ class ListFilesTool:
         )
 
 
-class SearchRepoTool:
-    name = "search_repo"
-    schema = {
-        "name": "search_repo",
-        "description": "Search text inside workspace files, excluding trace and git directories.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "path": {"type": "string"},
-                "max_matches": {"type": "integer", "minimum": 1},
-            },
-            "required": ["query"],
-        },
-    }
-
-    def run(self, call: ToolCall, state: RunState) -> ToolResult:
-        query = str(call.args.get("query", ""))
-        if not query:
-            return ToolResult(tool_name=self.name, call_id=call.id, output="query is required", ok=False)
-        try:
-            path = resolve_workspace_path(state, call.args.get("path", "."), allow_run_artifacts=True)
-            max_matches = max(int(call.args.get("max_matches", 100)), 1)
-        except Exception as exc:
-            return error_result(self.name, call, exc)
-
-        try:
-            output, captured_output, match_count, truncated, used_rg, timed_out = _search_workspace(
-                state,
-                path,
-                query,
-                max_matches=max_matches,
-            )
-        except Exception as exc:
-            return error_result(self.name, call, exc)
-        artifact = write_tool_output_artifact(
-            state,
-            call,
-            "search-output",
-            captured_output or "No matches.",
-            kind="search_captured_output",
-        )
-        readable_artifact = model_readable_path(state, artifact)
-        state.emit(
-            "search.completed",
-            {
-                "query": query,
-                "path": relative_workspace_path(state, path),
-                "match_count": match_count,
-                "truncated": truncated,
-                "timed_out": timed_out,
-                "used_rg": used_rg,
-                "excluded": _excluded_search_labels(state),
-                "captured_output_artifact": artifact,
-                "captured_output_chars": len(captured_output or "No matches."),
-            },
-        )
-        return ToolResult(
-            tool_name=self.name,
-            call_id=call.id,
-            output=output or "No matches.",
-            artifact_path=artifact,
-            truncated=truncated,
-            data={
-                "query": query,
-                "path": relative_workspace_path(state, path),
-                "match_count": match_count,
-                "truncated": truncated,
-                "timed_out": timed_out,
-                "used_rg": used_rg,
-                "captured_output_artifact": artifact,
-                "captured_output_chars": len(captured_output or "No matches."),
-                "output_artifact": artifact,
-                "output_chars": len(captured_output or "No matches."),
-            },
-            read_hints=read_hints(readable_artifact, failure=timed_out),
-        )
-
-
 def repo_inspect_tools() -> list[Tool]:
-    return [ReadFileTool(), ListFilesTool(), SearchRepoTool()]
+    return [ReadFileTool(), ListFilesTool()]
 
 
 def _iter_workspace_files(state: RunState, root: Path, *, max_files: int) -> list[Path]:
@@ -245,134 +160,15 @@ def _iter_workspace_files(state: RunState, root: Path, *, max_files: int) -> lis
     return files
 
 
-def _search_workspace(state: RunState, path: Path, query: str, *, max_matches: int) -> tuple[str, str, int, bool, bool, bool]:
-    if _excluded(state, path):
-        return "", "", 0, False, False, False
-
-    rg = shutil.which("rg")
-    if rg is not None:
-        target = relative_workspace_path(state, path)
-        lines, truncated, timed_out = _run_rg_limited(state, rg, query, target, max_matches=max_matches)
-        visible = lines[:max_matches]
-        captured_output = "\n".join(lines)
-        return "\n".join(visible), captured_output, len(visible), truncated, True, timed_out
-
-    matches: list[str] = []
-    deadline = time.monotonic() + max(state.budgets.max_shell_timeout_seconds, 1)
-    for file_path in _iter_workspace_files(state, path, max_files=100_000):
-        if time.monotonic() >= deadline:
-            return "\n".join(matches[:max_matches]), "\n".join(matches), min(len(matches), max_matches), True, False, True
-        try:
-            if file_path.stat().st_size > MAX_READ_FILE_BYTES:
-                continue
-            text = file_path.read_text(errors="ignore")
-        except OSError:
-            continue
-        for line_number, line in enumerate(text.splitlines(), start=1):
-            if query in line:
-                matches.append(f"{relative_workspace_path(state, file_path)}:{line_number}:{line}")
-                if len(matches) >= max_matches + 1:
-                    return "\n".join(matches[:max_matches]), "\n".join(matches), max_matches, True, False, False
-    output = "\n".join(matches)
-    return output, output, len(matches), False, False, False
-
-
-def _run_rg_limited(state: RunState, rg: str, query: str, target: str, *, max_matches: int) -> tuple[list[str], bool, bool]:
-    command = [
-        rg,
-        "--line-number",
-        "--no-heading",
-        "--color",
-        "never",
-        "--max-filesize",
-        "2M",
-        "--max-columns",
-        "300",
-        "--glob",
-        "!**/.tinyagent/**",
-        "--glob",
-        "!**/.git/**",
-    ]
-    command.extend(_rg_exclude_output_dir_args(state))
-    command.extend(["--", query, target])
-    process = subprocess.Popen(
-        command,
-        cwd=state.workspace.root,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        env=tool_env(state),
-    )
-    assert process.stdout is not None
-    lines: list[str] = []
-    truncated = False
-    timed_out = False
-    buffer = b""
-    deadline = time.monotonic() + max(state.budgets.max_shell_timeout_seconds, 1)
-    selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ)
-    try:
-        while process.poll() is None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                timed_out = True
-                truncated = True
-                process.terminate()
-                break
-            events = selector.select(timeout=min(0.1, remaining))
-            if not events:
-                continue
-            chunk = os.read(process.stdout.fileno(), 8192)
-            if not chunk:
-                break
-            buffer = _append_rg_chunk(buffer, chunk, lines)
-            if len(lines) > max_matches:
-                truncated = True
-                process.terminate()
-                break
-        while not timed_out and len(lines) <= max_matches:
-            chunk = os.read(process.stdout.fileno(), 8192)
-            if not chunk:
-                break
-            buffer = _append_rg_chunk(buffer, chunk, lines)
-        if buffer and len(lines) <= max_matches:
-            lines.append(buffer.decode(errors="replace").rstrip("\r"))
-        if len(lines) > max_matches:
-            truncated = True
-        try:
-            process.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=1)
-    finally:
-        selector.close()
-        process.stdout.close()
-    return lines, truncated, timed_out
-
-
-def _append_rg_chunk(buffer: bytes, chunk: bytes, lines: list[str]) -> bytes:
-    buffer += chunk
-    while b"\n" in buffer:
-        raw_line, buffer = buffer.split(b"\n", 1)
-        lines.append(raw_line.decode(errors="replace").rstrip("\r"))
-    return buffer
-
-
 def _excluded(state: RunState, path: Path) -> bool:
     try:
         resolved = path.resolve()
-        parts = resolved.relative_to(state.workspace.root).parts
+        resolved.relative_to(state.workspace.root)
     except ValueError:
         return True
-    if any(part in EXCLUDED_SEARCH_DIRS for part in parts):
+    if is_excluded_index_path(state.workspace.root, resolved):
         return True
     return _output_dir_inside_workspace(state) is not None and is_relative_to(resolved, state.output_dir.resolve())
-
-
-def _rg_exclude_output_dir_args(state: RunState) -> list[str]:
-    relative = _output_dir_inside_workspace(state)
-    if relative is None:
-        return []
-    return ["--glob", f"!{relative}", "--glob", f"!{relative}/**"]
 
 
 def _excluded_search_labels(state: RunState) -> list[str]:

@@ -8,34 +8,27 @@ import re
 import shlex
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from tinyagent.core.context.builder import render_environment_context
+from tinyagent.core.contextfs_render import (
+    OPTIONAL_CONTEXT_FILE_RELS,
+    STATIC_CONTEXT_FILE_RELS,
+    TOOL_CONTEXT_DESCRIPTIONS,
+    ContextIndexEntry,
+    ContextRenderHelpers,
+    render_context_index,
+    render_diff_docs,
+    render_tool_docs,
+    static_context_file_specs,
+)
 
-if False:  # pragma: no cover
-    from tinyagent.core.state import RunState, ToolCall
+if TYPE_CHECKING:
+    from tinyagent.core.state import RunState, ToolCall, ToolStep
 
 
 CONTEXT_DIR = "context"
 MAX_UNTRACKED_DIFF_BYTES = 1_000_000
-_STATIC_CONTEXT_FILES = frozenset(
-    {
-        "context/INDEX.md",
-        "context/task.md",
-        "context/environment.md",
-        "context/current_status.md",
-        "context/current_diff.patch",
-        "context/current_diff.md",
-        "context/last_failure.md",
-        "context/observations.md",
-        "context/transcript.md",
-        "context/history/compacted.md",
-        "context/history/summary.md",
-        "context/history/raw.jsonl",
-        "context/tools/INDEX.md",
-        "context/diffs/INDEX.md",
-    }
-)
+_STATIC_CONTEXT_FILES = frozenset(STATIC_CONTEXT_FILE_RELS)
 _SECRET_FILE_NAMES = frozenset({".env", ".npmrc", ".pypirc", ".netrc"})
 
 
@@ -49,6 +42,72 @@ def model_readable_path(state: "RunState", context_relative: str | Path) -> str:
         return absolute.relative_to(state.workspace.root.resolve()).as_posix()
     except ValueError:
         return absolute.as_posix()
+
+
+def context_display_ref(context_relative: str | Path) -> str:
+    rel = Path(context_relative).as_posix()
+    if rel.startswith(("context/", "artifacts/")):
+        return rel
+    return f"context/{rel}"
+
+
+def resolve_context_path(state: "RunState", value: str) -> Path:
+    raw = Path(value)
+    if raw.is_absolute():
+        candidate = raw.resolve()
+    else:
+        parts = raw.parts
+        if parts and parts[0] == ".tinyagent":
+            candidate = (state.workspace.root / raw).resolve()
+        elif parts and parts[0] in {"context", "artifacts"}:
+            candidate = (state.output_dir / raw).resolve()
+        else:
+            candidate = (state.output_dir / CONTEXT_DIR / raw).resolve()
+    output_root = state.output_dir.resolve()
+    try:
+        rel = candidate.relative_to(output_root)
+    except ValueError as exc:
+        raise ValueError(f"Context path is outside current run output: {value}") from exc
+    rel_posix = rel.as_posix()
+    if rel_posix.startswith("context/"):
+        if rel_posix not in allowed_context_read_paths(state):
+            raise ValueError(f"Context path is not part of the current run recovery surface: {value}")
+        return candidate
+    if (
+        rel_posix.startswith("artifacts/context-checkpoint-")
+        and rel_posix.endswith(".md")
+        and artifact_kind(state, rel_posix) == "context_checkpoint"
+    ):
+        return candidate
+    if (
+        rel_posix.startswith("artifacts/context-search-")
+        and rel_posix.endswith(".txt")
+        and artifact_kind(state, rel_posix) == "context_search_output"
+    ):
+        return candidate
+    if (
+        rel_posix.startswith("artifacts/context-read-")
+        and rel_posix.endswith(".txt")
+        and artifact_kind(state, rel_posix) == "context_read_output"
+    ):
+        return candidate
+    if rel_posix.startswith("artifacts/workspace-delta-") and artifact_kind(state, rel_posix) == "workspace_delta":
+        return candidate
+    raise ValueError(f"Context path is not an allowed recovery file: {value}")
+
+
+def relative_output_path(state: "RunState", path: Path) -> str:
+    try:
+        return path.resolve().relative_to(state.output_dir.resolve()).as_posix()
+    except ValueError:
+        return model_readable_path(state, path)
+
+
+def artifact_kind(state: "RunState", relative_path: str) -> str | None:
+    for event in reversed(state.events):
+        if event.type == "artifact.created" and event.data.get("path") == relative_path:
+            return str(event.data.get("kind") or "")
+    return None
 
 
 def write_context_tool_output(state: "RunState", call: "ToolCall", output: str, *, kind: str) -> str:
@@ -86,7 +145,10 @@ def read_hints(path: str, *, failure: bool = False) -> list[str]:
 
 def allowed_context_read_paths(state: "RunState") -> set[str]:
     paths = set(_STATIC_CONTEXT_FILES)
-    for tool_name in _TOOL_CONTEXT_DESCRIPTIONS:
+    for optional in OPTIONAL_CONTEXT_FILE_RELS:
+        if (state.output_dir / optional).exists():
+            paths.add(optional)
+    for tool_name in TOOL_CONTEXT_DESCRIPTIONS:
         paths.add(f"context/tools/{safe_artifact_name(tool_name)}.md")
     for event in state.events:
         if event.type == "contextfs.artifact.written":
@@ -105,48 +167,64 @@ def allowed_context_read_paths(state: "RunState") -> set[str]:
 def refresh_contextfs(state: "RunState") -> str:
     context_dir = state.output_dir / CONTEXT_DIR
     context_dir.mkdir(parents=True, exist_ok=True)
-    _write_text(state, "task.md", _task_text(state))
-    _write_text(state, "environment.md", render_environment_context(state))
-    _write_text(state, "current_status.md", _repo_status_text(state))
-    _write_text(state, "current_diff.patch", _repo_diff_text(state))
-    _write_text(state, "current_diff.md", _repo_state_text(state))
-    _write_text(state, "last_failure.md", _last_failure_text(state))
-    _write_text(state, "observations.md", _observations_text(state))
-    _write_text(state, "transcript.md", _transcript_text(state))
-    _write_tool_docs(state)
-    _write_diff_docs(state)
-    _write_text(state, "history/compacted.md", _compacted_history_text(state))
-    _write_text(state, "history/summary.md", _compacted_history_text(state))
-    _write_text(state, "history/raw.jsonl", _raw_history_text(state))
-    index = _index_text(state)
-    _write_text(state, "INDEX.md", index)
+    helpers = _context_render_helpers(state)
+    specs = static_context_file_specs(helpers)
+    entries = [spec.index_entry() for spec in specs if spec.include_in_index]
+    entries.extend(
+        [
+            ContextIndexEntry(
+                path="context/tools/INDEX.md",
+                section="Recovery",
+                description="recovery notes for available tool output files.",
+            ),
+            ContextIndexEntry(
+                path="context/diffs/INDEX.md",
+                section="Recovery",
+                description="mutation diff artifacts copied into ContextFS.",
+            ),
+        ]
+    )
+    for optional in OPTIONAL_CONTEXT_FILE_RELS:
+        if (state.output_dir / optional).exists():
+            entries.append(
+                ContextIndexEntry(
+                    path=optional,
+                    section="Recovery",
+                    description="run-scoped working todo state.",
+                )
+            )
+    for spec in specs:
+        _write_text(state, spec.rel, spec.render(state))
+    for rendered in (*render_tool_docs(state, helpers), *render_diff_docs(state, helpers)):
+        _write_text(state, rendered.rel, rendered.content)
+    index = render_context_index(state, entries, helpers)
+    _write_text(state, "context/INDEX.md", index)
     return contextfs_index_path(state)
 
 
 def _write_text(state: "RunState", relative: str, content: str) -> None:
-    path = state.output_dir / CONTEXT_DIR / relative
+    rel = Path(relative)
+    if not rel.parts or rel.parts[0] != CONTEXT_DIR:
+        rel = Path(CONTEXT_DIR) / rel
+    path = state.output_dir / rel
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content)
 
 
-def _task_text(state: "RunState") -> str:
-    return "\n".join(
-        [
-            "# Task",
-            "",
-            state.task,
-            "",
-            f"run_id: {state.run_id}",
-            f"status: {state.status}",
-            f"turn_count: {state.turn_count}",
-            f"tool_call_count: {state.tool_call_count}",
-            "",
-        ]
+def _context_render_helpers(state: "RunState") -> ContextRenderHelpers:
+    return ContextRenderHelpers(
+        context_ref=context_display_ref,
+        safe_recovery_artifact_ref=lambda artifact: _safe_recovery_artifact_ref(state, artifact),
+        primary_tool_artifact=_primary_tool_artifact,
+        safe_transcript_refs=lambda refs: _safe_transcript_refs(state, refs),
+        sanitize_value=lambda value: _sanitize_context_value(state, value),
+        sanitize_data=lambda value: _sanitize_context_data(state, value),
+        repo_status_text=lambda: _repo_status_text(state),
+        repo_diff_text=lambda: _repo_diff_text(state),
+        raw_history_text=lambda: _raw_history_text(state),
+        safe_artifact_name=safe_artifact_name,
+        diff_artifact_targets=lambda: _diff_artifact_targets(state),
     )
-
-
-def _repo_state_text(state: "RunState") -> str:
-    return "\n".join(["# Current Repo State", "", _repo_status_text(state), "", "## Current Diff", "", "```diff", _repo_diff_text(state).strip(), "```", ""])
 
 
 def _repo_status_text(state: "RunState") -> str:
@@ -172,102 +250,6 @@ def _repo_diff_text(state: "RunState") -> str:
         diff = _git(state, diff_args) or ""
     untracked = _untracked_diff_text(state)
     return _join_nonempty(diff, untracked)
-
-
-def _last_failure_text(state: "RunState") -> str:
-    for step in reversed(state.tool_steps):
-        if step.result.ok:
-            continue
-        artifact = _safe_recovery_artifact_ref(state, step.result.artifact_path or step.result.data.get("context_artifact") or step.result.data.get("output_artifact"))
-        readable_artifact = model_readable_path(state, artifact) if artifact else "(none)"
-        return "\n".join(
-            [
-                "# Last Failure",
-                "",
-                f"tool: {step.call.name}",
-                f"call_id: {step.call.id}",
-                f"failure_kind: {step.result.failure_kind or step.result.data.get('failure_kind') or 'unknown'}",
-                f"artifact: {readable_artifact}",
-                "",
-                "## Preview",
-                "",
-                "```text",
-                step.result.content_preview or step.result.output,
-                "```",
-                "",
-            ]
-        )
-    return "# Last Failure\n\nNo failing tool result yet.\n"
-
-
-def _index_text(state: "RunState") -> str:
-    task_path = model_readable_path(state, "context/task.md")
-    status_path = model_readable_path(state, "context/current_status.md")
-    diff_path = model_readable_path(state, "context/current_diff.patch")
-    environment_path = model_readable_path(state, "context/environment.md")
-    failure_path = model_readable_path(state, "context/last_failure.md")
-    observations_path = model_readable_path(state, "context/observations.md")
-    transcript_path = model_readable_path(state, "context/transcript.md")
-    tools_path = model_readable_path(state, "context/tools/INDEX.md")
-    diffs_path = model_readable_path(state, "context/diffs/INDEX.md")
-    compacted_path = model_readable_path(state, "context/history/compacted.md")
-    summary_path = model_readable_path(state, "context/history/summary.md")
-    raw_history_path = model_readable_path(state, "context/history/raw.jsonl")
-    lines = [
-        "# tinyagent ContextFS",
-        "",
-        "Read only what is needed. Large outputs are stored here to keep prompt context bounded.",
-        "",
-        "## Task",
-        f"- {task_path}: original task and current run state.",
-        "",
-        "## Current Repo State",
-        f"- {status_path}: latest git status and diff stat.",
-        f"- {diff_path}: latest git diff patch.",
-        f"- {environment_path}: cwd, shell, workspace, approvals, and sandbox metadata.",
-        "",
-        "## Recent Failures",
-        f"- {failure_path}: latest failing tool result, if any.",
-        "",
-        "## Recovery",
-        f"- {observations_path}: typed observations from tool results and harness events.",
-        f"- {transcript_path}: model and tool call/result pairing.",
-        f"- {tools_path}: recovery notes for available tool output files.",
-        f"- {diffs_path}: mutation diff artifacts copied into ContextFS.",
-        "",
-        "## Tool Outputs",
-    ]
-    if not state.tool_steps:
-        lines.append("- No tool outputs yet.")
-    else:
-        for step in state.tool_steps:
-            artifact = _safe_recovery_artifact_ref(state, step.result.artifact_path or step.result.data.get("context_artifact") or step.result.data.get("output_artifact"))
-            ok = "ok" if step.result.ok else "failed"
-            if artifact:
-                readable = model_readable_path(state, artifact)
-                lines.append(f"- {readable}: {step.call.name} `{step.call.id}` {ok}. Artifact id: `{artifact}`.")
-                for hint in step.result.read_hints:
-                    lines.append(f"  Suggested read: `{hint}`")
-            else:
-                lines.append(f"- {step.call.name} `{step.call.id}` {ok}: no artifact.")
-    lines.extend(
-        [
-            "",
-            "## History",
-            f"- {compacted_path}: latest compacted checkpoint summary, if any.",
-            f"- {summary_path}: latest compacted recovery summary.",
-            f"- {raw_history_path}: durable event log snapshot copied under ContextFS.",
-            "",
-        ]
-    )
-    return "\n".join(lines)
-
-
-def _compacted_history_text(state: "RunState") -> str:
-    if state.context_checkpoint.strip():
-        artifact = f"\n\nCheckpoint artifact: {state.context_checkpoint_artifact}" if state.context_checkpoint_artifact else ""
-        return f"# Compacted History\n\n{_sanitize_context_value(state, state.context_checkpoint).strip()}{_sanitize_context_value(state, artifact)}\n"
-    return "# Compacted History\n\nNo compaction checkpoint yet.\n"
 
 
 def _raw_history_text(state: "RunState") -> str:
@@ -300,102 +282,13 @@ def _raw_history_text(state: "RunState") -> str:
     return ""
 
 
-def _observations_text(state: "RunState") -> str:
-    lines = ["# Observations", ""]
-    if not state.observations:
-        lines.append("No observations recorded yet.")
-    for observation in state.observations:
-        refs = _safe_transcript_refs(state, observation.refs)
-        data = json.dumps(_sanitize_context_data(state, observation.data), sort_keys=True) if observation.data else "{}"
-        subject = _sanitize_context_value(state, observation.subject)
-        lines.extend(
-            [
-                f"## {observation.kind}: {subject}",
-                "",
-                _sanitize_context_value(state, observation.summary),
-                "",
-                f"refs: {refs}",
-                f"data: `{data}`",
-                "",
-            ]
-        )
-    return "\n".join(lines) + "\n"
-
-
-def _transcript_text(state: "RunState") -> str:
-    lines = ["# Transcript", ""]
-    if not state.transcript.items:
-        lines.append("No transcript items recorded yet.")
-    for item in state.transcript.items:
-        refs = _safe_transcript_refs(state, item.artifact_refs)
-        data = json.dumps(_sanitize_context_data(state, item.data), sort_keys=True) if item.data else "{}"
-        lines.extend(
-            [
-                f"## {item.kind}: {item.id}",
-                "",
-                f"turn_id: {item.turn_id or ''}",
-                f"model_call_id: {item.model_call_id or ''}",
-                f"tool_call_id: {item.tool_call_id or ''}",
-                f"tool_name: {item.tool_name or ''}",
-                f"summary: {_sanitize_context_value(state, item.summary)}",
-                f"refs: {refs}",
-                f"data: `{data}`",
-                "",
-            ]
-        )
-    return "\n".join(lines) + "\n"
-
-
-def _write_tool_docs(state: "RunState") -> None:
-    lines = ["# Tool Context", ""]
-    by_tool: dict[str, list[str]] = {}
-    for step in state.tool_steps:
-        artifact = _safe_recovery_artifact_ref(state, _primary_tool_artifact(step))
-        if not artifact:
-            continue
-        readable = model_readable_path(state, artifact)
-        by_tool.setdefault(step.call.name, []).append(f"- {readable}: `{step.call.id}` {'ok' if step.result.ok else 'failed'}")
-    for tool_name, description in _TOOL_CONTEXT_DESCRIPTIONS.items():
-        entries = by_tool.get(tool_name, ["- No readable output artifacts yet."])
-        tool_doc = "# Tool Output: " + tool_name + "\n\n" + description + "\n\n" + "\n".join(entries) + "\n"
-        _write_text(state, f"tools/{safe_artifact_name(tool_name)}.md", tool_doc)
-        lines.append(f"- {model_readable_path(state, f'context/tools/{safe_artifact_name(tool_name)}.md')}")
-    _write_text(state, "tools/INDEX.md", "\n".join(lines) + "\n")
-
-
-def _write_diff_docs(state: "RunState") -> None:
-    lines = ["# ContextFS Diffs", "", f"- {model_readable_path(state, 'context/current_diff.patch')}: latest aggregate workspace diff."]
-    seen: set[str] = set()
-    for artifact, target in _diff_artifact_targets(state):
-        if not artifact or artifact in seen:
-            continue
-        seen.add(artifact)
-        source = state.output_dir / artifact
-        if not source.exists():
-            continue
-        _write_text(state, target.removeprefix(f"{CONTEXT_DIR}/"), source.read_text(errors="replace"))
-        lines.append(f"- {model_readable_path(state, target)}: copied from `{artifact}`.")
-    _write_text(state, "diffs/INDEX.md", "\n".join(lines) + "\n")
-
-
-_TOOL_CONTEXT_DESCRIPTIONS = {
-    "read_file": "Workspace file reads. Long reads are artifact-backed under ContextFS.",
-    "read_context": "Safe ContextFS recovery reads for this run.",
-    "search_repo": "Repo search outputs. Captured search artifacts may be readable when recorded as safe tool output.",
-    "apply_patch": "Patch edit outputs and changed-file evidence.",
-    "str_replace_edit": "String replacement edit outputs and changed-file evidence.",
-    "write_file": "Whole-file write outputs and changed-file evidence.",
-    "shell": "Shell command outputs stored under ContextFS when long or otherwise artifact-backed.",
-}
-
-
 def _safe_transcript_refs(state: "RunState", refs: tuple[str, ...]) -> str:
     if not refs:
         return "(none)"
     safe = [_safe_recovery_artifact_ref(state, ref) for ref in refs]
     rendered = [ref for ref in safe if ref]
     if not rendered:
-        return "(internal artifacts not exposed through read_context)"
+        return "(internal artifacts not exposed through ContextFS)"
     return ", ".join(rendered)
 
 
@@ -406,7 +299,9 @@ def _safe_recovery_artifact_ref(state: "RunState", artifact: object) -> str | No
         return artifact
     if artifact.startswith("artifacts/context-checkpoint-") and artifact.endswith(".md") and _artifact_kind(state, artifact) == "context_checkpoint":
         return artifact
-    if artifact.startswith("artifacts/search-output-") and _artifact_kind(state, artifact) == "search_captured_output":
+    if artifact.startswith("artifacts/context-search-") and artifact.endswith(".txt") and _artifact_kind(state, artifact) == "context_search_output":
+        return artifact
+    if artifact.startswith("artifacts/context-read-") and artifact.endswith(".txt") and _artifact_kind(state, artifact) == "context_read_output":
         return artifact
     if artifact.startswith("artifacts/workspace-delta-") and _artifact_kind(state, artifact) == "workspace_delta":
         return artifact

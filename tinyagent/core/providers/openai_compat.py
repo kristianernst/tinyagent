@@ -12,7 +12,7 @@ from typing import Any
 
 from tinyagent.core.contracts import Tool
 from tinyagent.core.model_stream import ModelDelta, ProviderStreamEvent, parse_chat_completion, parse_chat_completion_chunk
-from tinyagent.core.models import ModelCapabilities, ProviderError
+from tinyagent.core.models import ModelCapabilities, ModelSpec, ProviderError
 from tinyagent.core.state import Message, ModelResponse, RunState
 
 
@@ -62,15 +62,24 @@ class OpenAICompatibleConfig:
 
 class OpenAICompatibleProvider:
     name = "openai-compatible"
+    adapter = "tinyagent.openai_compat.v1"
 
     def __init__(self, config: OpenAICompatibleConfig) -> None:
         self.config = config
+        self.model = config.model
         self.capabilities = ModelCapabilities(
             context_window=config.context_window,
             max_output_tokens=config.max_output_tokens,
             supports_tools=True,
             supports_parallel_tools=False,
             tool_protocol="chat_completions",
+        )
+        self.model_spec = ModelSpec(
+            provider=self.name,
+            model=config.model,
+            protocol="chat_completions",
+            adapter=self.adapter,
+            capabilities=self.capabilities,
         )
 
     @classmethod

@@ -51,6 +51,154 @@ def test_runtime_server_starts_run_streams_reconnects_and_reads_artifact(tmp_pat
         assert b"Fake run finished: runtime smoke" in final
 
 
+def test_runtime_api_accepts_tiny_pi_profile(tmp_path) -> None:
+    with _server(tmp_path) as base:
+        _request(base, "POST", "/api/runs", {"task": "profile smoke", "run_id": "run_profile_smoke", "profile": "tiny-pi"})
+        _wait_for_status(base, "run_profile_smoke", "completed")
+
+        events = _request(base, "GET", "/api/runs/run_profile_smoke/events.json")["events"]
+        started = next(event for event in events if event["type"] == "run.started")
+
+        assert started["data"]["profile"] == "tiny-pi"
+        assert started["data"]["tool_surface"] == "pi-minimal"
+        assert started["data"]["profile_visible_tools"] == ["read_file", "apply_patch", "shell"]
+
+
+def test_runtime_v1_single_workspace_run_events_artifacts_and_schema(tmp_path) -> None:
+    with _server(tmp_path) as base:
+        health = _request(base, "GET", "/v1/health")
+        assert health["healthy"] is True
+        assert health["schema_version"] == 1
+
+        openapi = _request(base, "GET", "/v1/openapi.json")
+        assert "Run" in openapi["components"]["schemas"]
+        assert "Event" in openapi["components"]["schemas"]
+        assert "Artifact" in openapi["components"]["schemas"]
+        assert "Approval" in openapi["components"]["schemas"]
+        assert "ErrorResponse" in openapi["components"]["schemas"]
+        event_stream = openapi["paths"]["/v1/runs/{run_id}/events"]["get"]["responses"]["200"]["content"]["text/event-stream"]
+        assert event_stream["x-itemSchema"]["$ref"] == "#/components/schemas/Event"
+
+        created = _request(base, "POST", "/v1/runs", {"task": "v1 single", "run_id": "run_v1_single"})
+        assert created["run"]["id"] == "run_v1_single"
+        assert created["events_url"] == "/v1/runs/run_v1_single/events"
+        _wait_for_status(base, "run_v1_single", "completed")
+
+        run = _request(base, "GET", "/v1/runs/run_v1_single")["run"]
+        assert run["workspace_id"] == ""
+        assert run["links"]["events"] == "/v1/runs/run_v1_single/events"
+
+        events = _request(base, "GET", "/v1/runs/run_v1_single/events.jsonl")
+        assert events["items"][0]["workspace_id"] == ""
+        assert any(event["type"] == "run.completed" for event in events["items"])
+
+        artifacts = _request(base, "GET", "/v1/runs/run_v1_single/artifacts")
+        assert any(item["path"] == "final.md" for item in artifacts["items"])
+        hidden = _request_error(
+            base,
+            "GET",
+            "/v1/runs/run_v1_single/artifacts/artifacts/model-response-0001.json",
+            expected=403,
+        )
+        assert hidden["error"]["code"] == "forbidden"
+        assert "artifact is not public" in hidden["error"]["message"]
+
+        created_turn = _request(
+            base,
+            "POST",
+            "/v1/runs",
+            {
+                "conversation_id": "conv_v1_single",
+                "turn_id": "turn_v1_single",
+                "task": "v1 single conversation",
+                "run_id": "run_v1_single_conversation",
+            },
+        )
+        assert created_turn["events_url"] == "/v1/runs/run_v1_single_conversation/events"
+        _wait_for_status(base, "run_v1_single_conversation", "completed")
+        turn_events = _request(base, "GET", "/v1/runs/run_v1_single_conversation/events.jsonl")
+        assert turn_events["items"][0]["conversation_id"] == "conv_v1_single"
+
+
+def test_runtime_v1_single_workspace_errors_use_shared_shape(tmp_path) -> None:
+    with _server(tmp_path) as base:
+        malformed = _raw_response(base, "POST", "/v1/runs", b"{", headers={"Content-Type": "application/json"})
+        assert malformed[0] == 400
+        payload = json.loads(malformed[1])
+        assert payload["error"]["code"] == "bad_request"
+        assert payload["error"]["request_id"].startswith("req_")
+
+        approvals = _request_error(base, "GET", "/v1/runs/missing/approvals", expected=404)
+        assert approvals["error"]["code"] == "run_not_found"
+        artifacts = _request_error(base, "GET", "/v1/runs/missing/artifacts", expected=404)
+        assert artifacts["error"]["code"] == "run_not_found"
+
+
+def test_product_runtime_server_profile_overrides_workspace_default(tmp_path) -> None:
+    home = ProductHome(tmp_path / "home")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = WorkspaceStore(home)
+    record = store.register(workspace)
+    assert record.default_profile == "tiny-coder"
+
+    try:
+        server = create_product_runtime_server(home, port=0, profile="tiny-pi")
+    except PermissionError as exc:
+        pytest.skip(f"localhost socket binding unavailable: {exc}")
+    try:
+        controller = server.product.controller_for_workspace(record.workspace_id)
+        assert controller.config.profile == "tiny-pi"
+    finally:
+        server.server_close()
+
+
+def test_product_runtime_server_explicit_tiny_coder_overrides_workspace_default(tmp_path) -> None:
+    home = ProductHome(tmp_path / "home")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = WorkspaceStore(home)
+    record = store.register(workspace)
+    record_path = home.workspaces_dir / record.workspace_id / "workspace.json"
+    payload = json.loads(record_path.read_text())
+    payload["default_profile"] = "tiny-pi"
+    record_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+    try:
+        server = create_product_runtime_server(home, port=0, profile="tiny-coder", profile_override=True)
+    except PermissionError as exc:
+        pytest.skip(f"localhost socket binding unavailable: {exc}")
+    try:
+        controller = server.product.controller_for_workspace(record.workspace_id)
+        assert controller.config.profile == "tiny-coder"
+    finally:
+        server.server_close()
+
+
+def test_runtime_legacy_artifact_route_blocks_hidden_artifacts(tmp_path) -> None:
+    with _server(tmp_path) as base:
+        _request(base, "POST", "/api/runs", {"task": "artifact boundary", "run_id": "run_artifact_boundary"})
+        _wait_for_status(base, "run_artifact_boundary", "completed")
+
+        final = _wait_for_artifact(base, "run_artifact_boundary", "final.md")
+        assert b"Fake run finished: artifact boundary" in final
+
+        for hidden in [
+            "artifacts/model-request-0001.json",
+            "artifacts/model-response-0001.json",
+            "artifacts/context-0001.md",
+            "artifacts/context-report-0001.md",
+            "context/INDEX.md",
+            "./artifacts/model-response-0001.json",
+            "artifacts/../artifacts/model-response-0001.json",
+        ]:
+            blocked = _request_error(base, "GET", f"/api/runs/run_artifact_boundary/artifacts/{hidden}", expected=403)
+            assert "artifact is not public" in blocked["error"]
+
+        escaped = _request_error(base, "GET", "/api/runs/run_artifact_boundary/artifacts/%2e%2e/events.jsonl", expected=400)
+        assert "escapes run" in escaped["error"]
+
+
 def test_runtime_default_sse_filters_internal_reasoning_but_keeps_surface_events(tmp_path) -> None:
     with _server(tmp_path, provider_factory=lambda _task: _InternalReasoningProvider()) as base:
         _request(base, "POST", "/api/runs", {"task": "stream private reasoning", "run_id": "run_private_stream"})
@@ -201,6 +349,153 @@ def test_product_runtime_lists_workspaces_and_scopes_conversations(tmp_path) -> 
         thread.join(timeout=5)
 
 
+def test_product_runtime_v1_workspace_run_events_artifacts_and_errors(tmp_path) -> None:
+    home = ProductHome(tmp_path / "home")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    record = WorkspaceStore(home).register(workspace, name="Workspace")
+    server = create_product_runtime_server(home, port=0, provider="fake", stream=True)
+    base = f"127.0.0.1:{server.server_port}"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        health = _request(base, "GET", "/v1/health")
+        assert health["healthy"] is True
+        assert health["schema_version"] == 1
+
+        workspaces = _request(base, "GET", "/v1/workspaces")
+        assert workspaces["items"][0]["workspace_id"] == record.workspace_id
+
+        created = _request(
+            base,
+            "POST",
+            "/v1/runs",
+            {"workspace_id": record.workspace_id, "task": "v1 smoke", "run_id": "run_v1_smoke"},
+        )
+        assert created["run"]["id"] == "run_v1_smoke"
+        assert created["events_url"] == f"/v1/runs/run_v1_smoke/events?workspace_id={record.workspace_id}"
+        _wait_for_status(base, "run_v1_smoke", "completed", workspace_id=record.workspace_id)
+
+        run = _request(base, "GET", f"/v1/runs/run_v1_smoke?workspace_id={record.workspace_id}")["run"]
+        assert run["workspace_id"] == record.workspace_id
+        assert run["links"]["events"] == f"/v1/runs/run_v1_smoke/events?workspace_id={record.workspace_id}"
+
+        events = _request(base, "GET", f"/v1/runs/run_v1_smoke/events.json?workspace_id={record.workspace_id}")
+        assert events["items"][0]["workspace_id"] == record.workspace_id
+        assert any(event["type"] == "run.completed" for event in events["items"])
+        events_jsonl = _request(base, "GET", f"/v1/runs/run_v1_smoke/events.jsonl?workspace_id={record.workspace_id}")
+        assert events_jsonl["items"][-1]["type"] == "run.completed"
+
+        artifacts = _request(base, "GET", f"/v1/runs/run_v1_smoke/artifacts?workspace_id={record.workspace_id}")
+        assert any(item["path"] == "final.md" for item in artifacts["items"])
+        assert not any(
+            item["path"].startswith(("artifacts/model-request", "artifacts/model-response", "artifacts/context", "context/"))
+            for item in artifacts["items"]
+        )
+        final = _wait_for_artifact(base, "run_v1_smoke", f"final.md?workspace_id={record.workspace_id}", prefix="/v1")
+        assert b"Fake run finished: v1 smoke" in final
+        for hidden_path in [
+            "artifacts/model-request-0001.json",
+            "artifacts/model-response-0001.json",
+            "artifacts/context-0001.md",
+            "artifacts/context-report-0001.md",
+            "context/INDEX.md",
+            "./artifacts/model-response-0001.json",
+            "artifacts/../artifacts/model-response-0001.json",
+        ]:
+            hidden = _request_error(
+                base,
+                "GET",
+                f"/v1/runs/run_v1_smoke/artifacts/{hidden_path}?workspace_id={record.workspace_id}",
+                expected=403,
+            )
+            assert hidden["error"]["code"] == "forbidden"
+            legacy_hidden = _request_error(
+                base,
+                "GET",
+                f"/api/runs/run_v1_smoke/artifacts/{hidden_path}?workspace_id={record.workspace_id}",
+                expected=403,
+            )
+            assert "artifact is not public" in legacy_hidden["error"]
+
+        duplicate = _request_error(
+            base,
+            "POST",
+            "/v1/runs",
+            {"workspace_id": record.workspace_id, "task": "v1 smoke", "run_id": "run_v1_smoke"},
+            expected=400,
+        )
+        assert duplicate["error"]["code"] == "already_exists"
+        unsupported = _request_error(
+            base,
+            "POST",
+            "/v1/runs",
+            {"workspace_id": record.workspace_id, "task": "bad", "profile": "ignored"},
+            expected=400,
+        )
+        assert unsupported["error"]["code"] == "bad_request"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_product_runtime_v1_can_start_conversation_run(tmp_path) -> None:
+    home = ProductHome(tmp_path / "home")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    record = WorkspaceStore(home).register(workspace, name="Workspace")
+    server = create_product_runtime_server(home, port=0, provider="fake", stream=True)
+    base = f"127.0.0.1:{server.server_port}"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        created = _request(
+            base,
+            "POST",
+            "/v1/runs",
+            {
+                "workspace_id": record.workspace_id,
+                "conversation_id": "conv_v1",
+                "turn_id": "turn_v1",
+                "task": "conversation v1",
+                "run_id": "run_v1_conversation",
+            },
+        )
+        assert created["run"]["id"] == "run_v1_conversation"
+        _wait_for_status(base, "run_v1_conversation", "completed", workspace_id=record.workspace_id)
+
+        events = _request(base, "GET", f"/v1/runs/run_v1_conversation/events.jsonl?workspace_id={record.workspace_id}")
+        assert events["items"][0]["conversation_id"] == "conv_v1"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_product_runtime_v1_missing_run_approvals_returns_error(tmp_path) -> None:
+    home = ProductHome(tmp_path / "home")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    record = WorkspaceStore(home).register(workspace, name="Workspace")
+    server = create_product_runtime_server(home, port=0, provider="fake", stream=True)
+    base = f"127.0.0.1:{server.server_port}"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        missing = _request_error(
+            base,
+            "GET",
+            f"/v1/runs/missing/approvals?workspace_id={record.workspace_id}",
+            expected=404,
+        )
+        assert missing["error"]["code"] == "run_not_found"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def test_runtime_retains_live_events_briefly_after_run_thread_exits(tmp_path) -> None:
     with _server(tmp_path) as base:
         _request(base, "POST", "/api/runs", {"task": "retention smoke", "run_id": "run_retention"})
@@ -241,17 +536,17 @@ def test_runtime_surface_stream_correlates_tool_events_by_tool_call_id(tmp_path)
         assert "context/" not in json.dumps(completed)
 
 
-def test_runtime_default_sse_redacts_read_context_paths(tmp_path) -> None:
-    with _server(tmp_path, provider_factory=lambda _task: _ReadContextProvider()) as base:
-        _request(base, "POST", "/api/runs", {"task": "read context", "run_id": "run_read_context_surface"})
-        _wait_for_status(base, "run_read_context_surface", "completed")
+def test_runtime_default_sse_redacts_context_read_paths(tmp_path) -> None:
+    with _server(tmp_path, provider_factory=lambda _task: _ContextReadProvider()) as base:
+        _request(base, "POST", "/api/runs", {"task": "read context", "run_id": "run_context_read_surface"})
+        _wait_for_status(base, "run_context_read_surface", "completed")
 
-        events = _sse(base, "/api/runs/run_read_context_surface/events")
+        events = _sse(base, "/api/runs/run_context_read_surface/events")
 
         completed = next(
             event
             for event in events
-            if event["type"] == "tool.execution.completed" and event["data"].get("tool") == "read_context"
+            if event["type"] == "tool.execution.completed" and event["data"].get("tool") == "context_read"
         )
         payload = json.dumps(completed)
         assert "context/" not in payload
@@ -358,9 +653,19 @@ def test_runtime_cancelled_approval_cannot_be_late_approved(tmp_path) -> None:
             expected=404,
         )
         summary = _wait_for_status(base, "run_cancel_approval", "cancelled")
+        events = _request(base, "GET", "/api/runs/run_cancel_approval/events.json")["events"]
+        approval_step_closures = [
+            event
+            for event in events
+            if event["type"] in {"step.completed", "step.failed", "step.cancelled", "step.timeout", "step.idle_timeout"}
+            and event["data"].get("step_kind") == "approval_wait"
+        ]
+        resolution = next(event for event in events if event["type"] == "approval.resolved")
 
         assert late["resolved"] is False
         assert summary["status"] == "cancelled"
+        assert [event["type"] for event in approval_step_closures] == ["step.cancelled"]
+        assert resolution["data"]["decision"] == "cancelled"
 
 
 class _server:
@@ -447,6 +752,16 @@ def _raw(base: str, method: str, path: str, headers: dict[str, str] | None = Non
         conn.close()
 
 
+def _raw_response(base: str, method: str, path: str, body: bytes, headers: dict[str, str] | None = None) -> tuple[int, bytes]:
+    conn = http.client.HTTPConnection(base, timeout=10)
+    try:
+        conn.request(method, path, body, headers=headers or {})
+        response = conn.getresponse()
+        return response.status, response.read()
+    finally:
+        conn.close()
+
+
 def _sse(base: str, path: str, headers: dict[str, str] | None = None) -> list[dict]:
     raw = _raw(base, "GET", path, headers=headers).decode()
     events = []
@@ -493,13 +808,13 @@ def _wait_for_event(base: str, run_id: str, event_type: str, timeout: float = 10
     raise AssertionError(f"event {event_type} not seen for {run_id}")
 
 
-def _wait_for_artifact(base: str, run_id: str, path: str, timeout: float = 10) -> bytes:
+def _wait_for_artifact(base: str, run_id: str, path: str, timeout: float = 10, *, prefix: str = "/api") -> bytes:
     deadline = time.monotonic() + timeout
     last_error = b""
     while time.monotonic() < deadline:
         conn = http.client.HTTPConnection(base, timeout=10)
         try:
-            conn.request("GET", f"/api/runs/{run_id}/artifacts/{path}")
+            conn.request("GET", f"{prefix}/runs/{run_id}/artifacts/{path}")
             response = conn.getresponse()
             data = response.read()
             if response.status < 400:
@@ -540,8 +855,8 @@ class _InternalReasoningProvider:
         yield ModelDelta(kind="completed", data={"finish_reason": "stop"})
 
 
-class _ReadContextProvider:
-    name = "read-context"
+class _ContextReadProvider:
+    name = "context-read"
 
     def __init__(self) -> None:
         self.calls = 0
@@ -551,6 +866,6 @@ class _ReadContextProvider:
         self.calls += 1
         if self.calls == 1:
             return ModelResponse(
-                tool_calls=(ToolCall(id="call_read_context", name="read_context", args={"path": "context/INDEX.md"}),)
+                tool_calls=(ToolCall(id="call_context_read", name="context_read", args={"ref": "contextfs:context/INDEX.md"}),)
             )
         return ModelResponse(content="read context done", finish_reason="stop")

@@ -1,14 +1,25 @@
-"""Minimal explicit extension host over hooks and tools."""
+"""Minimal explicit extension host over hooks, tools, skills, and context sources."""
 
 from __future__ import annotations
 
 import importlib.util
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from tinyagent.core.context_sources import ContextSource
 from tinyagent.core.contracts import Tool
 from tinyagent.core.hooks import TinyHook
+from tinyagent.core.skills import SkillSource
+
+
+@dataclass(frozen=True)
+class ExtensionInfo:
+    name: str
+    version: str = ""
+    description: str = ""
+    permissions: tuple[str, ...] = ()
 
 
 class Extension(Protocol):
@@ -17,6 +28,10 @@ class Extension(Protocol):
     def hooks(self) -> Sequence[TinyHook]: ...
 
     def tools(self) -> Sequence[Tool]: ...
+
+    def skills(self) -> Sequence[SkillSource]: ...
+
+    def context_sources(self) -> Sequence[ContextSource]: ...
 
 
 class ExtensionHost:
@@ -38,6 +53,43 @@ class ExtensionHost:
             if callable(method):
                 tools.extend(method())
         return tuple(tools)
+
+    def skills(self) -> tuple[SkillSource, ...]:
+        sources: list[SkillSource] = []
+        for extension in self.extensions:
+            method = getattr(extension, "skills", None)
+            if callable(method):
+                sources.extend(method())
+        return tuple(sources)
+
+    def context_sources(self) -> tuple[ContextSource, ...]:
+        sources: list[ContextSource] = []
+        for extension in self.extensions:
+            method = getattr(extension, "context_sources", None)
+            if callable(method):
+                sources.extend(method())
+        return tuple(sources)
+
+    def info(self) -> tuple[ExtensionInfo, ...]:
+        info: list[ExtensionInfo] = []
+        for extension in self.extensions:
+            method = getattr(extension, "info", None)
+            if callable(method):
+                try:
+                    declared = method()
+                except Exception as exc:
+                    info.append(
+                        ExtensionInfo(
+                            name=str(getattr(extension, "name", type(extension).__name__)),
+                            description=f"extension info unavailable: {exc}",
+                        )
+                    )
+                    continue
+                if isinstance(declared, ExtensionInfo):
+                    info.append(declared)
+                    continue
+            info.append(ExtensionInfo(name=str(getattr(extension, "name", type(extension).__name__))))
+        return tuple(info)
 
 
 def load_extension_file(path: Path) -> Extension:

@@ -10,18 +10,19 @@ from types import SimpleNamespace
 import pytest
 
 from tinyagent.core.context import BuiltContext, ContextConfig, estimate_messages_tokens, estimate_tools_tokens
+from tinyagent.core.context_sources import ContextReadTool
 from tinyagent.core.contextfs import read_hints, refresh_contextfs
-from tinyagent.evals.metrics import evaluate_thresholds, extract_run_metrics
 from tinyagent.core.kernel import Kernel
 from tinyagent.core.models import FakeModelProvider
 from tinyagent.core.observations import Observation
 from tinyagent.core.output import write_text_artifact
 from tinyagent.core.policy import LocalPolicy, PolicyConfig, PolicyRule
 from tinyagent.core.profiles import ApexCoderProfile
-from tinyagent.runtime.run_graph import fork_run
 from tinyagent.core.sdk import Agent
 from tinyagent.core.state import Message, ModelResponse, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, ToolStep, Workspace
-from tinyagent.core.tools import ReadContextTool, ShellTool, default_tools
+from tinyagent.core.tools import ShellTool, default_tools
+from tinyagent.evals.metrics import evaluate_thresholds, extract_run_metrics
+from tinyagent.runtime.run_graph import fork_run
 
 
 class RecordingModel:
@@ -130,7 +131,7 @@ def test_observations_classify_patch_diff_verification_and_policy(tmp_path) -> N
         model=FakeModelProvider(
             [
                 ModelResponse(tool_calls=(ToolCall(name="read_file", args={"path": "hello.py"}),)),
-                ModelResponse(tool_calls=(ToolCall(name="search_repo", args={"query": "test_ok"}),)),
+                ModelResponse(tool_calls=(ToolCall(name="search_code", args={"query": "test_ok"}),)),
                 ModelResponse(tool_calls=(ToolCall(name="apply_patch", args={"patch": patch}),)),
                 ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "git diff --no-index hello.py hello.py"}),)),
                 ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": f"{sys.executable} -m pytest hello.py"}),)),
@@ -161,7 +162,6 @@ def test_contextfs_recovery_files_expose_task_diff_observations_transcript_and_t
     (tmp_path / ".env").write_text("TOKEN=secret-contextfs\n")
     state = RunState.create("recover contextfs state", Workspace(tmp_path), run_id="run_contextfs_recovery")
     state.output_dir.mkdir(parents=True, exist_ok=True)
-    search_output = write_text_artifact(state, "search-output-call_search.txt", "generated.txt:1:hello contextfs\n", kind="search_captured_output")
     delta = write_text_artifact(state, "workspace-delta-0001.patch", "diff --git a/generated.txt b/generated.txt\n", kind="workspace_delta")
     state.emit("diff.snapshot", {"tool_call_id": "call_shell", "path": delta, "paths": ["generated.txt"]})
     state.emit("command.completed", {"cmd": f"{sys.executable} -m unittest discover -s .", "ok": True, "returncode": 0})
@@ -173,13 +173,12 @@ def test_contextfs_recovery_files_expose_task_diff_observations_transcript_and_t
             Observation(kind="sandbox_block", subject="filesystem", summary="Filesystem write was blocked by sandbox.", data={"capability": "filesystem", "source": "sandbox"}),
         ]
     )
-    search_call = ToolCall(id="call_search", name="search_repo", args={"query": "hello contextfs"})
+    search_call = ToolCall(id="call_search", name="search_code", args={"query": "hello contextfs"})
     search_result = ToolResult(
-        tool_name="search_repo",
+        tool_name="search_code",
         call_id="call_search",
         output="generated.txt:1:hello contextfs",
-        artifact_path=search_output,
-        data={"output_artifact": search_output, "query": "hello contextfs"},
+        data={"query": "hello contextfs", "result_count": 1},
     )
     state.tool_steps.append(ToolStep(call=search_call, result=search_result))
     state.transcript.record_tool_call(
@@ -187,18 +186,17 @@ def test_contextfs_recovery_files_expose_task_diff_observations_transcript_and_t
         turn_id="turn-0001",
         model_call_id="model-call-0001",
         tool_call_id="call_search",
-        tool_name="search_repo",
+        tool_name="search_code",
         args={"query": "hello contextfs"},
     )
     state.transcript.record_tool_result(
         item_id="transcript-tool-result-0002",
         turn_id="turn-0001",
         tool_call_id="call_search",
-        tool_name="search_repo",
+        tool_name="search_code",
         ok=True,
         summary="generated.txt:1:hello contextfs",
         failure_kind=None,
-        artifact_refs=(search_output,),
     )
     (state.output_dir / "events.jsonl").write_text(
         json.dumps(
@@ -227,8 +225,9 @@ def test_contextfs_recovery_files_expose_task_diff_observations_transcript_and_t
         "context/history/summary.md",
         "context/tools/INDEX.md",
         "context/tools/read_file.md",
-        "context/tools/read_context.md",
-        "context/tools/search_repo.md",
+        "context/tools/context_search.md",
+        "context/tools/context_read.md",
+        "context/tools/search_code.md",
         "context/tools/shell.md",
         "context/diffs/INDEX.md",
     ]:
@@ -248,25 +247,25 @@ def test_contextfs_recovery_files_expose_task_diff_observations_transcript_and_t
     transcript = (state.output_dir / "context" / "transcript.md").read_text()
     assert "tool_call_id:" in transcript
     assert "tool_result" in transcript
-    assert "artifacts/search-output" in (state.output_dir / "context" / "tools" / "search_repo.md").read_text()
+    assert "Workspace code and docs search results" in (state.output_dir / "context" / "tools" / "search_code.md").read_text()
 
-    reader = ReadContextTool()
+    reader = ContextReadTool()
     for relative in [
         "context/INDEX.md",
         "context/current_diff.patch",
         "context/observations.md",
         "context/transcript.md",
-        "context/tools/search_repo.md",
+        "context/tools/search_code.md",
     ]:
-        result = reader.run(ToolCall(name="read_context", args={"path": relative}), state)
+        result = reader.run(ToolCall(name="context_read", args={"ref": f"contextfs:{relative}"}), state)
         assert result.ok is True, result.output
 
 
-def test_read_context_safely_allows_recovery_artifacts_but_not_raw_model_artifacts(tmp_path) -> None:
+def test_context_read_safely_allows_recovery_artifacts_but_not_raw_model_artifacts(tmp_path) -> None:
     state = Kernel(
         model=FakeModelProvider(
             [
-                ModelResponse(tool_calls=(ToolCall(name="search_repo", args={"query": "needle"}),)),
+                ModelResponse(tool_calls=(ToolCall(name="search_code", args={"query": "needle"}),)),
                 ModelResponse(content="done", finish_reason="stop"),
             ]
         ),
@@ -278,17 +277,15 @@ def test_read_context_safely_allows_recovery_artifacts_but_not_raw_model_artifac
 
     state.output_dir.mkdir(parents=True, exist_ok=True)
     context_report = next(event.data["path"] for event in state.events if event.type == "artifact.created" and event.data["kind"] == "context_report")
-    search_output = next(event.data["path"] for event in state.events if event.type == "artifact.created" and event.data["kind"] == "search_captured_output")
-    reader = ReadContextTool()
+    reader = ContextReadTool()
 
-    assert reader.run(ToolCall(name="read_context", args={"path": "context/INDEX.md"}), state).ok is True
-    assert reader.run(ToolCall(name="read_context", args={"path": search_output}), state).ok is True
-    assert reader.run(ToolCall(name="read_context", args={"path": context_report}), state).ok is False
-    assert reader.run(ToolCall(name="read_context", args={"path": "events.jsonl"}), state).ok is False
-    assert reader.run(ToolCall(name="read_context", args={"path": "artifacts/model-response-0001.json"}), state).ok is False
+    assert reader.run(ToolCall(name="context_read", args={"ref": "contextfs:context/INDEX.md"}), state).ok is True
+    assert reader.run(ToolCall(name="context_read", args={"ref": f"contextfs:{context_report}"}), state).ok is False
+    assert reader.run(ToolCall(name="context_read", args={"ref": "contextfs:events.jsonl"}), state).ok is False
+    assert reader.run(ToolCall(name="context_read", args={"ref": "contextfs:artifacts/model-response-0001.json"}), state).ok is False
     forged_checkpoint = state.output_dir / "artifacts" / "context-checkpoint-9999.md"
     forged_checkpoint.write_text("forged checkpoint\n")
-    assert reader.run(ToolCall(name="read_context", args={"path": "artifacts/context-checkpoint-9999.md"}), state).ok is False
+    assert reader.run(ToolCall(name="context_read", args={"ref": "contextfs:artifacts/context-checkpoint-9999.md"}), state).ok is False
 
 
 def test_contextfs_diff_excludes_custom_output_dir_symlinks_and_large_files(tmp_path) -> None:
@@ -300,6 +297,10 @@ def test_contextfs_diff_excludes_custom_output_dir_symlinks_and_large_files(tmp_
     except OSError as exc:
         pytest.skip(f"symlink unavailable: {exc}")
     (tmp_path / "big.bin").write_bytes(b"x" * 1_000_001)
+    (tmp_path / ".env.local").write_text("TOKEN=env-local-secret\n")
+    (tmp_path / ".npmrc").write_text("//registry.example/:_authToken=npm-secret\n")
+    (tmp_path / ".ssh").mkdir()
+    (tmp_path / ".ssh" / "config").write_text("Host hidden-ssh-secret\n")
     output_dir = tmp_path / "run-output"
     state = RunState.create("custom output contextfs", Workspace(tmp_path), run_id="run_custom_output", output_dir=output_dir)
     state.output_dir.mkdir(parents=True, exist_ok=True)
@@ -313,18 +314,24 @@ def test_contextfs_diff_excludes_custom_output_dir_symlinks_and_large_files(tmp_
     assert "linked-secret.txt" not in diff
     assert "run-output" not in diff
     assert "run-output" not in status
+    assert "env-local-secret" not in diff
+    assert "npm-secret" not in diff
+    assert "hidden-ssh-secret" not in diff
+    assert ".env.local" not in status
+    assert ".npmrc" not in status
+    assert ".ssh" not in status
     assert "big.bin" in diff
     assert "Binary files /dev/null and b/big.bin differ" in diff
 
 
-def test_read_context_blocks_stale_context_files_not_generated_this_run(tmp_path) -> None:
+def test_context_read_blocks_stale_context_files_not_generated_this_run(tmp_path) -> None:
     state = RunState.create("stale context", Workspace(tmp_path), run_id="run_stale_context")
     stale = state.output_dir / "context" / "shell" / "0001-stale.txt"
     stale.parent.mkdir(parents=True, exist_ok=True)
     stale.write_text("stale-secret\n")
     refresh_contextfs(state)
 
-    result = ReadContextTool().run(ToolCall(name="read_context", args={"path": "context/shell/0001-stale.txt"}), state)
+    result = ContextReadTool().run(ToolCall(name="context_read", args={"ref": "contextfs:context/shell/0001-stale.txt"}), state)
 
     assert result.ok is False
     assert "not part of the current run recovery surface" in result.output
@@ -424,7 +431,7 @@ def test_contextfs_sanitizes_compacted_history(tmp_path) -> None:
 
     refresh_contextfs(state)
     compacted = (state.output_dir / "context" / "history" / "compacted.md").read_text()
-    checkpoint = ReadContextTool().run(ToolCall(name="read_context", args={"path": artifact}), state)
+    checkpoint = ContextReadTool().run(ToolCall(name="context_read", args={"ref": f"contextfs:{artifact}"}), state)
 
     assert "checkpoint-secret" not in compacted
     assert "artifacts/model-response-0001" not in compacted
@@ -452,6 +459,14 @@ def test_progress_guard_blocks_repeated_failed_command_before_policy_retry(tmp_p
     blocked = state.tool_steps[-1].result
     assert blocked.failure_kind == "progress_blocked"
     assert blocked.data["progress_blocked"] is True
+    blocked_call_id = state.tool_steps[-1].call.id
+    blocked_event_types = [
+        event.type
+        for event in state.events
+        if event.data.get("tool_call_id") == blocked_call_id and event.type.startswith("tool.execution.")
+    ]
+    assert blocked_event_types == ["tool.execution.failed", "tool.execution.blocked"]
+    assert any(event.type == "contextfs.index.updated" and event.data.get("tool_call_id") == blocked_call_id for event in state.events)
     assert any(observation.kind == "policy_block" for observation in state.observations)
 
 
@@ -531,6 +546,168 @@ def test_context_report_matches_final_model_request_after_hooks(tmp_path) -> Non
     assert request["messages"][-1]["content"] == "before model hook context"
 
 
+def test_hook_success_events_preserve_order_and_names(tmp_path) -> None:
+    seen = {}
+
+    class FirstHook:
+        name = "first-hook"
+
+        def on_run_start(self, state: RunState) -> None:
+            seen["first"] = state.run_id
+
+    class SecondHook:
+        name = 42
+
+        def on_run_start(self, state: RunState) -> None:
+            seen["second_after_first"] = seen.get("first") == state.run_id
+
+    state = Kernel(
+        model=FakeModelProvider([ModelResponse(content="done", finish_reason="stop")]),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        hooks=[FirstHook(), SecondHook()],
+        workspace_mode="current",
+    ).run("hook order", workspace=tmp_path, run_id="run_hook_order")
+
+    hook_events = [event for event in state.events if event.type.startswith("hook.")]
+    assert [(event.type, event.data) for event in hook_events] == [
+        ("hook.started", {"hook": "first-hook", "method": "on_run_start"}),
+        ("hook.completed", {"hook": "first-hook", "method": "on_run_start"}),
+        ("hook.started", {"hook": "42", "method": "on_run_start"}),
+        ("hook.completed", {"hook": "42", "method": "on_run_start"}),
+    ]
+    assert seen["second_after_first"] is True
+    types = [event.type for event in state.events]
+    assert types.index("hook.completed") < types.index("run.started")
+
+
+def test_before_model_call_tuple_return_is_applied_but_list_return_is_ignored(tmp_path) -> None:
+    tuple_workspace = tmp_path / "tuple"
+    list_workspace = tmp_path / "list"
+    tuple_workspace.mkdir()
+    list_workspace.mkdir()
+
+    class TupleHook:
+        name = "tuple-hook"
+
+        def before_model_call(self, state: RunState, messages, tools):
+            return [*messages, Message(role="user", content="tuple hook context")], tools[:1]
+
+    tuple_model = RecordingModel([ModelResponse(content="done", finish_reason="stop")])
+    tuple_state = Kernel(
+        model=tuple_model,
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        hooks=[TupleHook()],
+        workspace_mode="current",
+    ).run("tuple hook", workspace=tuple_workspace, run_id="run_tuple_hook")
+
+    assert tuple_state.failed is False
+    assert tuple_model.messages[0][-1].content == "tuple hook context"
+
+    class ListHook:
+        name = "list-hook"
+
+        def before_model_call(self, state: RunState, messages, tools):
+            return [[*messages, Message(role="user", content="list hook context")], tools[:1]]
+
+    list_model = RecordingModel([ModelResponse(content="done", finish_reason="stop")])
+    list_state = Kernel(
+        model=list_model,
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        hooks=[ListHook()],
+        workspace_mode="current",
+    ).run("list hook", workspace=list_workspace, run_id="run_list_hook")
+
+    assert list_state.failed is False
+    assert all(message.content != "list hook context" for message in list_model.messages[0])
+
+
+def test_hook_error_policy_record_continues_without_hook_completed(tmp_path) -> None:
+    class FailingHook:
+        name = "failing-record-hook"
+
+        def before_model_call(self, state: RunState, messages, tools):
+            raise RuntimeError("recorded hook failed")
+
+    class LaterHook:
+        name = "later-hook"
+
+        def before_model_call(self, state: RunState, messages, tools):
+            return [*messages, Message(role="user", content="later hook ran")], tools
+
+    model = RecordingModel([ModelResponse(content="done", finish_reason="stop")])
+    state = Kernel(
+        model=model,
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        hooks=[FailingHook(), LaterHook()],
+        hook_error_policy="record",
+        workspace_mode="current",
+    ).run("record hook failure", workspace=tmp_path, run_id="run_hook_record")
+
+    hook_events = [(event.type, event.data["hook"], event.data["method"]) for event in state.events if event.type.startswith("hook.")]
+    assert state.failed is False
+    assert "later hook ran" in [message.content for message in model.messages[0]]
+    assert ("hook.failed", "failing-record-hook", "before_model_call") in hook_events
+    assert ("hook.completed", "failing-record-hook", "before_model_call") not in hook_events
+    assert ("hook.completed", "later-hook", "before_model_call") in hook_events
+
+
+def test_after_model_response_hook_failure_fails_current_model_call(tmp_path) -> None:
+    class FailingHook:
+        name = "after-model-failing-hook"
+
+        def after_model_response(self, state: RunState, response: ModelResponse) -> ModelResponse:
+            raise RuntimeError("after model failed")
+
+    state = Kernel(
+        model=FakeModelProvider([ModelResponse(content="should fail", finish_reason="stop")]),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        hooks=[FailingHook()],
+        workspace_mode="current",
+    ).run("after model failure", workspace=tmp_path, run_id="run_after_model_hook_fail")
+
+    types = [event.type for event in state.events]
+    assert state.failed is True
+    assert "model.call.started" in types
+    assert "model.call.failed" in types
+    assert "run.failed" in types
+    assert types.index("hook.failed") < types.index("model.call.failed")
+    failed = next(event for event in state.events if event.type == "model.call.failed")
+    assert failed.data["reason"] == "hook after-model-failing-hook.after_model_response failed: after model failed"
+
+
+def test_before_finish_hook_receives_profile_decision_and_can_override(tmp_path) -> None:
+    class AllowFinishHook:
+        name = "allow-finish-hook"
+
+        def before_finish(self, state: RunState, response: ModelResponse, decision):
+            assert decision.allow is False
+            return type(decision).allowed()
+
+    call = ToolCall(name="shell", args={"cmd": "false"})
+    state = Kernel(
+        model=FakeModelProvider([ModelResponse(tool_calls=(call,)), ModelResponse(content="done", finish_reason="stop")]),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        hooks=[AllowFinishHook()],
+        workspace_mode="current",
+    ).run("override finish decision", workspace=tmp_path, run_id="run_before_finish_override")
+
+    assert state.failed is False
+    assert state.final_output == "done"
+    assert any(event.type == "hook.completed" and event.data["method"] == "before_finish" for event in state.events)
+
+
 def test_initial_model_context_includes_contextfs_index(tmp_path) -> None:
     model = RecordingModel([ModelResponse(content="done", finish_reason="stop")])
     state = Kernel(
@@ -544,7 +721,8 @@ def test_initial_model_context_includes_contextfs_index(tmp_path) -> None:
     assert state.failed is False
     first_request = model.messages[0]
     contextfs = next(message for message in first_request if message.meta.get("context_layer") == "contextfs_index")
-    assert ".tinyagent/runs/run_initial_contextfs/context/task.md" in contextfs.content
+    assert "context/task.md" in contextfs.content
+    assert ".tinyagent/runs/run_initial_contextfs" not in contextfs.content
 
 
 def test_finish_gate_blocks_edit_without_diff_or_verification(tmp_path) -> None:
@@ -635,6 +813,31 @@ def test_workspace_delta_ignores_contextfs_writes_for_read_only_tools(tmp_path) 
 
     assert state.failed is False
     assert not any(event.type == "workspace.mutation.detected" for event in state.events)
+    assert not any(event.type in {"diff.snapshot", "file.changed"} for event in state.events)
+
+
+def test_non_mutating_shell_dispatch_records_boundaries_without_detected_mutation(tmp_path) -> None:
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "printf ok"}),)),
+                ModelResponse(content="done", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    ).run("non-mutating shell", workspace=tmp_path, run_id="run_shell_no_delta")
+
+    assert state.failed is False
+    assert any(event.type == "workspace.mutation.planned" for event in state.events)
+    assert any(event.type == "workspace.mutation.started" for event in state.events)
+    assert any(event.type == "workspace.mutation.completed" for event in state.events)
+    assert any(event.type == "workspace.delta.started" for event in state.events)
+    assert any(event.type == "workspace.delta.completed" for event in state.events)
+    assert not any(event.type == "workspace.mutation.detected" for event in state.events)
+    assert not any(event.type in {"diff.snapshot", "file.changed"} for event in state.events)
 
 
 def test_workspace_delta_detects_edit_to_existing_untracked_git_file(tmp_path) -> None:
@@ -1147,6 +1350,25 @@ def test_eval_metrics_count_policy_denial_once(tmp_path) -> None:
     assert metrics.tool_error_count == 1
     assert metrics.tool_error_kinds["policy_denied"] == 1
     assert "unknown" not in metrics.tool_error_kinds
+    assert metrics.mcp_call_count == 0
+
+
+def test_eval_metrics_count_attempted_context_tools_before_execution(tmp_path) -> None:
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(name="context_search", args={"query": "hello"}),)),
+                ModelResponse(content="done", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        workspace_mode="current",
+    ).run("attempt context search", workspace=tmp_path, run_id="run_attempt_context_metric")
+
+    metrics = extract_run_metrics(state.output_dir)
+    assert metrics.context_search_count == 1
 
 
 def test_eval_metrics_treat_structured_reads_as_pre_edit_inspection(tmp_path) -> None:
@@ -1394,8 +1616,8 @@ def test_final_contextfs_raw_history_includes_run_completion(tmp_path) -> None:
 
 
 def test_hook_can_inject_context_and_block_tool(tmp_path) -> None:
-    class BlockingHook:
-        name = "blocking-hook"
+    class FirstBlockingHook:
+        name = "first-blocking-hook"
 
         def on_context(self, state: RunState, context: BuiltContext) -> BuiltContext:
             return replace(context, messages=[*context.messages, Message(role="user", content="hook context")])
@@ -1403,13 +1625,19 @@ def test_hook_can_inject_context_and_block_tool(tmp_path) -> None:
         def before_tool_call(self, state: RunState, call: ToolCall, decision: PolicyDecision) -> ToolResult:
             return ToolResult(tool_name=call.name, call_id=call.id, output="hook blocked", ok=False, failure_kind="policy_denied")
 
+    class SecondHook:
+        name = "second-hook"
+
+        def before_tool_call(self, state: RunState, call: ToolCall, decision: PolicyDecision) -> ToolCall:
+            raise AssertionError("second hook should not run after ToolResult")
+
     call = ToolCall(name="shell", args={"cmd": "printf should-not-run"})
     state = Kernel(
         model=FakeModelProvider([ModelResponse(tool_calls=(call,)), ModelResponse(content="blocked by hook", finish_reason="stop")]),
         profile=ApexCoderProfile(),
         tools=[ShellTool()],
         policy=LocalPolicy(),
-        hooks=[BlockingHook()],
+        hooks=[FirstBlockingHook(), SecondHook()],
         workspace_mode="current",
     ).run("hook test", workspace=tmp_path, run_id="run_hook_contract")
 
@@ -1417,17 +1645,31 @@ def test_hook_can_inject_context_and_block_tool(tmp_path) -> None:
     assert "command.started" not in [event.type for event in state.events]
     assert any(event.type == "hook.completed" and event.data["method"] == "on_context" for event in state.events)
     assert any(event.type == "tool.execution.blocked" for event in state.events)
+    assert not any(event.type == "tool.execution.started" for event in state.events)
+    assert not any(event.type == "approval.requested" for event in state.events)
+    assert not any(event.type.startswith("hook.") and event.data.get("hook") == "second-hook" for event in state.events)
     first_context = next(event for event in state.events if event.type == "model.call.started")
     assert "hook context" in (state.output_dir / first_context.data["context_artifact"]).read_text()
 
 
 def test_hook_mutated_tool_call_is_rechecked_by_policy(tmp_path) -> None:
+    seen_by_later_hook = {}
+
     class MutatingHook:
         name = "mutating-hook"
 
         def before_tool_call(self, state: RunState, call: ToolCall, decision: PolicyDecision) -> ToolCall:
             assert decision.allowed is True
             return ToolCall(name="shell", args={"cmd": "curl https://example.com"}, id=call.id)
+
+    class LaterHook:
+        name = "later-hook"
+
+        def before_tool_call(self, state: RunState, call: ToolCall, decision: PolicyDecision) -> None:
+            seen_by_later_hook["tool"] = call.name
+            seen_by_later_hook["cmd"] = call.args["cmd"]
+            seen_by_later_hook["decision_allowed"] = decision.allowed
+            return None
 
     call = ToolCall(name="shell", args={"cmd": "git diff -- README.md"})
     state = Kernel(
@@ -1440,15 +1682,39 @@ def test_hook_mutated_tool_call_is_rechecked_by_policy(tmp_path) -> None:
         profile=ApexCoderProfile(),
         tools=default_tools(),
         policy=LocalPolicy(),
-        hooks=[MutatingHook()],
+        hooks=[MutatingHook(), LaterHook()],
         workspace_mode="current",
     ).run("mutate tool", workspace=tmp_path, run_id="run_hook_policy_recheck")
 
     assert state.failed is False
+    assert seen_by_later_hook == {"tool": "shell", "cmd": "curl https://example.com", "decision_allowed": True}
     assert "command.started" not in [event.type for event in state.events]
     decisions = [event for event in state.events if event.type == "policy.evaluated"]
     assert [decision.data["kind"] for decision in decisions] == ["allow", "deny"]
     assert decisions[-1].data["permission"] == "network"
+
+
+def test_equal_tool_call_return_from_hook_does_not_trigger_policy_reevaluation(tmp_path) -> None:
+    class EqualReturnHook:
+        name = "equal-return-hook"
+
+        def before_tool_call(self, state: RunState, call: ToolCall, decision: PolicyDecision) -> ToolCall:
+            return replace(call)
+
+    call = ToolCall(name="shell", args={"cmd": "printf ok"})
+    state = Kernel(
+        model=FakeModelProvider([ModelResponse(tool_calls=(call,)), ModelResponse(content="done", finish_reason="stop")]),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+        hooks=[EqualReturnHook()],
+        workspace_mode="current",
+    ).run("equal hook return", workspace=tmp_path, run_id="run_equal_hook_return")
+
+    assert state.failed is False
+    decisions = [event for event in state.events if event.type == "policy.evaluated"]
+    assert len(decisions) == 1
+    assert decisions[0].data["kind"] == "allow"
 
 
 def test_hook_failure_fails_closed_by_default(tmp_path) -> None:
