@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from tinyagent.core.contracts import Tool
+from tinyagent.core.contracts import ProfileRuntimeCapabilities, Tool
 from tinyagent.core.events import Event
 from tinyagent.core.models import FakeModelProvider
 from tinyagent.core.policy import default_policy
@@ -15,8 +15,8 @@ from tinyagent.core.resources import ResourceLoader
 from tinyagent.core.run_control import CancelToken
 from tinyagent.core.state import Message, ModelResponse, PolicyDecision, RunState, ToolCall, ToolResult, Workspace
 from tinyagent.core.tools import default_tools
-from tinyagent.evals.runner import load_eval_cases, render_eval_comparison, render_eval_report, run_eval_comparison, run_eval_suite
 from tinyagent.evals.metrics import extract_run_metrics
+from tinyagent.evals.runner import load_eval_cases, render_eval_comparison, render_eval_report, run_eval_comparison, run_eval_suite
 from tinyagent.evals.variants import VariantSpec, validate_supported_eval_compare
 from tinyagent.runtime.run_record import load_run_record, render_run_inspection
 
@@ -232,7 +232,10 @@ def test_eval_comparison_profiles_surface_context_deltas(tmp_path) -> None:
         profile_factory=lambda config: profile_for(config.profile, visible_tool_names=config.visible_tools or None),
         tools_factory=lambda _config: default_tools(),
         policy_factory=lambda _config: default_policy(),
-        resources_factory=lambda config: ResourceLoader().load(suite, profile=config.profile),
+        resources_factory=lambda _config, profile: ResourceLoader().load(
+            suite,
+            runtime_capabilities=profile.runtime_capabilities,
+        ),
     )
 
     report = (output_dir / "comparison.md").read_text()
@@ -266,12 +269,53 @@ def test_eval_comparison_can_run_tiny_pi_variant_with_resources(tmp_path) -> Non
         profile_factory=lambda config: profile_for(config.profile, visible_tool_names=config.visible_tools or None),
         tools_factory=lambda _config: default_tools(),
         policy_factory=lambda _config: default_policy(),
-        resources_factory=lambda config: ResourceLoader().load(suite, profile=config.profile),
+        resources_factory=lambda _config, profile: ResourceLoader().load(
+            suite,
+            runtime_capabilities=profile.runtime_capabilities,
+        ),
     )
 
-    events = json.loads((Path(comparison.variants[0].results[0].run_path) / "events.jsonl").read_text().splitlines()[0])
-    assert events["data"]["profile"] == "tiny-pi"
-    assert events["data"]["profile_visible_tools"] == ["read_file", "apply_patch", "shell"]
+    result = comparison.variants[0].results[0]
+    events = [
+        json.loads(line)
+        for line in (Path(result.run_path) / "events.jsonl").read_text().splitlines()
+        if line
+    ]
+    started = next(event for event in events if event["type"] == "run.started")
+    context = next(event for event in events if event["type"] == "context.built")
+
+    assert started["data"]["profile"] == "tiny-pi"
+    assert started["data"]["profile_visible_tools"] == ["read_file", "apply_patch", "shell"]
+    assert context["data"]["visible_tools"] == ["read_file", "apply_patch", "shell"]
+    assert result.context_search_count == 0
+    assert result.search_code_count == 0
+    assert "contextfs.index.updated" not in [event["type"] for event in events]
+
+
+def test_eval_comparison_resource_factory_receives_resolved_profile(tmp_path) -> None:
+    suite = _write_suite(tmp_path)
+    seen: list[tuple[str, ProfileRuntimeCapabilities]] = []
+
+    class LeanProfile(ApexCoderProfile):
+        name = "lean-custom"
+        runtime_capabilities = ProfileRuntimeCapabilities(skills=False, dynamic_context=False, extensions=False)
+
+    comparison = run_eval_comparison(
+        suite,
+        output_dir=tmp_path / "compare-resolved-profile",
+        variants=[VariantSpec.parse("custom")],
+        model_factory=lambda _config, task: FakeModelProvider(_fake_eval_responses(task)),
+        profile_factory=lambda _config: LeanProfile(visible_tool_names=("read_file", "shell")),
+        tools_factory=lambda _config: default_tools(),
+        policy_factory=lambda _config: default_policy(),
+        resources_factory=lambda _config, profile: (
+            seen.append((profile.name, profile.runtime_capabilities))
+            or ResourceLoader().load(suite, runtime_capabilities=profile.runtime_capabilities)
+        ),
+    )
+
+    assert comparison.variants[0].results[0].success is True
+    assert seen == [("lean-custom", LeanProfile.runtime_capabilities)]
 
 
 def test_eval_metrics_treat_code_search_as_pre_edit_inspection(tmp_path) -> None:
@@ -292,7 +336,13 @@ def test_eval_metrics_time_to_first_tool_uses_model_tool_selection(tmp_path) -> 
     start = datetime(2026, 5, 8, tzinfo=UTC)
     events = [
         Event(type="run.started", run_id="run_metrics", seq=1, time=start),
-        Event(type="model.call.started", run_id="run_metrics", seq=2, time=start + timedelta(seconds=0.5), data={"model_call_id": "model-call-1"}),
+        Event(
+            type="model.call.started",
+            run_id="run_metrics",
+            seq=2,
+            time=start + timedelta(seconds=0.5),
+            data={"model_call_id": "model-call-1"},
+        ),
         Event(
             type="model.tool_call.assembly.completed",
             run_id="run_metrics",
@@ -300,10 +350,34 @@ def test_eval_metrics_time_to_first_tool_uses_model_tool_selection(tmp_path) -> 
             time=start + timedelta(seconds=1),
             data={"model_call_id": "model-call-1", "tool_call_id": "call-1", "tool": "shell"},
         ),
-        Event(type="model.call.completed", run_id="run_metrics", seq=4, time=start + timedelta(seconds=1.1), data={"model_call_id": "model-call-1"}),
-        Event(type="policy.evaluated", run_id="run_metrics", seq=5, time=start + timedelta(seconds=1.2), data={"tool_call_id": "call-1", "kind": "allow"}),
-        Event(type="tool.execution.started", run_id="run_metrics", seq=6, time=start + timedelta(seconds=2), data={"tool_call_id": "call-1"}),
-        Event(type="tool.execution.completed", run_id="run_metrics", seq=7, time=start + timedelta(seconds=10), data={"tool_call_id": "call-1", "ok": True}),
+        Event(
+            type="model.call.completed",
+            run_id="run_metrics",
+            seq=4,
+            time=start + timedelta(seconds=1.1),
+            data={"model_call_id": "model-call-1"},
+        ),
+        Event(
+            type="policy.evaluated",
+            run_id="run_metrics",
+            seq=5,
+            time=start + timedelta(seconds=1.2),
+            data={"tool_call_id": "call-1", "kind": "allow"},
+        ),
+        Event(
+            type="tool.execution.started",
+            run_id="run_metrics",
+            seq=6,
+            time=start + timedelta(seconds=2),
+            data={"tool_call_id": "call-1"},
+        ),
+        Event(
+            type="tool.execution.completed",
+            run_id="run_metrics",
+            seq=7,
+            time=start + timedelta(seconds=10),
+            data={"tool_call_id": "call-1", "ok": True},
+        ),
         Event(type="artifact.finalization.started", run_id="run_metrics", seq=8, time=start + timedelta(seconds=10.1)),
         Event(type="artifact.finalization.completed", run_id="run_metrics", seq=9, time=start + timedelta(seconds=10.2)),
         Event(type="run.completed", run_id="run_metrics", seq=10, time=start + timedelta(seconds=11)),

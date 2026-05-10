@@ -556,7 +556,14 @@ def test_runtime_default_sse_redacts_context_read_paths(tmp_path) -> None:
 
 def test_runtime_cancel_endpoint_stops_active_run(tmp_path) -> None:
     with _server(tmp_path) as base:
-        _request(base, "POST", "/api/runs", {"task": "sleep please", "run_id": "run_runtime_cancel"})
+        _request(base, "POST", "/api/runs", {"task": "sleep please", "run_id": "run_runtime_cancel", "approval_mode": "on-request"})
+        approval = _wait_for_event(base, "run_runtime_cancel", "approval.requested")
+        _request(
+            base,
+            "POST",
+            "/api/runs/run_runtime_cancel/approve",
+            {"approval_id": approval["data"]["approval_id"], "decision": "approved", "scope": "once"},
+        )
         _wait_for_event(base, "run_runtime_cancel", "tool.execution.started")
 
         cancelled = _request(base, "POST", "/api/runs/run_runtime_cancel/cancel", {"reason": "test_cancel"})

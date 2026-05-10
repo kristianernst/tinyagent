@@ -7,7 +7,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
-from tinyagent.core.events import utc_now
+from tinyagent.core.events import small_event_data, utc_now
 from tinyagent.core.state import Message, ModelResponse, RunState, ToolCall
 
 ModelDeltaKind = Literal[
@@ -167,7 +167,13 @@ def complete_model_call(
     except Exception as exc:
         state.emit(
             "model.tool_call.assembly.failed",
-            {"provider": model.name, "model_call_index": call_index, "reason": str(exc)},
+            {
+                "provider": model.name,
+                "model_call_id": state.current_model_call_id,
+                "model_call_index": call_index,
+                "reason": str(exc),
+                **trace.failure_context(),
+            },
             visibility="user",
         )
         raise
@@ -180,7 +186,7 @@ def complete_model_call(
                 "model_call_index": call_index,
                 "tool_call_id": call.id,
                 "tool": call.name,
-                "args": call.args,
+                "args": small_event_data(call.args),
             },
             visibility="user",
         )
@@ -332,14 +338,25 @@ def _record_model_delta(state: RunState, provider: str, delta: ModelDelta) -> No
                     },
                 )
         case "tool_call_args_delta":
+            data = {
+                "model_call_id": state.current_model_call_id,
+                "tool_call_id": delta.tool_call_id,
+                "tool": delta.data.get("name"),
+                "chars": len(delta.delta),
+            }
+            bounded = small_event_data({"delta": delta.delta})
+            if bounded.get("_truncated"):
+                data.update(
+                    {
+                        "delta_truncated": True,
+                        "delta_json_chars": bounded["json_chars"],
+                    }
+                )
+            else:
+                data["delta"] = delta.delta
             state.emit(
                 "model.tool_call.args.delta",
-                {
-                    "tool_call_id": delta.tool_call_id,
-                    "tool": delta.data.get("name"),
-                    "chars": len(delta.delta),
-                    "delta": delta.delta,
-                },
+                data,
                 durability="ephemeral",
             )
         case "usage":
@@ -399,6 +416,8 @@ class _StreamTraceState:
         self.tool_names: dict[str, str] = {}
         self.started_keys: set[str] = set()
         self.reasoning_seen = False
+        self.last_tool_call_id: str | None = None
+        self.last_tool_name: str | None = None
 
     def normalize(self, delta: ModelDelta) -> ModelDelta:
         if delta.kind in {"reasoning_summary_delta", "reasoning_visible_delta", "reasoning_encrypted"}:
@@ -419,6 +438,8 @@ class _StreamTraceState:
 
         resolved_id = self.tool_call_ids.get(key, delta.tool_call_id)
         resolved_name = self.tool_names.get(key)
+        self.last_tool_call_id = resolved_id
+        self.last_tool_name = resolved_name or self.last_tool_name
         data = dict(delta.data)
         if resolved_id and not data.get("id"):
             data["id"] = resolved_id
@@ -427,6 +448,14 @@ class _StreamTraceState:
         if first_seen:
             data["_first_seen"] = True
         return replace(delta, tool_call_id=resolved_id, data=data)
+
+    def failure_context(self) -> dict[str, str]:
+        data: dict[str, str] = {}
+        if self.last_tool_call_id:
+            data["tool_call_id"] = self.last_tool_call_id
+        if self.last_tool_name:
+            data["tool"] = self.last_tool_name
+        return data
 
 
 def _provider_tool_call_id(delta: ModelDelta) -> str:

@@ -240,6 +240,7 @@ VISIBILITY_DEBUG_LEVELS = {
     "debug": 1,
     "internal": 4,
 }
+MAX_EVENT_DATA_CHARS = 4_000
 
 
 def utc_now() -> datetime:
@@ -279,6 +280,18 @@ def json_safe(value: Any) -> Any:
     if isinstance(value, list | tuple):
         return [json_safe(item) for item in value]
     return repr(value)
+
+
+def small_event_data(data: dict[str, Any]) -> dict[str, Any]:
+    safe = json_safe(data)
+    encoded = json.dumps(safe, sort_keys=True)
+    if len(encoded) <= MAX_EVENT_DATA_CHARS:
+        return safe
+    return {
+        "_truncated": True,
+        "json_chars": len(encoded),
+        "preview": encoded[:MAX_EVENT_DATA_CHARS],
+    }
 
 
 @dataclass(frozen=True)

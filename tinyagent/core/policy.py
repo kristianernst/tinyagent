@@ -16,11 +16,12 @@ from tinyagent.core.tools import patch_paths, resolve_workspace_path
 
 
 class LocalPolicy:
-    """Classifier-first local policy for permissive workspace bash.
+    """Classifier-first local policy for bounded workspace bash.
 
     This is not a sandbox. Network, secrets, ContextFS/evidence writes,
     external redirects, repeated failures, and known destructive commands are
-    restricted before the default bash allow rule applies.
+    restricted before read-only and verification commands are allowed. Unknown
+    shell commands ask by default.
     """
 
     def __init__(self, *, allow_run_artifacts: bool = False, config: PolicyConfig | None = None) -> None:
@@ -222,6 +223,22 @@ class LocalPolicy:
                 risk="high",
                 command=cmd,
             )
+        workspace_write = _workspace_write_target(cmd, state)
+        if workspace_write:
+            return PolicyDecision.needs_approval(
+                f"shell command may write to workspace: {workspace_write}",
+                _approval_request(call, state, action_kind="shell", risk="medium", args_preview=cmd, command=cmd),
+                matched_rule="bash.workspace_write",
+                permission="bash",
+            )
+        read_only_mutation = _read_only_command_mutation(cmd)
+        if read_only_mutation:
+            return PolicyDecision.needs_approval(
+                f"read-only shell allowlist used with mutating option: {read_only_mutation}",
+                _approval_request(call, state, action_kind="shell", risk="medium", args_preview=cmd, command=cmd),
+                matched_rule="bash.read_only_mutation",
+                permission="bash",
+            )
         if _NETWORK_SHELL_PATTERN.search(lower):
             return self._decision(
                 call,
@@ -327,6 +344,17 @@ def _protected_output_write(cmd: str, state: RunState) -> str:
     return ""
 
 
+def _workspace_write_target(cmd: str, state: RunState) -> str:
+    for raw in _write_targets(cmd):
+        resolved = _resolve_shell_path(raw, state.workspace.root)
+        if state.workspace.contains(resolved):
+            return raw
+        envelope = state.workspace_envelope
+        if envelope is not None and envelope.contains(resolved):
+            return raw
+    return ""
+
+
 def _write_targets(cmd: str) -> list[str]:
     targets = [match.group("path").strip("'\"") for match in _WRITE_REDIRECT_PATTERN.finditer(cmd)]
     words = _shell_words(cmd)
@@ -358,6 +386,20 @@ def _is_protected_output_path(path: Path, state: RunState) -> bool:
     if any(_is_relative_to(path, root.resolve()) for root in protected_dirs):
         return True
     return path in {file.resolve() for file in protected_files}
+
+
+def _read_only_command_mutation(cmd: str) -> str:
+    words = _shell_words(cmd)
+    if not words:
+        return ""
+    command = Path(words[0]).name
+    if command == "sed" and any(word == "-i" or word.startswith("-i") for word in words[1:]):
+        return "sed -i"
+    if command == "git" and len(words) > 2 and words[1] == "diff" and any(
+        word == "--output" or word.startswith("--output=") for word in words[2:]
+    ):
+        return "git diff --output"
+    return ""
 
 
 def _protected_tinyagent_write(cmd: str) -> str:
@@ -571,13 +613,24 @@ def default_policy_config() -> PolicyConfig:
             PolicyRule("lsp", "*", "ask"),
             PolicyRule("working_memory", "run", "allow"),
             PolicyRule("working_memory", "files", "allow"),
+            PolicyRule("bash", "*", "ask"),
             PolicyRule("bash", "git status*", "allow"),
             PolicyRule("bash", "git diff*", "allow"),
+            PolicyRule("bash", "git log*", "allow"),
+            PolicyRule("bash", "git show*", "allow"),
+            PolicyRule("bash", "ls*", "allow"),
+            PolicyRule("bash", "pwd", "allow"),
             PolicyRule("bash", "rg *", "allow"),
             PolicyRule("bash", "sed *", "allow"),
+            PolicyRule("bash", "cat *", "allow"),
+            PolicyRule("bash", "head *", "allow"),
+            PolicyRule("bash", "tail *", "allow"),
+            PolicyRule("bash", "wc *", "allow"),
+            PolicyRule("bash", "pytest", "allow"),
             PolicyRule("bash", "pytest *", "allow"),
+            PolicyRule("bash", "uv run pytest", "allow"),
             PolicyRule("bash", "uv run pytest*", "allow"),
+            PolicyRule("bash", "npm test", "allow"),
             PolicyRule("bash", "npm test*", "allow"),
-            PolicyRule("bash", "*", "allow"),
         ),
     )

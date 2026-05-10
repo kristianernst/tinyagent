@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
-from tinyagent.app.product import ProductHome, workspace_id_for
 from tinyagent.core.index.rg import RgWorkspaceIndex
 from tinyagent.core.index.types import IndexHit, IndexMode, IndexStatus, SyncMode, SyncResult, WorkspaceIndex
 
@@ -16,15 +15,15 @@ class WorkspaceIndexManager:
         self.index_root = index_root
 
     @classmethod
-    def for_workspace(cls, root: Path, *, home: ProductHome | None = None) -> WorkspaceIndexManager:
-        product_home = home or ProductHome.from_env()
-        workspace_id = workspace_id_for(str(root.expanduser().resolve()))
-        return cls.for_workspace_id(workspace_id, home=product_home)
+    def for_workspace(cls, root: Path, *, index_root: Path | None = None) -> WorkspaceIndexManager:
+        del root
+        if index_root is not None:
+            index_root.mkdir(parents=True, exist_ok=True)
+        return cls(index=RgWorkspaceIndex(), index_root=index_root)
 
     @classmethod
-    def for_workspace_id(cls, workspace_id: str, *, home: ProductHome | None = None) -> WorkspaceIndexManager:
-        product_home = home or ProductHome.from_env()
-        index_root = product_home.workspaces_dir / workspace_id / "search"
+    def for_workspace_id(cls, workspace_id: str, *, index_root: Path) -> WorkspaceIndexManager:
+        del workspace_id
         index_root.mkdir(parents=True, exist_ok=True)
         return cls(index=RgWorkspaceIndex(), index_root=index_root)
 

@@ -4,8 +4,10 @@ import os
 
 import pytest
 
+from tinyagent.core.contracts import ProfileRuntimeCapabilities
 from tinyagent.core.extensions import ExtensionHost, ExtensionInfo
 from tinyagent.core.policy import LocalPolicy, PolicyConfig, PolicyRule
+from tinyagent.core.profile_catalog import DEFAULT_RUNTIME_CAPABILITIES, TINY_PI_RUNTIME_CAPABILITIES
 from tinyagent.core.resources import ResourceLoader, ResourceLoaderConfig
 from tinyagent.core.skills import DirectorySkillSource, SkillRegistry
 from tinyagent.core.skills.parser import MAX_SKILL_MARKDOWN_BYTES, parse_skill_markdown
@@ -73,25 +75,62 @@ def test_skill_registry_explicit_empty_sources_disables_discovery(tmp_path) -> N
 
 
 def test_resource_loader_no_discovery_and_tiny_pi_load_no_skill_sources(tmp_path) -> None:
-    assert ResourceLoader(ResourceLoaderConfig(no_discovery=True)).load(tmp_path, profile="tiny-coder").skill_sources == ()
-    assert ResourceLoader().load(tmp_path, profile="tiny-pi").skill_sources == ()
-    assert ResourceLoader().load(tmp_path, profile="tiny-coder").skill_sources
+    assert (
+        ResourceLoader(ResourceLoaderConfig(no_discovery=True))
+        .load(tmp_path, runtime_capabilities=DEFAULT_RUNTIME_CAPABILITIES)
+        .skill_sources
+        == ()
+    )
+    assert ResourceLoader().load(tmp_path, runtime_capabilities=TINY_PI_RUNTIME_CAPABILITIES).skill_sources == ()
+    assert ResourceLoader().load(tmp_path, runtime_capabilities=DEFAULT_RUNTIME_CAPABILITIES).skill_sources
+
+
+def test_resource_loader_can_use_resolved_runtime_capabilities(tmp_path) -> None:
+    extension_path = tmp_path / "extension.py"
+    extension_path.write_text("raise RuntimeError('should not load')\n")
+
+    resources = ResourceLoader(
+        ResourceLoaderConfig(memory_enabled=True, trust="trusted", extension_paths=(extension_path,))
+    ).load(
+        tmp_path,
+        runtime_capabilities=ProfileRuntimeCapabilities(skills=False, dynamic_context=False, extensions=False),
+    )
+
+    assert resources.skill_sources == ()
+    assert resources.context_sources == ()
+    assert resources.extensions == ()
+
+
+def test_resource_loader_skips_extension_loading_for_tiny_pi(tmp_path) -> None:
+    extension_path = tmp_path / "extension.py"
+    extension_path.write_text("raise RuntimeError('should not load')\n")
+
+    resources = ResourceLoader(ResourceLoaderConfig(trust="trusted", extension_paths=(extension_path,))).load(
+        tmp_path,
+        runtime_capabilities=TINY_PI_RUNTIME_CAPABILITIES,
+    )
+
+    assert resources.extensions == ()
 
 
 def test_resource_loader_extension_paths_require_trust_or_explicit_allowance(tmp_path) -> None:
     extension_path = tmp_path / "extension.py"
+    extension_path.write_text("raise RuntimeError('should not import untrusted extension')\n")
+
+    with pytest.raises(PermissionError, match="trusted workspace or explicit extension allowance"):
+        ResourceLoader(ResourceLoaderConfig(extension_paths=(extension_path,))).load(
+            tmp_path,
+            runtime_capabilities=DEFAULT_RUNTIME_CAPABILITIES,
+        )
+
     extension_path.write_text("class Extension:\n    name = 'local-ext'\n\nextension = Extension()\n")
-
-    with pytest.raises(PermissionError):
-        ResourceLoader(ResourceLoaderConfig(extension_paths=(extension_path,))).load(tmp_path, profile="tiny-coder")
-
     trusted = ResourceLoader(ResourceLoaderConfig(trust="trusted", extension_paths=(extension_path,))).load(
         tmp_path,
-        profile="tiny-coder",
+        runtime_capabilities=DEFAULT_RUNTIME_CAPABILITIES,
     )
     allowed = ResourceLoader(
         ResourceLoaderConfig(extension_paths=(extension_path,), allow_extension_paths=True)
-    ).load(tmp_path, profile="tiny-coder")
+    ).load(tmp_path, runtime_capabilities=DEFAULT_RUNTIME_CAPABILITIES)
 
     assert [extension.name for extension in trusted.extensions] == ["local-ext"]
     assert [extension.name for extension in allowed.extensions] == ["local-ext"]

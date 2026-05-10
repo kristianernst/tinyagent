@@ -9,8 +9,16 @@ from tinyagent.core.kernel import Kernel
 from tinyagent.core.models import FakeModelProvider
 from tinyagent.core.policy import LocalPolicy
 from tinyagent.core.profiles import ApexCoderProfile
-from tinyagent.core.state import Message, ModelResponse, RunState, ToolCall, ToolResult, ToolStep, Workspace
+from tinyagent.core.state import Message, ModelResponse, PolicyDecision, RunState, ToolCall, ToolResult, ToolStep, Workspace
 from tinyagent.core.tools import default_tools
+
+
+class WorkspaceShellPolicy(LocalPolicy):
+    def _evaluate_shell(self, call: ToolCall, state: RunState) -> PolicyDecision:
+        decision = super()._evaluate_shell(call, state)
+        if decision.kind == "needs_approval" and decision.permission == "bash":
+            return PolicyDecision.allow("test permits workspace shell", matched_rule="test.bash.allow", permission="bash")
+        return decision
 
 
 class RecordingModel:
@@ -118,13 +126,41 @@ def test_apex_context_layers_environment_agents_task_and_budgeted_tools(tmp_path
     assert "sandbox_mode: none" in environment
     assert "Prefer rg before grep." in built.messages[2].content
     assert built.messages[3].content == "Task:\ninspect and patch"
-    assert "mode: debug" in built.messages[4].content
+    assert "mode: verify" in built.messages[4].content
     assert "Use context_search" in built.messages[5].content
     recent = built.messages[-1].content
     assert "failed command" in recent
     assert "git status --short" in recent
     assert "Applied patch." in recent
     assert "older-noise" not in recent
+
+
+def test_apex_context_debug_mode_only_tracks_active_failures(tmp_path) -> None:
+    state = RunState.create("recover after transient failure", Workspace(tmp_path), run_id="run_context_recovery")
+    state.tool_steps.extend(
+        [
+            ToolStep(
+                call=ToolCall(name="shell", args={"cmd": "pytest"}),
+                result=ToolResult(tool_name="shell", output="failed", ok=False, data={"cmd": "pytest"}, exit_code=1),
+            ),
+            ToolStep(
+                call=ToolCall(name="shell", args={"cmd": "pytest"}),
+                result=ToolResult(tool_name="shell", output="passed", data={"cmd": "pytest"}, exit_code=0),
+            ),
+        ]
+    )
+    profile = ApexCoderProfile(context_config=ContextConfig(compact_at_tokens=999_999))
+
+    recovered = profile.plan_next_context(state)
+    state.tool_steps.append(
+        ToolStep(
+            call=ToolCall(name="shell", args={"cmd": "pytest"}),
+            result=ToolResult(tool_name="shell", output="failed again", ok=False, data={"cmd": "pytest"}, exit_code=1),
+        )
+    )
+
+    assert recovered.mode != "debug"
+    assert profile.plan_next_context(state).mode == "debug"
 
 
 def test_recent_tool_context_uses_stable_contextfs_refs_for_product_home_output(tmp_path) -> None:
@@ -182,6 +218,20 @@ def test_apex_context_includes_prior_conversation_before_current_task(tmp_path, 
 
 
 def test_kernel_compacts_at_turn_boundary_and_uses_checkpoint(tmp_path, monkeypatch) -> None:
+    on_context_saw_checkpoint: list[bool] = []
+    before_compact_seen_events: list[list[str]] = []
+
+    class CompactHook:
+        name = "compact-hook"
+
+        def before_compact(self, state: RunState) -> None:
+            before_compact_seen_events.append([event.type for event in state.events])
+
+        def on_context(self, state: RunState, context):
+            del state
+            on_context_saw_checkpoint.append(any("Context Checkpoint 1" in message.content for message in context.messages))
+            return context
+
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
@@ -196,7 +246,8 @@ def test_kernel_compacts_at_turn_boundary_and_uses_checkpoint(tmp_path, monkeypa
         model=model,
         profile=profile,
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=WorkspaceShellPolicy(),
+        hooks=[CompactHook()],
     )
 
     state = kernel.run("run a command then finish", workspace=tmp_path, run_id="run_compact")
@@ -212,6 +263,38 @@ def test_kernel_compacts_at_turn_boundary_and_uses_checkpoint(tmp_path, monkeypa
         "compaction.started",
         "checkpoint.completed",
     ]
+    types = [event.type for event in state.events]
+    compact_started = types.index("compaction.started")
+    hook_started = next(
+        index
+        for index, event in enumerate(state.events)
+        if event.type == "hook.started" and event.data["method"] == "before_compact"
+    )
+    hook_completed = next(
+        index
+        for index, event in enumerate(state.events)
+        if event.type == "hook.completed" and event.data["method"] == "before_compact"
+    )
+    checkpoint_completed = types.index("checkpoint.completed")
+    context_built_index = next(
+        index
+        for index, event_type in enumerate(types)
+        if index > checkpoint_completed and event_type == "context.built"
+    )
+    context_report_index = next(
+        index for index, event_type in enumerate(types) if index > context_built_index and event_type == "context.report.written"
+    )
+    model_started_index = next(
+        index
+        for index, event_type in enumerate(types)
+        if index > context_report_index and event_type == "model.call.started"
+    )
+    assert len(before_compact_seen_events) == 1
+    assert before_compact_seen_events[0][-2:] == ["compaction.started", "hook.started"]
+    assert "checkpoint.completed" not in before_compact_seen_events[0]
+    assert compact_started < hook_started < hook_completed < checkpoint_completed
+    assert checkpoint_completed < context_built_index < context_report_index < model_started_index
+    assert on_context_saw_checkpoint == [False, True]
     context_built = [event for event in state.events if event.type == "context.built"][-1]
     assert context_built.data["token_estimate"] == state.context_token_estimate
     assert context_built.data["checkpoint_artifact"] == state.context_checkpoint_artifact
@@ -245,7 +328,7 @@ def test_kernel_compacts_after_configured_tool_step_count(tmp_path, monkeypatch)
         model=model,
         profile=profile,
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=WorkspaceShellPolicy(),
     )
 
     state = kernel.run("compact after one tool step", workspace=tmp_path, run_id="run_compact_steps")

@@ -19,10 +19,16 @@ from tinyagent.core.context import (
     render_project_instructions,
     render_recent_tool_steps,
 )
-from tinyagent.core.context.checkpoint import is_test_command_text
 from tinyagent.core.context.builder import render_conversation_history, render_finish_gate_messages
+from tinyagent.core.context.checkpoint import is_test_command_text
 from tinyagent.core.context.instructions import load_project_instructions
 from tinyagent.core.contracts import Tool
+from tinyagent.core.profile_catalog import (
+    DEFAULT_PROFILE_NAMES,
+    DEFAULT_RUNTIME_CAPABILITIES,
+    TINY_PI_PROFILE_NAMES,
+    TINY_PI_RUNTIME_CAPABILITIES,
+)
 from tinyagent.core.state import FinishDecision, Message, ModelResponse, RunState, ToolStep
 
 PROFILE_ROOT = Path(__file__).resolve().parents[1] / "profiles"
@@ -54,6 +60,7 @@ class ApexCoderProfile:
         "apply_patch",
         "shell",
     )
+    runtime_capabilities = DEFAULT_RUNTIME_CAPABILITIES
 
     def __init__(
         self,
@@ -90,12 +97,13 @@ class ApexCoderProfile:
         )
 
     def plan_next_context(self, state: RunState) -> ContextPlan:
-        kinds = [observation.kind for observation in state.observations]
         edited_index = _latest_index(state.tool_steps, _is_successful_mutation)
         verification_index = _latest_index(state.tool_steps, _is_successful_verification)
         diff_index = _latest_index(state.tool_steps, _is_diff_inspection)
         latest_failed = _latest_index(state.tool_steps, lambda step: not step.result.ok)
-        if any(kind in {"test_failure", "command_failed"} for kind in kinds) or latest_failed is not None:
+        latest_recovery = max((index for index in (edited_index, verification_index, diff_index) if index is not None), default=None)
+        active_failure = latest_failed is not None and (latest_recovery is None or latest_failed > latest_recovery)
+        if active_failure:
             return ContextPlan(
                 mode="debug",
                 pinned_observation_kinds=frozenset({"test_failure", "command_failed", "file_changed", "policy_block"}),
@@ -217,6 +225,7 @@ class TinyPiProfile:
     skill_policy_name = "none"
     tool_surface_name = "pi-minimal"
     DEFAULT_VISIBLE_TOOL_NAMES = ("read_file", "apply_patch", "shell")
+    runtime_capabilities = TINY_PI_RUNTIME_CAPABILITIES
 
     def __init__(
         self,
@@ -364,9 +373,9 @@ def profile_for(
     context_config: ContextConfig | None = None,
 ):
     normalized = (name or "tiny-coder").strip().lower()
-    if normalized in {"tiny-coder", "default", "apex", "apex-coder"}:
+    if normalized in DEFAULT_PROFILE_NAMES:
         return ApexCoderProfile(visible_tool_names=visible_tool_names, context_config=context_config)
-    if normalized in {"tiny-pi", "pi", "minimal"}:
+    if normalized in TINY_PI_PROFILE_NAMES:
         return TinyPiProfile(visible_tool_names=visible_tool_names, context_config=context_config)
     raise ValueError(f"Unknown profile: {name}")
 

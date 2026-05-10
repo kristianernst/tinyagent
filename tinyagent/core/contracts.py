@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from tinyagent.core.model_stream import ModelDelta
@@ -26,6 +27,16 @@ class ModelProvider(Protocol):
 
 class StreamingModelProvider(ModelProvider, Protocol):
     def stream(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState) -> Iterable[ModelDelta]: ...
+
+
+@dataclass(frozen=True)
+class ProfileRuntimeCapabilities:
+    skills: bool = True
+    dynamic_context: bool = True
+    workspace_index: bool = True
+    extensions: bool = True
+    contextfs: bool = True
+    tool_names: tuple[str, ...] | None = None
 
 
 class Profile(Protocol):
