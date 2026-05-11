@@ -377,7 +377,10 @@ def main(argv: list[str] | None = None) -> int:
             profile=profile,
             tools=default_tools(),
             policy=default_policy(),
-            resources=ResourceLoader(ResourceLoaderConfig(memory_enabled=args.memory)).load(Path(args.workspace), profile=profile.name),
+            resources=ResourceLoader(ResourceLoaderConfig(memory_enabled=args.memory)).load(
+                Path(args.workspace),
+                runtime_capabilities=profile.runtime_capabilities,
+            ),
             approval_handler=_CliApprovalHandler() if args.approval_mode == "on-request" else None,
             stream=args.stream != "off",
             event_sink=_stream_sink(args.stream, debug_level),
@@ -516,7 +519,10 @@ def main(argv: list[str] | None = None) -> int:
                     profile=profile,
                     tools=default_tools(),
                     policy=default_policy(),
-                    resources=ResourceLoader(ResourceLoaderConfig(memory_enabled=args.memory)).load(args.suite_path, profile=profile.name),
+                    resources=ResourceLoader(ResourceLoaderConfig(memory_enabled=args.memory)).load(
+                        args.suite_path,
+                        runtime_capabilities=profile.runtime_capabilities,
+                    ),
                     stream=args.stream != "off",
                     event_sink=_stream_sink(args.stream, debug_level),
                     cancel_token=cancel_token,
@@ -648,7 +654,10 @@ def _main_eval_compare(argv: list[str]) -> int:
                 profile_factory=lambda config: profile_for(config.profile, visible_tool_names=config.visible_tools or None),
                 tools_factory=lambda _config: default_tools(),
                 policy_factory=lambda _config: default_policy(),
-                resources_factory=lambda config: ResourceLoader().load(args.suite_path, profile=config.profile),
+                resources_factory=lambda _config, profile: ResourceLoader().load(
+                    args.suite_path,
+                    runtime_capabilities=profile.runtime_capabilities,
+                ),
                 cancel_token=cancel_token,
             )
     except RunCancelled:

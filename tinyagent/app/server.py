@@ -95,7 +95,10 @@ class ProductRuntimeController:
                 sandbox_mode=self.sandbox_mode,
                 profile=self.profile if self.profile_override else record.default_profile,
                 conversation_store=ConversationStore(workspace_root_path / "conversations"),
-                workspace_index_manager=WorkspaceIndexManager.for_workspace_id(record.workspace_id, home=self.store.home),
+                workspace_index_manager=WorkspaceIndexManager.for_workspace_id(
+                    record.workspace_id,
+                    index_root=self.store.home.workspaces_dir / record.workspace_id / "search",
+                ),
                 mcp_config=mcp_config,
                 lsp_config=lsp_config,
                 todo_memory_enabled=self.todo_memory_enabled,

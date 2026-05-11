@@ -9,15 +9,24 @@ from tinyagent.core.evolution import accept_candidate, create_skill_experiment
 from tinyagent.core.kernel import Kernel
 from tinyagent.core.memory import MemoryStore, PersistentMemorySource
 from tinyagent.core.models import FakeModelProvider
-from tinyagent.core.policy import default_policy
+from tinyagent.core.policy import LocalPolicy, default_policy
+from tinyagent.core.profile_catalog import DEFAULT_RUNTIME_CAPABILITIES, TINY_PI_RUNTIME_CAPABILITIES
 from tinyagent.core.profiles import ApexCoderProfile
 from tinyagent.core.resources import ResourceLoader, ResourceLoaderConfig
 from tinyagent.core.skills import SkillRegistry
 from tinyagent.core.skills.drafts import draft_from_run, install_draft, list_drafts, reject_draft, show_draft
+from tinyagent.core.state import ModelResponse, PolicyDecision, RunState, ToolCall, Workspace
+from tinyagent.core.tools import default_tools
 from tinyagent.extensions.todo_memory import TodoMemoryExtension
 from tinyagent.extensions.todo_memory.tools import TodoWriteTool
-from tinyagent.core.state import ModelResponse, RunState, ToolCall, Workspace
-from tinyagent.core.tools import default_tools
+
+
+class WorkspaceShellPolicy(LocalPolicy):
+    def _evaluate_shell(self, call: ToolCall, state: RunState) -> PolicyDecision:
+        decision = super()._evaluate_shell(call, state)
+        if decision.kind == "needs_approval" and decision.permission == "bash":
+            return PolicyDecision.allow("test permits workspace shell", matched_rule="test.bash.allow", permission="bash")
+        return decision
 
 
 def test_skill_draft_generation_install_and_reject_from_successful_run(tmp_path) -> None:
@@ -45,7 +54,7 @@ def test_skill_draft_generation_install_and_reject_from_successful_run(tmp_path)
             ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=default_policy(),
+        policy=WorkspaceShellPolicy(),
         workspace_mode="current",
     ).run("Update hello.txt and verify pytest is available.", workspace=workspace, run_id="run_skill_draft")
 
@@ -193,8 +202,16 @@ def test_memory_files_are_explicit_and_optional_context_source(tmp_path) -> None
     assert (tmp_path / ".tinyagent" / "memory" / "project.md").read_text() == "Remember the websocket decision.\n"
     assert "memory:project" in searched.output
     assert "websocket decision" in read.output
-    assert ResourceLoader(ResourceLoaderConfig(memory_enabled=True)).load(tmp_path, profile="tiny-coder").context_sources
-    assert ResourceLoader(ResourceLoaderConfig(memory_enabled=True)).load(tmp_path, profile="tiny-pi").context_sources == ()
+    assert ResourceLoader(ResourceLoaderConfig(memory_enabled=True)).load(
+        tmp_path,
+        runtime_capabilities=DEFAULT_RUNTIME_CAPABILITIES,
+    ).context_sources
+    assert (
+        ResourceLoader(ResourceLoaderConfig(memory_enabled=True))
+        .load(tmp_path, runtime_capabilities=TINY_PI_RUNTIME_CAPABILITIES)
+        .context_sources
+        == ()
+    )
 
 
 def test_persistent_memory_and_todo_memory_sources_coexist(tmp_path) -> None:

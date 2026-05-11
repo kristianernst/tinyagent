@@ -331,7 +331,7 @@ def run_eval_comparison(
     stream: bool = False,
     event_sink: EventSink | None = None,
     cancel_token: CancelToken | None = None,
-    resources_factory: Callable[[RunConfig], LoadedResources | None] | None = None,
+    resources_factory: Callable[[RunConfig, Profile], LoadedResources | None] | None = None,
 ) -> EvalComparison:
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -352,11 +352,12 @@ def run_eval_comparison(
             "suite_path": str(suite_path_resolved),
             "suite_hash": _suite_hash(suite_path_resolved),
         }
+        profile = profile_factory(config)
         run = run_eval_suite(
             suite_path,
             output_dir=variant_dir,
             model_factory=lambda task, config=config: model_factory(config, task),
-            profile=profile_factory(config),
+            profile=profile,
             tools=tools_factory(config),
             policy=policy_factory(config),
             stream=stream,
@@ -368,7 +369,7 @@ def run_eval_comparison(
             variant_name=variant.name,
             variant_metadata=metadata,
             run_id_prefix=variant.name,
-            resources=resources_factory(config) if resources_factory is not None else None,
+            resources=resources_factory(config, profile) if resources_factory is not None else None,
         )
         runs.append(run)
         if cancel_token is not None and cancel_token.cancelled:
@@ -405,7 +406,9 @@ def render_eval_comparison(comparison: EvalComparison) -> str:
             "",
             "## Profile Metrics",
             "",
-            "| Variant | Profile | Visible tools | Solve | Validation | Static prompt tok | Tool schema tok | Context tok | Model calls | Tool calls | Repeated cmds | Diff after edit | Verification after edit | Finish blocks | Policy | Approvals | Invariants |",
+            "| Variant | Profile | Visible tools | Solve | Validation | Static prompt tok | Tool schema tok | "
+            "Context tok | Model calls | Tool calls | Repeated cmds | Diff after edit | Verification after edit | "
+            "Finish blocks | Policy | Approvals | Invariants |",
             "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )

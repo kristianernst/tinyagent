@@ -26,6 +26,7 @@ def check_event_invariants(events: Sequence[Event]) -> list[str]:
     _check_model_calls(events, failures)
     _check_tool_calls(events, failures)
     _check_workspace_deltas(events, failures)
+    _check_workspace_mutations(events, failures)
     _check_approvals(events, failures)
     _check_artifacts(events, failures)
     _check_finalization(events, failures)
@@ -108,20 +109,54 @@ def _check_model_calls(events: Sequence[Event], failures: list[str]) -> None:
     active: dict[str, Event] = {}
     started_seq: dict[str, int] = {}
     assembly_seq: dict[str, int] = {}
+    assembly_counts: dict[str, int] = {}
+    terminal_seq: dict[str, int] = {}
     for event in events:
         model_call_id = _string(event.data.get("model_call_id"))
-        if not model_call_id:
-            continue
         if event.type == "model.call.started":
+            if not model_call_id:
+                failures.append("model.call.started missing model_call_id")
+                continue
             active[model_call_id] = event
             started_seq[model_call_id] = event.seq
         elif event.type == "model.tool_call.assembly.completed":
+            tool_call_id = _string(event.data.get("tool_call_id"))
+            tool = _string(event.data.get("tool"))
+            if not model_call_id:
+                failures.append(f"model tool assembly completed missing model_call_id: {tool_call_id or '(missing tool_call_id)'}")
+                continue
+            malformed = False
+            if not tool_call_id:
+                failures.append(f"model tool assembly completed missing tool_call_id: {model_call_id}")
+                malformed = True
+            if not tool:
+                failures.append(f"model tool assembly completed missing tool: {tool_call_id or model_call_id}")
+                malformed = True
+            if "args" not in event.data:
+                failures.append(f"model tool assembly completed missing args: {tool_call_id or model_call_id}")
+                malformed = True
             if model_call_id not in started_seq:
                 failures.append(f"model tool assembly without model start: {model_call_id}")
-            assembly_seq[_tool_call_key(event)] = event.seq
+            if not malformed:
+                assembly_counts[model_call_id] = assembly_counts.get(model_call_id, 0) + 1
+            key = _tool_call_key(event)
+            assembly_seq.setdefault(key, event.seq)
         elif event.type in MODEL_TERMINALS:
+            if not model_call_id:
+                failures.append(f"{event.type} missing model_call_id")
+                continue
             if model_call_id not in started_seq:
                 failures.append(f"model terminal without start: {model_call_id}")
+            if event.type == "model.call.completed":
+                expected = event.data.get("tool_call_count")
+                if isinstance(expected, int):
+                    actual = assembly_counts.get(model_call_id, 0)
+                    if actual != expected:
+                        failures.append(
+                            f"model call tool_call_count mismatch: {model_call_id} "
+                            f"expected {expected}, saw {actual} completed assembly event(s)"
+                        )
+            terminal_seq[model_call_id] = event.seq
             active.pop(model_call_id, None)
     for event in events:
         if event.type != "tool.execution.started":
@@ -129,6 +164,9 @@ def _check_model_calls(events: Sequence[Event], failures: list[str]) -> None:
         key = _tool_call_key(event)
         if key and key in assembly_seq and assembly_seq[key] > event.seq:
             failures.append(f"tool execution started before model assembly completed: {key}")
+        model_call_id = _string(event.data.get("model_call_id"))
+        if key and model_call_id and terminal_seq.get(model_call_id, event.seq) > event.seq:
+            failures.append(f"tool execution started before model call completed: {key}")
     if active:
         failures.append(f"open model calls after event stream: {sorted(active)}")
 
@@ -141,6 +179,11 @@ def _check_tool_calls(events: Sequence[Event], failures: list[str]) -> None:
     terminal_seen: set[str] = set()
     terminal_without_start: dict[str, Event] = {}
     blocked_seen: set[str] = set()
+    output_snapshots = {
+        _tool_call_key(event): event.seq
+        for event in events
+        if event.type == "tool.execution.output.snapshot" and _tool_call_key(event)
+    }
     for event in events:
         tool_call_id = _string(event.data.get("tool_call_id"))
         if not tool_call_id:
@@ -163,6 +206,12 @@ def _check_tool_calls(events: Sequence[Event], failures: list[str]) -> None:
         elif event.type in TOOL_TERMINALS:
             if tool_call_id not in assembled_seq:
                 failures.append(f"tool execution terminal without model tool assembly: {tool_call_id}")
+            if event.type in {"tool.execution.completed", "tool.execution.failed"} and _tool_event_has_artifact_output(event):
+                snapshot_seq = output_snapshots.get(tool_call_id)
+                if snapshot_seq is None:
+                    failures.append(f"tool execution artifact output without snapshot: {tool_call_id}")
+                elif snapshot_seq > event.seq:
+                    failures.append(f"tool execution output snapshot after terminal: {tool_call_id}")
             if tool_call_id in terminal_seen:
                 failures.append(f"tool execution terminal appears more than once: {tool_call_id}")
             terminal_seen.add(tool_call_id)
@@ -184,7 +233,9 @@ def _check_tool_calls(events: Sequence[Event], failures: list[str]) -> None:
         if tool_call_id not in terminal_seen:
             failures.append(f"tool blocked without terminal result: {tool_call_id}")
     for tool_call_id, event in sorted(terminal_without_start.items()):
-        if tool_call_id not in blocked_seen and not event.data.get("blocked"):
+        if event.data.get("blocked") and tool_call_id not in blocked_seen:
+            failures.append(f"tool execution terminal marked blocked without blocked event: {tool_call_id}")
+        elif tool_call_id not in blocked_seen:
             failures.append(f"tool execution terminal without start: {tool_call_id}")
 
 
@@ -213,6 +264,43 @@ def _check_workspace_deltas(events: Sequence[Event], failures: list[str]) -> Non
                 active.pop(tool_call_id)
     if active:
         failures.append(f"open workspace deltas after event stream: {sorted(active)}")
+
+
+def _check_workspace_mutations(events: Sequence[Event], failures: list[str]) -> None:
+    planned: set[str] = set()
+    active: dict[str, Event] = {}
+    completed: set[str] = set()
+    for event in events:
+        tool_call_id = _string(event.data.get("tool_call_id"))
+        if event.type == "workspace.mutation.planned":
+            if not tool_call_id:
+                failures.append("workspace.mutation.planned missing tool_call_id")
+                continue
+            if tool_call_id in planned:
+                failures.append(f"workspace mutation planned more than once: {tool_call_id}")
+            planned.add(tool_call_id)
+        elif event.type == "workspace.mutation.started":
+            if not tool_call_id:
+                failures.append("workspace.mutation.started missing tool_call_id")
+                continue
+            if tool_call_id not in planned:
+                failures.append(f"workspace mutation started without plan: {tool_call_id}")
+            if tool_call_id in active:
+                failures.append(f"workspace mutation started twice before completion: {tool_call_id}")
+            active[tool_call_id] = event
+        elif event.type == "workspace.mutation.completed":
+            if not tool_call_id:
+                failures.append("workspace.mutation.completed missing tool_call_id")
+                continue
+            if tool_call_id in completed:
+                failures.append(f"workspace mutation completed more than once: {tool_call_id}")
+            completed.add(tool_call_id)
+            if tool_call_id not in active:
+                failures.append(f"workspace mutation completed without start: {tool_call_id}")
+            else:
+                active.pop(tool_call_id)
+    if active:
+        failures.append(f"open workspace mutations after event stream: {sorted(active)}")
 
 
 def _check_approvals(events: Sequence[Event], failures: list[str]) -> None:
@@ -272,12 +360,18 @@ def _artifact_paths(event: Event) -> list[str]:
         value = event.data.get(key)
         if isinstance(value, str) and value:
             paths.append(value)
+    if event.type in _ARTIFACT_PATH_EVENTS:
+        value = event.data.get("path")
+        if isinstance(value, str) and value:
+            paths.append(value)
     paths.extend(_nested_artifact_paths(event.data))
     for ref in event.artifact_refs:
         if ref:
             paths.append(ref)
     return paths
 
+
+_ARTIFACT_PATH_EVENTS = frozenset({"artifact.created", "artifact.materialized"})
 
 _ARTIFACT_PATH_KEYS = frozenset(
     {
@@ -293,7 +387,6 @@ _ARTIFACT_PATH_KEYS = frozenset(
         "logical_request_artifact",
         "output_artifact",
         "output_path",
-        "path",
         "request_artifact",
         "response_artifact",
         "summary_artifact",
@@ -324,6 +417,15 @@ def _path_escapes(path: str) -> bool:
 
 def _tool_call_key(event: Event) -> str:
     return _string(event.data.get("tool_call_id")) or ""
+
+
+def _tool_event_has_artifact_output(event: Event) -> bool:
+    if _string(event.data.get("artifact_path")):
+        return True
+    data = event.data.get("data")
+    return isinstance(data, dict) and any(
+        _string(data.get(key)) for key in ("output_artifact", "context_artifact")
+    )
 
 
 def _string(value: object) -> str:

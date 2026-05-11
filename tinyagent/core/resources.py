@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 from tinyagent.core.context_sources import ContextSource
+from tinyagent.core.contracts import ProfileRuntimeCapabilities
 from tinyagent.core.extensions import Extension, load_extension_file
 from tinyagent.core.memory import PersistentMemorySource
 from tinyagent.core.skills import SkillSource, default_skill_sources
@@ -35,13 +35,18 @@ class ResourceLoader:
     def __init__(self, config: ResourceLoaderConfig | None = None) -> None:
         self.config = config or ResourceLoaderConfig()
 
-    def load(self, workspace: Path, *, profile: str) -> LoadedResources:
+    def load(
+        self,
+        workspace: Path,
+        *,
+        runtime_capabilities: ProfileRuntimeCapabilities,
+    ) -> LoadedResources:
         del workspace
-        is_tiny_pi = profile in {"tiny-pi", "pi", "minimal"}
-        skills = () if self.config.no_discovery or is_tiny_pi else default_skill_sources()
-        extensions = self._load_extensions()
+        runtime = runtime_capabilities
+        skills = () if self.config.no_discovery or not runtime.skills else default_skill_sources()
+        extensions = self._load_extensions() if runtime.extensions else ()
         context_sources: tuple[ContextSource, ...] = ()
-        if self.config.memory_enabled and not is_tiny_pi:
+        if self.config.memory_enabled and runtime.dynamic_context:
             context_sources = (PersistentMemorySource(),)
         return LoadedResources(extensions=extensions, skill_sources=skills, context_sources=context_sources)
 

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from tinyagent.core.approval import record_policy_decision
 from tinyagent.core.contracts import Tool
 from tinyagent.core.events import (
     DURABLE_EVENT_TYPES,
@@ -23,9 +24,22 @@ from tinyagent.core.events import (
     load_events_jsonl,
 )
 from tinyagent.core.kernel import Kernel
+from tinyagent.core.model_recording import record_model_tool_calls
 from tinyagent.core.model_stream import ModelDelta
+from tinyagent.core.state import (
+    ApprovalRequest,
+    ApprovalResolution,
+    Message,
+    ModelResponse,
+    PolicyDecision,
+    RunBudgets,
+    RunState,
+    ToolCall,
+    ToolResult,
+    Workspace,
+)
+from tinyagent.evals.invariants import check_event_invariants
 from tinyagent.runtime.replay import render_timeline
-from tinyagent.core.state import Message, ModelResponse, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, Workspace
 
 
 class AllowAllPolicy:
@@ -82,6 +96,12 @@ class CancellingApprovalHandler:
         state.request_cancel("approval cancelled")
         state.raise_if_cancelled()
         raise AssertionError("unreachable")
+
+
+class CancelledResolutionApprovalHandler:
+    def resolve(self, request, state):
+        del state
+        return ApprovalResolution(request.approval_id, "cancelled", reason="test_cancelled_resolution")
 
 
 class ExplodingApprovalHandler:
@@ -478,6 +498,13 @@ def test_denied_tool_call_gets_finished_event_and_counts_requested_call(tmp_path
     assert tool_finished.data["ok"] is False
     assert tool_finished.data["blocked"] is True
     assert tool_finished.data["output"] == "noop denied"
+    tool_blocked = next(event for event in state.events if event.type == "tool.execution.blocked")
+    assert tool_finished.seq < tool_blocked.seq
+    assert tool_blocked.data == {"tool_call_id": denied_call.id, "tool": "noop", "reason": "noop denied"}
+    transcript_result = next(item for item in state.transcript.items if item.kind == "tool_result")
+    assert transcript_result.data["synthetic"] is True
+    assert state.transcript.pending_tool_call_ids == set()
+    assert check_event_invariants(state.events) == []
     assert tool_finished.data["output_chars"] == len("noop denied")
     assert tool_finished.data["output_truncated"] is False
     assert tool_finished.data["data"]["blocked"] is True
@@ -510,9 +537,94 @@ def test_approval_mode_never_fails_closed_and_blocks_execution(tmp_path) -> None
     assert resolution.data["reason"] == "approval_mode_never"
 
 
+def test_approval_mode_yolo_approves_workspace_safe_approval_once(tmp_path) -> None:
+    call = ToolCall(name="noop")
+    model = StaticModel([ModelResponse(tool_calls=[call]), ModelResponse(content="done", finish_reason="stop")])
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[NoopTool()],
+        policy=ApprovalPolicy(),
+        approval_mode="yolo",
+    )
+
+    state = kernel.run("approval yolo", workspace=tmp_path)
+
+    resolution = next(event for event in state.events if event.type == "approval.resolved")
+    assert state.failed is False
+    assert resolution.data["decision"] == "approved"
+    assert resolution.data["scope"] == "once"
+    assert resolution.data["reason"] == "approval_mode_yolo_in_workspace"
+    assert len([event for event in state.events if event.type == "tool.execution.completed"]) == 1
+
+
+def test_on_request_without_approval_handler_denies_without_wait_step(tmp_path) -> None:
+    call = ToolCall(name="noop")
+    model = StaticModel([ModelResponse(tool_calls=[call]), ModelResponse(content="done", finish_reason="stop")])
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[NoopTool()],
+        policy=ApprovalPolicy(),
+        approval_mode="on-request",
+    )
+
+    state = kernel.run("approval unavailable", workspace=tmp_path)
+
+    resolution = next(event for event in state.events if event.type == "approval.resolved")
+    assert state.failed is False
+    assert state.pending_approvals == {}
+    assert resolution.data["decision"] == "denied"
+    assert resolution.data["reason"] == "approval_handler_unavailable"
+    assert "tool.execution.started" not in event_types(state)
+    assert not any(event.data.get("step_kind") == "approval_wait" for event in state.events)
+
+
+def test_policy_decision_event_payload_records_permission_alias_and_recoverability(tmp_path) -> None:
+    state = RunState.create("policy payload", Workspace(tmp_path), run_id="run_policy_payload")
+    call = ToolCall(name="shell", args={"cmd": "curl https://example.com"}, id="call_policy")
+    approval = ApprovalRequest(
+        approval_id="approval-policy",
+        run_id=state.run_id,
+        turn_id="turn-0001",
+        step_id="step-policy",
+        action_kind="network",
+        tool_name="shell",
+        cwd=str(tmp_path),
+        args_preview="curl https://example.com",
+        command="curl https://example.com",
+        risk="medium",
+    )
+    decision = PolicyDecision.needs_approval(
+        "network requires approval",
+        approval,
+        matched_rule="network:*",
+        permission="network",
+    )
+
+    record_policy_decision(state, call, decision)
+
+    event = state.events[-1]
+    assert event.type == "policy.evaluated"
+    assert event.data == {
+        "tool_call_id": "call_policy",
+        "tool": "shell",
+        "kind": "needs_approval",
+        "allowed": False,
+        "reason": "network requires approval",
+        "redacted": False,
+        "approval_id": "approval-policy",
+        "matched_rule": "network:*",
+        "permission": "network",
+        "capability": "network",
+        "source": "policy",
+        "recoverability": "request_approval",
+    }
+
+
 def test_run_scoped_approval_grant_is_reused(tmp_path) -> None:
-    call_1 = ToolCall(name="noop", id="call_same")
-    call_2 = ToolCall(name="noop", id="call_same")
+    call_1 = ToolCall(name="noop", id="call_first")
+    call_2 = ToolCall(name="noop", id="call_second")
     handler = RunScopeApprovalHandler()
     model = StaticModel(
         [
@@ -536,6 +648,11 @@ def test_run_scoped_approval_grant_is_reused(tmp_path) -> None:
     assert handler.count == 1
     assert len([event for event in state.events if event.type == "approval.requested"]) == 1
     assert len([event for event in state.events if event.type == "tool.execution.completed"]) == 2
+    resolved = [event.data for event in state.events if event.type == "approval.resolved"]
+    assert resolved == [
+        {"approval_id": "approval_call_first", "decision": "approved", "scope": "run", "reason": "test_run_scope"},
+        {"approval_id": "approval_call_second", "decision": "approved", "scope": "run", "reason": "approval_grant"},
+    ]
 
 
 def test_cancel_during_approval_wait_marks_active_step_only(tmp_path) -> None:
@@ -554,6 +671,10 @@ def test_cancel_during_approval_wait_marks_active_step_only(tmp_path) -> None:
 
     types = event_types(state)
     assert state.cancelled is True
+    assert state.pending_approvals == {}
+    assert state.current_step_kind is None
+    assert state.current_step_id is None
+    assert state.current_model_call_id is None
     assert "approval.requested" in types
     assert "step.cancel.requested" in types
     assert "step.cancelled" in types
@@ -562,6 +683,34 @@ def test_cancel_during_approval_wait_marks_active_step_only(tmp_path) -> None:
         types,
         ["approval.requested", "step.started", "step.cancel.requested", "step.cancelled", "turn.interrupted", "run.cancelled"],
     )
+
+
+def test_cancelled_approval_resolution_closes_wait_step_and_blocks_execution(tmp_path) -> None:
+    call = ToolCall(name="noop")
+    model = StaticModel([ModelResponse(tool_calls=[call]), ModelResponse(content="done", finish_reason="stop")])
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[NoopTool()],
+        policy=ApprovalPolicy(),
+        approval_handler=CancelledResolutionApprovalHandler(),
+        approval_mode="on-request",
+    )
+
+    state = kernel.run("approval cancelled resolution", workspace=tmp_path)
+
+    resolution = next(event for event in state.events if event.type == "approval.resolved")
+    approval_step_closures = [
+        event
+        for event in state.events
+        if event.type in {"step.completed", "step.failed", "step.cancelled", "step.timeout", "step.idle_timeout"}
+        and event.data.get("step_kind") == "approval_wait"
+    ]
+    assert state.failed is False
+    assert resolution.data["decision"] == "cancelled"
+    assert resolution.data["reason"] == "test_cancelled_resolution"
+    assert "tool.execution.started" not in event_types(state)
+    assert [event.type for event in approval_step_closures] == ["step.cancelled"]
 
 
 def test_approval_handler_exception_closes_wait_step_and_denies(tmp_path) -> None:
@@ -667,6 +816,159 @@ def test_tool_exception_gets_finished_event(tmp_path) -> None:
     assert tool_finished.data["data"] == {"error_type": "RuntimeError"}
 
 
+def test_after_tool_result_hook_replacement_is_recorded(tmp_path) -> None:
+    seen_results: list[tuple[str | None, str]] = []
+
+    class ResultReplacingHook:
+        name = "result-replacing-hook"
+
+        def after_tool_result(self, state: RunState, result: ToolResult) -> ToolResult:
+            del state
+            seen_results.append((result.call_id, result.output))
+            return ToolResult(
+                tool_name=result.tool_name,
+                output="redacted by hook",
+                ok=True,
+                data={"hooked": True},
+                summary="redacted",
+                content_preview="redacted by hook",
+            )
+
+    call = ToolCall(name="noop")
+    state = Kernel(
+        model=StaticModel([ModelResponse(tool_calls=[call]), ModelResponse(content="done", finish_reason="stop")]),
+        profile=BasicProfile(),
+        tools=[NoopTool()],
+        policy=AllowAllPolicy(),
+        hooks=[ResultReplacingHook()],
+    ).run("replace result", workspace=tmp_path)
+
+    assert state.failed is False
+    assert seen_results == [("", "ok")]
+    result = state.tool_results[0]
+    assert result.call_id == call.id
+    assert result.output == "redacted by hook"
+    completed_events = [event for event in state.events if event.type == "tool.execution.completed"]
+    assert len(completed_events) == 1
+    completed = completed_events[0]
+    assert completed.data["tool_call_id"] == call.id
+    assert completed.data["output"] == "redacted by hook"
+    assert completed.data["data"]["hooked"] is True
+    transcript_result = next(item for item in state.transcript.items if item.kind == "tool_result")
+    assert transcript_result.tool_call_id == call.id
+    assert transcript_result.summary == "redacted"
+    state.transcript.validate_complete()
+    assert check_event_invariants(state.events) == []
+
+
+def test_after_tool_result_hook_failure_closes_tool_execution_invariants(tmp_path) -> None:
+    call = ToolCall(name="noop")
+
+    class FailingAfterHook:
+        name = "failing-after-hook"
+
+        def after_tool_result(self, state: RunState, result: ToolResult) -> ToolResult:
+            del state, result
+            raise RuntimeError("after tool failed")
+
+    state = Kernel(
+        model=StaticModel([ModelResponse(tool_calls=[call])]),
+        profile=BasicProfile(),
+        tools=[NoopTool()],
+        policy=AllowAllPolicy(),
+        hooks=[FailingAfterHook()],
+    ).run("fail after tool result", workspace=tmp_path)
+
+    assert state.failed is True
+    assert "after tool failed" in (state.failure_reason or "")
+    assert any(
+        event.type == "hook.failed"
+        and event.data == {"hook": "failing-after-hook", "method": "after_tool_result", "reason": "after tool failed"}
+        for event in state.events
+    )
+    result = state.tool_results[0]
+    assert result.call_id == call.id
+    assert result.output == "hook failing-after-hook.after_tool_result failed: after tool failed"
+    assert result.data["hook_failed"] is True
+    assert result.data["error_type"] == "RuntimeError"
+    assert any(event.type == "tool.execution.failed" and event.data.get("tool_call_id") == call.id for event in state.events)
+    assert any(event.type == "workspace.delta.completed" and event.data.get("tool_call_id") == call.id for event in state.events)
+    assert any(event.type == "step.failed" and event.data.get("tool_call_id") == call.id for event in state.events)
+    assert_subsequence(
+        event_types(state),
+        [
+            "tool.execution.started",
+            "hook.started",
+            "hook.failed",
+            "tool.execution.failed",
+            "workspace.delta.completed",
+            "step.failed",
+            "run.failed",
+        ],
+    )
+    assert check_event_invariants(state.events) == []
+
+
+def test_after_tool_result_hook_is_not_called_for_before_tool_block(tmp_path) -> None:
+    call = ToolCall(name="noop")
+
+    class BlockingHook:
+        name = "blocking-hook"
+
+        def before_tool_call(self, state: RunState, call: ToolCall, decision: PolicyDecision) -> ToolResult:
+            del state, decision
+            return ToolResult(tool_name=call.name, call_id=call.id, output="blocked by hook", ok=False, data={"blocked": True})
+
+        def after_tool_result(self, state: RunState, result: ToolResult) -> ToolResult:
+            del state, result
+            raise AssertionError("after_tool_result should not run for blocked synthetic results")
+
+    state = Kernel(
+        model=StaticModel([ModelResponse(tool_calls=[call]), ModelResponse(content="done", finish_reason="stop")]),
+        profile=BasicProfile(),
+        tools=[NoopTool()],
+        policy=AllowAllPolicy(),
+        hooks=[BlockingHook()],
+    ).run("block before tool", workspace=tmp_path)
+
+    assert state.failed is False
+    assert state.tool_results[0].output == "blocked by hook"
+    assert not any(event.type.startswith("hook.") and event.data.get("method") == "after_tool_result" for event in state.events)
+    assert "tool.execution.started" not in event_types(state)
+    assert check_event_invariants(state.events) == []
+
+
+def test_before_tool_call_mutation_to_unavailable_tool_is_blocked_without_after_hook(tmp_path) -> None:
+    call = ToolCall(name="noop")
+
+    class MutatingHook:
+        name = "mutating-hook"
+
+        def before_tool_call(self, state: RunState, call: ToolCall, decision: PolicyDecision) -> ToolCall:
+            del state, decision
+            return ToolCall(name="missing_tool", args={}, id=call.id)
+
+        def after_tool_result(self, state: RunState, result: ToolResult) -> ToolResult:
+            del state, result
+            raise AssertionError("after_tool_result should not run for hook-mutated unavailable tools")
+
+    state = Kernel(
+        model=StaticModel([ModelResponse(tool_calls=[call]), ModelResponse(content="done", finish_reason="stop")]),
+        profile=BasicProfile(),
+        tools=[NoopTool()],
+        policy=AllowAllPolicy(),
+        hooks=[MutatingHook()],
+    ).run("mutate to missing tool", workspace=tmp_path)
+
+    result = state.tool_results[0]
+    assert result.ok is False
+    assert result.failure_kind == "policy_denied"
+    assert result.data["error_type"] == "HookMutatedToolNotVisible"
+    assert not any(event.type.startswith("hook.") and event.data.get("method") == "after_tool_result" for event in state.events)
+    assert "tool.execution.started" not in event_types(state)
+    assert check_event_invariants(state.events) == []
+
+
 def test_unknown_tool_records_result_with_available_tools_and_can_recover(tmp_path) -> None:
     call = ToolCall(name="missing")
     second_call = ToolCall(name="noop")
@@ -730,6 +1032,10 @@ def test_tool_finished_output_is_truncated(tmp_path) -> None:
     state = kernel.run("long output", workspace=tmp_path)
 
     tool_finished = next(event for event in state.events if event.type == "tool.execution.completed")
+    snapshot = next(event for event in state.events if event.type == "tool.execution.output.snapshot")
+    assert snapshot.seq < tool_finished.seq
+    assert snapshot.data["tool_call_id"] == call.id
+    assert snapshot.data["output_artifact"] == "artifacts/tool.txt"
     assert tool_finished.data["output"] == "abc"
     assert tool_finished.data["output_chars"] == 6
     assert tool_finished.data["output_truncated"] is True
@@ -911,11 +1217,160 @@ def test_streaming_tool_arguments_are_buffered_before_tool_execution(tmp_path) -
     ]
     arg_delta_events = [event for event in sink.events if event.type == "model.tool_call.args.delta"]
     assert [event.data["delta"] for event in arg_delta_events] == ["{", "}"]
+    assert [event.data["model_call_id"] for event in arg_delta_events] == ["model-call-0001", "model-call-0001"]
     assert [event.data["tool_call_id"] for event in arg_delta_events] == ["call_1", "call_1"]
     assert [event.data["tool"] for event in arg_delta_events] == ["noop", "noop"]
-    tool_requested = next(event for event in state.events if event.type == "model.tool_call.assembly.completed")
+    sink_completed_assembly = [event for event in sink.events if event.type == "model.tool_call.assembly.completed"]
+    assert len(sink_completed_assembly) == 1
+    assert sink_completed_assembly[0].data["model_call_id"] == "model-call-0001"
+    model_completed = [
+        event
+        for event in state.events
+        if event.type == "model.call.completed" and event.data["model_call_id"] == "model-call-0001"
+    ][0]
+    policy_evaluated = [event for event in state.events if event.type == "policy.evaluated"][0]
+    sink_tool_started = [event for event in sink.events if event.type == "tool.execution.started"][0]
+    assert arg_delta_events[-1].seq < sink_completed_assembly[0].seq < sink_tool_started.seq
+    assert sink_completed_assembly[0].seq < model_completed.seq < policy_evaluated.seq < sink_tool_started.seq
+    completed_assembly_events = [
+        event for event in state.events if event.type == "model.tool_call.assembly.completed"
+    ]
+    assert len(completed_assembly_events) == 1
+    tool_requested = completed_assembly_events[0]
     assert tool_requested.data["tool_call_id"] == "call_1"
     assert tool_requested.data["args"] == {}
+    transcript_tool_calls = [item for item in state.transcript.items if item.kind == "tool_call"]
+    assert [
+        (item.turn_id, item.model_call_id, item.tool_call_id, item.tool_name, item.data["args"])
+        for item in transcript_tool_calls
+    ] == [("turn-0001", "model-call-0001", "call_1", "noop", {})]
+    transcript_tool_results = [item for item in state.transcript.items if item.kind == "tool_result"]
+    assert [(item.turn_id, item.tool_call_id, item.tool_name, item.data["ok"]) for item in transcript_tool_results] == [
+        ("turn-0001", "call_1", "noop", True)
+    ]
+    assert state.transcript.pending_tool_call_ids == set()
+    state.transcript.validate_complete()
+    transcript = (state.output_dir / "context/transcript.md").read_text()
+    assert "## tool_call: transcript-tool-call-" in transcript
+    assert "## tool_result: transcript-tool-result-0001" in transcript
+    assert "tool_call_id: call_1" in transcript
+    assert "tool_name: noop" in transcript
+    assert 'data: `{"args": "(redacted)"}`' in transcript
+    assert check_event_invariants(state.events) == []
+
+
+def test_model_tool_call_recording_keeps_streamed_event_and_records_transcript(tmp_path) -> None:
+    state = RunState.create("record streamed call", Workspace(tmp_path))
+    state.current_turn_id = "turn-1"
+    state.emit("model.tool_call.assembly.completed", {"model_call_id": "model-call-1", "tool_call_id": "call_1", "tool": "noop"})
+
+    record_model_tool_calls(
+        state,
+        [ToolCall(name="noop", id="call_1", args={"value": 1})],
+        provider="fake",
+        model_call_id="model-call-1",
+        model_call_index=1,
+    )
+
+    completed_assembly_events = [
+        event for event in state.events if event.type == "model.tool_call.assembly.completed"
+    ]
+    assert len(completed_assembly_events) == 1
+    transcript_tool_calls = [item for item in state.transcript.items if item.kind == "tool_call"]
+    assert [(item.tool_call_id, item.tool_name, item.data["args"]) for item in transcript_tool_calls] == [
+        ("call_1", "noop", {"value": 1})
+    ]
+
+
+def test_reused_tool_call_id_across_model_calls_fails_before_dispatch(tmp_path) -> None:
+    model = StaticModel(
+        [
+            ModelResponse(tool_calls=[ToolCall(name="noop", id="call_1")]),
+            ModelResponse(tool_calls=[ToolCall(name="noop", id="call_1")]),
+        ]
+    )
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[NoopTool()],
+        policy=AllowAllPolicy(),
+    )
+
+    state = kernel.run("reuse a provider tool id", workspace=tmp_path)
+
+    assert state.failed is True
+    assert state.failure_reason == "duplicate tool_call_id in run: call_1"
+    assert state.model_call_count == 2
+    assert state.tool_call_count == 1
+    assert len([event for event in state.events if event.type == "model.tool_call.assembly.completed"]) == 1
+    assert len([event for event in state.events if event.type == "tool.execution.completed"]) == 1
+    failed_assembly = [event for event in state.events if event.type == "model.tool_call.assembly.failed"][0]
+    assert failed_assembly.data == {
+        "provider": "static-model",
+        "model_call_id": "model-call-0002",
+        "model_call_index": 2,
+        "tool_call_id": "call_1",
+        "tool": "noop",
+        "reason": "duplicate tool_call_id in run: call_1",
+    }
+
+
+def test_streamed_tool_call_completed_args_are_bounded_in_events(tmp_path) -> None:
+    large_value = "x" * 5_000
+    sink = MemoryEventSink()
+    model = StreamingModel(
+        [
+            [
+                ModelDelta(
+                    kind="tool_call_started",
+                    tool_call_id="call_1",
+                    data={"id": "call_1", "index": 0, "name": "noop"},
+                ),
+                ModelDelta(
+                    kind="tool_call_args_delta",
+                    tool_call_id="index_0",
+                    delta=json.dumps({"payload": large_value}),
+                    data={"index": 0},
+                ),
+                ModelDelta(kind="tool_call_completed", tool_call_id="index_0", data={"index": 0}),
+                ModelDelta(kind="completed", data={"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelDelta(kind="text_delta", delta="done"),
+                ModelDelta(kind="completed", data={"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[NoopTool()],
+        policy=AllowAllPolicy(),
+        stream=True,
+        event_sink=sink,
+    )
+
+    state = kernel.run("stream a large tool argument", workspace=tmp_path)
+
+    completed_assembly = [
+        event for event in state.events if event.type == "model.tool_call.assembly.completed"
+    ][0]
+    assert completed_assembly.data["args"]["_truncated"] is True
+    assert completed_assembly.data["args"]["json_chars"] > 4_000
+    arg_delta = [event for event in sink.events if event.type == "model.tool_call.args.delta"][0]
+    assert arg_delta.data["model_call_id"] == "model-call-0001"
+    assert arg_delta.data["chars"] > 4_000
+    assert arg_delta.data["delta_truncated"] is True
+    assert "delta" not in arg_delta.data
+    assert "delta_preview" not in arg_delta.data
+    assert large_value not in json.dumps(arg_delta.data)
+    response_event = [
+        event
+        for event in state.events
+        if event.type == "model.call.completed" and event.data["tool_call_count"] == 1
+    ][0]
+    response = json.loads((state.output_dir / response_event.data["response_artifact"]).read_text())
+    assert response["tool_calls"] == [{"id": "call_1", "name": "noop", "args": {"payload": large_value}}]
 
 
 def test_invalid_streamed_tool_arguments_fail_without_tool_execution(tmp_path) -> None:
@@ -948,6 +1403,15 @@ def test_invalid_streamed_tool_arguments_fail_without_tool_execution(tmp_path) -
     assert state.failure_reason == "Model provider error: Tool call arguments for noop must be a JSON object."
     assert "model.call.failed" in event_types(state)
     assert "tool.execution.started" not in event_types(state)
+    assert "model.tool_call.assembly.completed" not in event_types(state)
+    failed_assembly = [event for event in state.events if event.type == "model.tool_call.assembly.failed"][0]
+    assert failed_assembly.data["model_call_id"] == "model-call-0001"
+    assert failed_assembly.data["model_call_index"] == 1
+    assert failed_assembly.data["tool_call_id"] == "call_1"
+    assert failed_assembly.data["tool"] == "noop"
+    assert "must be a JSON object" in failed_assembly.data["reason"]
+    model_failed = [event for event in state.events if event.type == "model.call.failed"][0]
+    assert model_failed.data["model_call_id"] == failed_assembly.data["model_call_id"]
     assert event_types(state)[-1] == "run.failed"
     assert (state.output_dir / "events.jsonl").exists()
     assert (state.output_dir / "final.md").exists()
@@ -1003,6 +1467,17 @@ def test_cancelled_tool_preserves_completed_steps_and_finalizes_without_completi
         "tool.execution.started",
         "tool.execution.cancelled",
     ]
+    cancel_transcript = [
+        item for item in state.transcript.items if item.kind == "tool_result" and item.tool_call_id == cancel_call.id
+    ][0]
+    assert cancel_transcript.data["ok"] is False
+    assert cancel_transcript.data["failure_kind"] is None
+    assert not any(
+        event.data.get("tool_call_id") == cancel_call.id
+        and event.type in {"tool.execution.completed", "tool.execution.failed"}
+        for event in state.events
+    )
+    assert check_event_invariants(state.events) == []
     assert "run.completed" not in types
     assert_subsequence(types, ["diff.finalized", "turn.interrupted", "run.cancelled"])
     assert (state.output_dir / "final.md").read_text() == "# Final output\n\nNo final output produced.\n"

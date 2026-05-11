@@ -7,7 +7,7 @@ from tinyagent.core.models import FakeModelProvider
 from tinyagent.core.state import ModelResponse, ToolCall
 from tinyagent.runtime.backend import ArtifactInfo, BackendRunHandle, HTTPRunBackend, LocalRunBackend, RunBackend, RunRequest
 from tinyagent.runtime.coordination import CoordinationStore
-from tinyagent.runtime.server import RuntimeConfig, RunController, RuntimeHTTPServer
+from tinyagent.runtime.server import RunController, RuntimeConfig, RuntimeHTTPServer
 
 
 def _controller(tmp_path, responses) -> RunController:
@@ -43,6 +43,40 @@ def test_local_run_backend_exposes_protocol_compatible_run_events_and_artifacts(
     assert events[-1].type == "run.completed"
     assert any(isinstance(item, ArtifactInfo) and item.path == "final.md" and item.kind == "run_output" for item in artifacts)
     assert b"backend done" in backend.fetch_artifact("run_backend", "final.md")
+
+
+def test_local_run_backend_keeps_shell_output_artifacts_private_by_default(tmp_path) -> None:
+    backend = LocalRunBackend(
+        _controller(
+            tmp_path,
+            [
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "printf secret-output"}),)),
+                ModelResponse(content="done", finish_reason="stop"),
+            ],
+        )
+    )
+
+    backend.start_run(RunRequest(task="shell artifact", run_id="run_private_artifact", approval_mode="on-request"))
+    approval = _wait_for_backend_approval(backend, "run_private_artifact")
+    assert backend.resolve_approval("run_private_artifact", approval["approval_id"], decision="approved", scope="once")
+    for _ in range(100):
+        events = list(backend.events("run_private_artifact"))
+        if events and events[-1].type == "run.completed":
+            break
+        time.sleep(0.02)
+    output_artifact = next(
+        event.data["data"]["output_artifact"]
+        for event in events
+        if event.type == "tool.execution.completed" and event.data.get("data", {}).get("output_artifact")
+    )
+
+    assert [item.path for item in backend.artifacts("run_private_artifact")] == ["final.md"]
+    try:
+        backend.fetch_artifact("run_private_artifact", output_artifact)
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("expected shell output artifact fetch to be forbidden")
 
 
 def test_http_run_backend_matches_local_protocol_for_events_and_artifacts(tmp_path) -> None:
@@ -140,7 +174,9 @@ def test_http_run_backend_cancels_active_run(tmp_path) -> None:
     thread.start()
     try:
         backend = HTTPRunBackend(f"http://127.0.0.1:{server.server_port}")
-        backend.start_run(RunRequest(task="backend cancel", run_id="run_http_backend_cancel"))
+        backend.start_run(RunRequest(task="backend cancel", run_id="run_http_backend_cancel", approval_mode="on-request"))
+        approval = _wait_for_backend_approval(backend, "run_http_backend_cancel")
+        assert backend.resolve_approval("run_http_backend_cancel", approval["approval_id"], decision="approved", scope="once")
         _wait_for_backend_event(backend, "run_http_backend_cancel", "tool.execution.started")
 
         assert backend.cancel("run_http_backend_cancel", reason="http_backend_cancel")
@@ -205,3 +241,14 @@ def _wait_for_backend_event(backend: HTTPRunBackend, run_id: str, event_type: st
                 return event
         time.sleep(0.05)
     raise AssertionError(f"event {event_type} not seen for {run_id}: {[event.type for event in latest]}")
+
+
+def _wait_for_backend_approval(backend: RunBackend, run_id: str, timeout: float = 10) -> dict[str, object]:
+    deadline = time.monotonic() + timeout
+    latest: list[dict[str, object]] = []
+    while time.monotonic() < deadline:
+        latest = backend.pending_approvals(run_id)
+        if latest:
+            return latest[0]
+        time.sleep(0.05)
+    raise AssertionError(f"approval not seen for {run_id}: {latest}")

@@ -10,15 +10,19 @@ import time
 
 import pytest
 
+from tinyagent.core.context import estimate_messages_tokens, estimate_tools_tokens
 from tinyagent.core.index import SearchCodeTool, WorkspaceIndexManager
 from tinyagent.core.kernel import Kernel
 from tinyagent.core.models import FakeModelProvider, ModelSpec
 from tinyagent.core.output import MAX_UNTRACKED_DIFF_BYTES, capture_final_diff
 from tinyagent.core.policy import LocalPolicy
+from tinyagent.core.profile_catalog import (
+    DEFAULT_RUNTIME_CAPABILITIES,
+    TINY_PI_RUNTIME_CAPABILITIES,
+)
 from tinyagent.core.profiles import ApexCoderProfile, TinyPiProfile, profile_for
 from tinyagent.core.run_control import CancelToken
-from tinyagent.core.context import estimate_messages_tokens, estimate_tools_tokens
-from tinyagent.core.state import Message, ModelResponse, RunBudgets, RunState, ToolCall, ToolResult, ToolStep, Workspace
+from tinyagent.core.state import Message, ModelResponse, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, ToolStep, Workspace
 from tinyagent.core.tools import (
     ApplyPatchTool,
     ListFilesTool,
@@ -33,6 +37,14 @@ from tinyagent.core.tools import (
 from tinyagent.core.tools.builtins.patch import apply_openai_patch
 from tinyagent.core.tools.repo import MAX_READ_FILE_BYTES, repo_inspect_tools
 from tinyagent.runtime.replay import replay_run
+
+
+class WorkspaceShellPolicy(LocalPolicy):
+    def _evaluate_shell(self, call: ToolCall, state: RunState):
+        decision = super()._evaluate_shell(call, state)
+        if decision.kind == "needs_approval" and decision.permission == "bash":
+            return PolicyDecision.allow("test permits workspace shell", matched_rule="test.bash.allow", permission="bash")
+        return decision
 
 
 def test_list_and_code_search_exclude_tinyagent_outputs(tmp_path) -> None:
@@ -294,7 +306,7 @@ def test_kernel_shell_cancel_records_only_cancelled_tool_and_command_events(tmp_
         model=FakeModelProvider([ModelResponse(tool_calls=(call,))]),
         profile=ApexCoderProfile(),
         tools=[ShellTool()],
-        policy=LocalPolicy(),
+        policy=WorkspaceShellPolicy(),
     )
     state_box: dict[str, RunState] = {}
     command_started = threading.Event()
@@ -834,11 +846,51 @@ def test_tiny_pi_profile_selects_model_specific_edit_tool(tmp_path) -> None:
     assert [tool.name for tool in visible] == ["read_file", "str_replace_edit", "shell"]
 
 
+@pytest.mark.parametrize(
+    ("edit_style", "edit_tool"),
+    [("str_replace", "str_replace_edit"), ("whole_file", "write_file")],
+)
+def test_tiny_pi_kernel_keeps_model_specific_edit_tool(tmp_path, edit_style, edit_tool) -> None:
+    class CapturingModel:
+        name = "capturing"
+        model_spec = ModelSpec(provider="capturing", model="capturing", edit_style=edit_style)
+
+        def __init__(self) -> None:
+            self.tools: list[str] = []
+
+        def complete(self, messages, tools, state):
+            del messages, state
+            self.tools = [tool.name for tool in tools]
+            return ModelResponse(content="done", finish_reason="stop")
+
+    model = CapturingModel()
+    state = Kernel(
+        model=model,
+        profile=TinyPiProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+    ).run("done", workspace=tmp_path, output_dir=tmp_path / "run")
+
+    assert model.tools == ["read_file", edit_tool, "shell"]
+    started = next(event for event in state.events if event.type == "run.started")
+    context = next(event for event in state.events if event.type == "context.built")
+    assert started.data["profile_visible_tools"] == ["read_file", edit_tool, "shell"]
+    assert context.data["visible_tools"] == ["read_file", edit_tool, "shell"]
+
+
 def test_profile_for_aliases_and_errors() -> None:
     assert isinstance(profile_for("tiny-coder"), ApexCoderProfile)
     assert isinstance(profile_for("pi"), TinyPiProfile)
     with pytest.raises(ValueError, match="Unknown profile"):
         profile_for("unknown")
+
+
+def test_profile_runtime_capabilities_match_profile_catalog() -> None:
+    assert ApexCoderProfile.runtime_capabilities is DEFAULT_RUNTIME_CAPABILITIES
+    assert TinyPiProfile.runtime_capabilities is TINY_PI_RUNTIME_CAPABILITIES
+    assert profile_for("tiny-coder").runtime_capabilities is DEFAULT_RUNTIME_CAPABILITIES
+    assert profile_for("pi").runtime_capabilities is TINY_PI_RUNTIME_CAPABILITIES
+    assert profile_for("minimal").runtime_capabilities is TINY_PI_RUNTIME_CAPABILITIES
 
 
 def test_tiny_pi_truthfulness_gate_without_strict_apex_finish_gate(tmp_path) -> None:
@@ -889,7 +941,7 @@ def test_apex_profile_blocks_registered_but_hidden_tools(tmp_path, tool_name, ar
         model=model,
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=WorkspaceShellPolicy(),
     )
 
     state = kernel.run(f"try hidden {tool_name}", workspace=tmp_path, run_id=f"run_hidden_{tool_name}")
@@ -932,7 +984,7 @@ def test_shell_preflight_records_expected_interface_in_events_and_metrics(tmp_pa
         model=model,
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=WorkspaceShellPolicy(),
     )
 
     state = kernel.run("preflight", workspace=tmp_path, run_id="run_preflight")
@@ -982,7 +1034,7 @@ def test_golden_trace_calc_pytest_patch_loop_records_required_artifacts(tmp_path
         model=model,
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=WorkspaceShellPolicy(),
     )
 
     state = kernel.run(
@@ -1114,6 +1166,52 @@ def test_yolo_approval_mode_does_not_allow_network_shell(tmp_path) -> None:
     assert blocked.data["tool_call_id"] == shell_call.id
 
 
+def test_default_yolo_approval_mode_does_not_execute_unknown_shell(tmp_path) -> None:
+    script = "from pathlib import Path; Path('created.txt').write_text('created')"
+    shell_call = ToolCall(name="shell", args={"cmd": f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"})
+    model = FakeModelProvider(
+        [
+            ModelResponse(tool_calls=(shell_call,)),
+            ModelResponse(content="Unknown shell command was denied.", finish_reason="stop"),
+        ]
+    )
+    kernel = Kernel(
+        model=model,
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=LocalPolicy(),
+    )
+
+    state = kernel.run("try unknown shell write", workspace=tmp_path, run_id="run_unknown_shell_block")
+
+    assert state.failed is False
+    assert not (tmp_path / "created.txt").exists()
+    assert "command.started" not in [event.type for event in state.events]
+    resolution = next(event for event in state.events if event.type == "approval.resolved")
+    assert resolution.data["decision"] == "denied"
+    assert resolution.data["reason"] == "approval-mode=yolo does not allow shell"
+    blocked = next(event for event in state.events if event.type == "tool.execution.blocked")
+    assert blocked.data["tool_call_id"] == shell_call.id
+
+
+def test_read_only_shell_allowlist_rejects_workspace_writes(tmp_path) -> None:
+    (tmp_path / "source.txt").write_text("secret\n")
+    state = RunState.create("policy", Workspace(tmp_path), run_id="run_readonly_shell_policy")
+    policy = LocalPolicy()
+
+    redirected_cat = policy.evaluate(ToolCall(name="shell", args={"cmd": "cat source.txt > copy.txt"}), state)
+    sed_in_place = policy.evaluate(ToolCall(name="shell", args={"cmd": "sed -i s/secret/public/ source.txt"}), state)
+    git_diff_output = policy.evaluate(ToolCall(name="shell", args={"cmd": "git diff --output=audit.diff"}), state)
+
+    assert redirected_cat.kind == "needs_approval"
+    assert redirected_cat.matched_rule == "bash.workspace_write"
+    assert redirected_cat.permission == "bash"
+    assert sed_in_place.kind == "needs_approval"
+    assert sed_in_place.matched_rule == "bash.read_only_mutation"
+    assert git_diff_output.kind == "needs_approval"
+    assert git_diff_output.matched_rule == "bash.read_only_mutation"
+
+
 def test_fake_provider_trace_shells_patches_answers_with_content_and_captures_diff(tmp_path) -> None:
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
     (tmp_path / "hello.txt").write_text("hello\n")
@@ -1181,7 +1279,7 @@ def test_golden_streaming_trace_runs_shell_then_finalizes(tmp_path) -> None:
         model=model,
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=WorkspaceShellPolicy(),
         stream=True,
     )
 
@@ -1239,7 +1337,7 @@ def test_golden_trace_covers_context_artifacts_tool_args_shell_artifact_and_untr
         model=model,
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=WorkspaceShellPolicy(),
     )
 
     state = kernel.run("golden trace", workspace=tmp_path, run_id="run_golden")

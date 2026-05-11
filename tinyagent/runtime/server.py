@@ -23,8 +23,8 @@ from tinyagent.core.kernel import Kernel
 from tinyagent.core.models import ProviderError
 from tinyagent.core.policy import default_policy
 from tinyagent.core.profiles import profile_for
-from tinyagent.core.resources import ResourceLoader, ResourceLoaderConfig
 from tinyagent.core.providers.factory import ProviderSpec, provider_for
+from tinyagent.core.resources import ResourceLoader, ResourceLoaderConfig
 from tinyagent.core.run_control import CancelToken
 from tinyagent.core.state import ApprovalMode, ApprovalRequest, ApprovalResolution, Message, RunState
 from tinyagent.core.tools import default_tools
@@ -461,7 +461,7 @@ class RunController:
                 extensions=extensions,
                 resources=ResourceLoader(ResourceLoaderConfig(memory_enabled=self.config.memory_enabled)).load(
                     self.config.workspace,
-                    profile=resolved_profile.name,
+                    runtime_capabilities=resolved_profile.runtime_capabilities,
                 ),
             )
         except Exception:
@@ -595,7 +595,7 @@ class RunController:
             if event.type != "artifact.created":
                 continue
             path = event.data.get("path")
-            if not isinstance(path, str) or _artifact_hidden_by_default(path):
+            if not isinstance(path, str) or not _artifact_public(event, path):
                 continue
             artifact_path = self.store.artifact_path(run_id, path)
             if not artifact_path.exists() or not artifact_path.is_file():
@@ -606,7 +606,7 @@ class RunController:
                 "kind": event.data.get("kind") or "artifact",
                 "bytes": int(event.data.get("bytes") or stat.st_size),
                 "created_at": event.time,
-                "safe_to_display": True,
+                "safe_to_display": bool(event.data.get("safe_to_display", True)),
             }
         final = run_path / "final.md"
         if final.exists() and final.is_file():
@@ -626,9 +626,19 @@ class RunController:
     def public_artifact_path(self, run_id: str, relative_path: str) -> Path:
         path = self.store.artifact_path(run_id, relative_path)
         normalized = path.relative_to(self.store.run_path(run_id).resolve()).as_posix()
-        if _artifact_hidden_by_default(normalized):
+        if not self._public_artifact_allowed(run_id, normalized):
             raise PermissionError(f"artifact is not public: {normalized}")
         return path
+
+    def _public_artifact_allowed(self, run_id: str, relative_path: str) -> bool:
+        if relative_path == "final.md":
+            return True
+        return any(
+            event.type == "artifact.created"
+            and event.data.get("path") == relative_path
+            and _artifact_public(event, relative_path)
+            for event in self.events(run_id)
+        )
 
     def mcp_servers(self) -> list[dict[str, Any]]:
         clients = self.config.mcp_clients or {}
@@ -1231,6 +1241,14 @@ def _redact_default_surface_data(value: Any) -> Any:
 
 def _artifact_hidden_by_default(path: str) -> bool:
     return path.startswith(("artifacts/model-request", "artifacts/model-response", "artifacts/context", "context/"))
+
+
+def _artifact_public(event: Event, path: str) -> bool:
+    if _artifact_hidden_by_default(path):
+        return False
+    if event.data.get("public") is True:
+        return bool(event.data.get("safe_to_display", True))
+    return event.data.get("visibility") == "public" and bool(event.data.get("safe_to_display", True))
 
 
 def _surface_event_visible(event: Event, debug_level: int) -> bool:

@@ -44,13 +44,25 @@ class AllowAllPolicy:
         return PolicyDecision.allow()
 
 
+class WorkspaceShellPolicy(LocalPolicy):
+    def _evaluate_shell(self, call: ToolCall, state: RunState) -> PolicyDecision:
+        decision = super()._evaluate_shell(call, state)
+        if decision.kind == "needs_approval" and decision.permission == "bash":
+            return PolicyDecision.allow("test permits workspace shell", matched_rule="test.bash.allow", permission="bash")
+        return decision
+
+
+def workspace_shell_policy() -> LocalPolicy:
+    return WorkspaceShellPolicy()
+
+
 def test_toolresult_contextfs_and_context_report_contracts(tmp_path) -> None:
     call = ToolCall(name="shell", args={"cmd": f"{sys.executable} -c \"print('x' * 80)\""})
     kernel = Kernel(
         model=FakeModelProvider([ModelResponse(tool_calls=(call,)), ModelResponse(content="done", finish_reason="stop")]),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         budgets=RunBudgets(max_command_output_chars_visible=16),
         workspace_mode="current",
     )
@@ -96,7 +108,7 @@ def test_transcript_records_model_tool_result_and_finish_gate(tmp_path) -> None:
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     ).run("edit then finish too early", workspace=tmp_path, run_id="run_transcript_contract")
 
@@ -141,7 +153,7 @@ def test_observations_classify_patch_diff_verification_and_policy(tmp_path) -> N
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     ).run("record observations", workspace=tmp_path, run_id="run_observations_contract")
 
@@ -271,7 +283,7 @@ def test_context_read_safely_allows_recovery_artifacts_but_not_raw_model_artifac
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     ).run("context reader safety", workspace=tmp_path, run_id="run_context_reader_safety")
 
@@ -356,7 +368,7 @@ def test_contextfs_sanitizes_transcript_observations_and_workspace_delta_artifac
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     ).run("workspace delta sanitizer", workspace=tmp_path, run_id="run_delta_sanitizer")
 
@@ -409,7 +421,7 @@ def test_workspace_delta_redacts_preexisting_dirty_tracked_diffs_from_contextfs(
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     ).run("stage dirty file", workspace=tmp_path, run_id="run_dirty_tracked_delta")
 
@@ -451,7 +463,7 @@ def test_progress_guard_blocks_repeated_failed_command_before_policy_retry(tmp_p
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     ).run("avoid repeated failures", workspace=tmp_path, run_id="run_progress_guard_contract")
 
@@ -529,7 +541,7 @@ def test_context_report_matches_final_model_request_after_hooks(tmp_path) -> Non
         model=FakeModelProvider([ModelResponse(content="done", finish_reason="stop")]),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         hooks=[RequestHook()],
         workspace_mode="current",
     ).run("hook context report", workspace=tmp_path, run_id="run_hook_report")
@@ -565,7 +577,7 @@ def test_hook_success_events_preserve_order_and_names(tmp_path) -> None:
         model=FakeModelProvider([ModelResponse(content="done", finish_reason="stop")]),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         hooks=[FirstHook(), SecondHook()],
         workspace_mode="current",
     ).run("hook order", workspace=tmp_path, run_id="run_hook_order")
@@ -599,7 +611,7 @@ def test_before_model_call_tuple_return_is_applied_but_list_return_is_ignored(tm
         model=tuple_model,
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         hooks=[TupleHook()],
         workspace_mode="current",
     ).run("tuple hook", workspace=tuple_workspace, run_id="run_tuple_hook")
@@ -618,7 +630,7 @@ def test_before_model_call_tuple_return_is_applied_but_list_return_is_ignored(tm
         model=list_model,
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         hooks=[ListHook()],
         workspace_mode="current",
     ).run("list hook", workspace=list_workspace, run_id="run_list_hook")
@@ -645,7 +657,7 @@ def test_hook_error_policy_record_continues_without_hook_completed(tmp_path) -> 
         model=model,
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         hooks=[FailingHook(), LaterHook()],
         hook_error_policy="record",
         workspace_mode="current",
@@ -670,7 +682,7 @@ def test_after_model_response_hook_failure_fails_current_model_call(tmp_path) ->
         model=FakeModelProvider([ModelResponse(content="should fail", finish_reason="stop")]),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         hooks=[FailingHook()],
         workspace_mode="current",
     ).run("after model failure", workspace=tmp_path, run_id="run_after_model_hook_fail")
@@ -698,7 +710,7 @@ def test_before_finish_hook_receives_profile_decision_and_can_override(tmp_path)
         model=FakeModelProvider([ModelResponse(tool_calls=(call,)), ModelResponse(content="done", finish_reason="stop")]),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         hooks=[AllowFinishHook()],
         workspace_mode="current",
     ).run("override finish decision", workspace=tmp_path, run_id="run_before_finish_override")
@@ -714,7 +726,7 @@ def test_initial_model_context_includes_contextfs_index(tmp_path) -> None:
         model=model,
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     ).run("read contextfs first", workspace=tmp_path, run_id="run_initial_contextfs")
 
@@ -746,7 +758,7 @@ def test_finish_gate_blocks_edit_without_diff_or_verification(tmp_path) -> None:
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     )
 
@@ -767,7 +779,7 @@ def test_workspace_delta_detects_shell_mutation_and_blocks_early_finish(tmp_path
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     ).run("generate a file", workspace=tmp_path, run_id="run_shell_delta")
 
@@ -789,7 +801,7 @@ def test_workspace_delta_shell_mutation_read_file_inspection_can_finish(tmp_path
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     ).run("generate and inspect a file", workspace=tmp_path, run_id="run_shell_delta_read_file")
 
@@ -807,7 +819,7 @@ def test_workspace_delta_ignores_contextfs_writes_for_read_only_tools(tmp_path) 
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     ).run("read only", workspace=tmp_path, run_id="run_read_only_delta")
 
@@ -826,7 +838,7 @@ def test_non_mutating_shell_dispatch_records_boundaries_without_detected_mutatio
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     ).run("non-mutating shell", workspace=tmp_path, run_id="run_shell_no_delta")
 
@@ -852,7 +864,7 @@ def test_workspace_delta_detects_edit_to_existing_untracked_git_file(tmp_path) -
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     ).run("edit existing untracked file", workspace=tmp_path, run_id="run_untracked_delta")
 
@@ -884,7 +896,7 @@ def test_workspace_delta_does_not_attribute_preexisting_dirty_git_files(tmp_path
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     ).run("edit only new file", workspace=tmp_path, run_id="run_dirty_attribution")
 
@@ -926,7 +938,7 @@ def test_workspace_delta_detects_clean_to_clean_git_checkout(tmp_path) -> None:
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     ).run("checkout branch", workspace=tmp_path, run_id="run_clean_checkout_delta")
 
@@ -952,7 +964,7 @@ def test_workspace_delta_handles_non_git_to_git_transition(tmp_path) -> None:
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     ).run("initialize git and create a file", workspace=tmp_path, run_id="run_git_transition_delta")
 
@@ -971,7 +983,7 @@ def test_workspace_delta_detects_pure_git_init_transition(tmp_path) -> None:
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     ).run("initialize git only", workspace=tmp_path, run_id="run_pure_git_init_delta")
 
@@ -1023,7 +1035,7 @@ def test_workspace_delta_detects_git_mode_only_mutation(tmp_path) -> None:
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     ).run("chmod a tracked file", workspace=tmp_path, run_id="run_mode_delta")
 
@@ -1053,7 +1065,7 @@ def test_workspace_delta_detects_git_index_only_mutation(tmp_path) -> None:
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     ).run("stage a dirty file", workspace=tmp_path, run_id="run_index_delta")
 
@@ -1082,7 +1094,7 @@ def test_workspace_delta_detects_existing_untracked_directory_file_change(tmp_pa
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     ).run("edit a file inside an existing untracked dir", workspace=tmp_path, run_id="run_untracked_dir_delta")
 
@@ -1099,7 +1111,7 @@ def test_workspace_delta_ignores_common_generated_artifacts(tmp_path) -> None:
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     ).run("write generated test artifact", workspace=tmp_path, run_id="run_generated_artifact_delta")
 
@@ -1117,7 +1129,7 @@ def test_failed_shell_mutation_still_requires_mutation_gates(tmp_path) -> None:
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     ).run("failed mutation", workspace=tmp_path, run_id="run_failed_mutation")
 
@@ -1153,7 +1165,7 @@ def test_eval_metrics_do_not_count_same_mutating_shell_diff_as_post_edit(tmp_pat
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     ).run("mutate and inspect in one shell command", workspace=tmp_path, run_id="run_same_command_diff_metric")
 
@@ -1183,7 +1195,7 @@ def test_non_git_finish_gate_accepts_changed_file_inspection(tmp_path) -> None:
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     ).run("edit non-git", workspace=tmp_path, run_id="run_non_git_finish")
 
@@ -1212,7 +1224,7 @@ def test_non_git_finish_gate_accepts_read_file_changed_file_inspection(tmp_path)
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     ).run("edit non-git and inspect with read_file", workspace=tmp_path, run_id="run_non_git_read_file_finish")
 
@@ -1250,7 +1262,7 @@ def test_git_status_alone_does_not_satisfy_post_edit_finish_gate(tmp_path) -> No
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     )
 
@@ -1341,7 +1353,7 @@ def test_eval_metrics_count_policy_denial_once(tmp_path) -> None:
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     ).run("deny network", workspace=tmp_path, run_id="run_policy_metric_once")
 
@@ -1363,7 +1375,7 @@ def test_eval_metrics_count_attempted_context_tools_before_execution(tmp_path) -
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     ).run("attempt context search", workspace=tmp_path, run_id="run_attempt_context_metric")
 
@@ -1393,7 +1405,7 @@ def test_eval_metrics_treat_structured_reads_as_pre_edit_inspection(tmp_path) ->
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
         budgets=RunBudgets(max_turns=3),
     ).run("read then edit", workspace=tmp_path, run_id="run_structured_inspection_metric")
@@ -1425,7 +1437,7 @@ def test_container_sandbox_mode_fails_setup_until_backend_exists(tmp_path, monke
         model=FakeModelProvider([ModelResponse(content="done", finish_reason="stop")]),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         sandbox_mode="container",
     )
 
@@ -1439,7 +1451,7 @@ def test_container_sandbox_mode_records_enforced_backend(tmp_path, monkeypatch) 
         model=FakeModelProvider([ModelResponse(content="done", finish_reason="stop")]),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         sandbox_mode="container",
     ).run("use container sandbox", workspace=tmp_path, run_id="run_container_sandbox")
 
@@ -1536,7 +1548,7 @@ def test_policy_and_sandbox_denials_have_distinct_failure_dimensions(tmp_path) -
         model=FakeModelProvider([ModelResponse(tool_calls=(network_call,)), ModelResponse(content="blocked", finish_reason="stop")]),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     ).run("deny network", workspace=tmp_path, run_id="run_policy_dimensions")
 
@@ -1591,7 +1603,7 @@ def test_approval_denial_preserves_original_capability(tmp_path) -> None:
         ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         approval_mode="yolo",
         workspace_mode="current",
     ).run("deny workspace escape approval", workspace=tmp_path, run_id="run_approval_capability")
@@ -1607,7 +1619,7 @@ def test_final_contextfs_raw_history_includes_run_completion(tmp_path) -> None:
         model=FakeModelProvider([ModelResponse(content="done", finish_reason="stop")]),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         workspace_mode="current",
     ).run("final contextfs", workspace=tmp_path, run_id="run_final_contextfs")
 
@@ -1636,7 +1648,7 @@ def test_hook_can_inject_context_and_block_tool(tmp_path) -> None:
         model=FakeModelProvider([ModelResponse(tool_calls=(call,)), ModelResponse(content="blocked by hook", finish_reason="stop")]),
         profile=ApexCoderProfile(),
         tools=[ShellTool()],
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         hooks=[FirstBlockingHook(), SecondHook()],
         workspace_mode="current",
     ).run("hook test", workspace=tmp_path, run_id="run_hook_contract")
@@ -1673,15 +1685,16 @@ def test_hook_mutated_tool_call_is_rechecked_by_policy(tmp_path) -> None:
 
     call = ToolCall(name="shell", args={"cmd": "git diff -- README.md"})
     state = Kernel(
-        model=FakeModelProvider(
-            [
-                ModelResponse(tool_calls=(call,)),
-                ModelResponse(content="Network command was denied by policy.", finish_reason="stop"),
-            ]
-        ),
+            model=FakeModelProvider(
+                [
+                    ModelResponse(tool_calls=(call,)),
+                    ModelResponse(content="Network command was denied by policy.", finish_reason="stop"),
+                    ModelResponse(content="Network command was denied by policy.", finish_reason="stop"),
+                ]
+            ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         hooks=[MutatingHook(), LaterHook()],
         workspace_mode="current",
     ).run("mutate tool", workspace=tmp_path, run_id="run_hook_policy_recheck")
@@ -1701,12 +1714,12 @@ def test_equal_tool_call_return_from_hook_does_not_trigger_policy_reevaluation(t
         def before_tool_call(self, state: RunState, call: ToolCall, decision: PolicyDecision) -> ToolCall:
             return replace(call)
 
-    call = ToolCall(name="shell", args={"cmd": "printf ok"})
+    call = ToolCall(name="shell", args={"cmd": "pwd"})
     state = Kernel(
         model=FakeModelProvider([ModelResponse(tool_calls=(call,)), ModelResponse(content="done", finish_reason="stop")]),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         hooks=[EqualReturnHook()],
         workspace_mode="current",
     ).run("equal hook return", workspace=tmp_path, run_id="run_equal_hook_return")
@@ -1728,7 +1741,7 @@ def test_hook_failure_fails_closed_by_default(tmp_path) -> None:
         model=FakeModelProvider([ModelResponse(content="should not run", finish_reason="stop")]),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
         hooks=[FailingHook()],
         workspace_mode="current",
     ).run("hook failure", workspace=tmp_path, run_id="run_hook_fail_closed")
@@ -1745,7 +1758,7 @@ def test_sdk_streams_same_durable_events_as_run_log(tmp_path) -> None:
             workspace=tmp_path,
             provider=FakeModelProvider([ModelResponse(content="sdk done", finish_reason="stop")]),
             tools=default_tools(),
-            policy=LocalPolicy(),
+            policy=workspace_shell_policy(),
         )
         return [event async for event in agent.run("sdk task", run_id="run_sdk_contract")]
 
@@ -1760,7 +1773,7 @@ def test_run_graph_fork_metadata_and_eval_thresholds(tmp_path) -> None:
         model=FakeModelProvider([ModelResponse(content="done", finish_reason="stop")]),
         profile=ApexCoderProfile(),
         tools=default_tools(),
-        policy=LocalPolicy(),
+        policy=workspace_shell_policy(),
     ).run("fork me", workspace=tmp_path, run_id="run_fork_source")
 
     destination = fork_run(state.output_dir, "0001", output_dir=tmp_path / "forked")
