@@ -48,6 +48,24 @@ export type WorkspaceSummary = {
 
 export type ApprovalDecision = "approved" | "denied" | "cancelled" | "expired";
 
+export type GitFileStatus = {
+  path: string;
+  oldPath?: string;
+  status: "added" | "modified" | "deleted" | "renamed" | "untracked" | "copied" | "typechange" | "unknown";
+};
+
+export type GitSnapshot = {
+  isRepo: boolean;
+  clean: boolean;
+  branch?: string;
+  ahead?: number;
+  behind?: number;
+  files: GitFileStatus[];
+  diff: string;
+  diffTruncated: boolean;
+  error?: string;
+};
+
 const BASE = "/api";
 
 export class TinyagentClient {
@@ -82,6 +100,34 @@ export class TinyagentClient {
     }
     const body = await res.json();
     return Array.isArray(body.conversations) ? body.conversations : [];
+  }
+
+  async listWorkspaceFiles(workspaceId: string): Promise<string[]> {
+    const res = await fetch(`${this.base}/workspace/files?workspace_id=${encodeURIComponent(workspaceId)}`);
+    if (!res.ok) {
+      throw new Error(`listWorkspaceFiles failed: ${res.status} ${await res.text()}`);
+    }
+    const body = await res.json();
+    return Array.isArray(body.files) ? body.files : [];
+  }
+
+  async gitStatus(workspaceId: string): Promise<GitSnapshot> {
+    const res = await fetch(`${this.base}/git/status?workspace_id=${encodeURIComponent(workspaceId)}`);
+    if (!res.ok) {
+      throw new Error(`gitStatus failed: ${res.status} ${await res.text()}`);
+    }
+    const body = await res.json();
+    return {
+      isRepo: !!body.isRepo,
+      clean: !!body.clean,
+      branch: typeof body.branch === "string" ? body.branch : undefined,
+      ahead: Number(body.ahead ?? 0),
+      behind: Number(body.behind ?? 0),
+      files: Array.isArray(body.files) ? body.files : [],
+      diff: typeof body.diff === "string" ? body.diff : "",
+      diffTruncated: !!body.diffTruncated,
+      error: typeof body.error === "string" ? body.error : undefined,
+    };
   }
 
   async startConversationTurn(

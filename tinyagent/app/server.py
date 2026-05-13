@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import threading
 from collections.abc import Callable
 from http import HTTPStatus
@@ -12,7 +13,6 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from tinyagent.app.product import ProductHome, WorkspaceRecord, WorkspaceStore
-from tinyagent.runtime.protocol_v1 import V1_RUN_START_KEYS, error_response, health_response, openapi_spec, run_object
 from tinyagent.core.contracts import ModelProvider
 from tinyagent.core.index import WorkspaceIndexManager
 from tinyagent.core.models import ProviderError
@@ -22,7 +22,8 @@ from tinyagent.core.workspace import SandboxModeInput, WorkspaceMode
 from tinyagent.extensions.lsp import load_lsp_config
 from tinyagent.extensions.mcp import load_mcp_config
 from tinyagent.runtime.conversation import ConversationStore
-from tinyagent.runtime.server import RunController, RuntimeConfig, RuntimeHandler, _conversation_id_for_run
+from tinyagent.runtime.protocol_v1 import V1_RUN_START_KEYS, error_response, health_response, openapi_spec, run_object
+from tinyagent.runtime.server import RunController, RuntimeConfig, RuntimeHandler, UnsupportedMediaType, _conversation_id_for_run
 
 
 class ProductRuntimeController:
@@ -139,6 +140,14 @@ class ProductRuntimeHandler(RuntimeHandler):
                 )
                 self._json(HTTPStatus.OK, {"conversations": conversations})
                 return
+            if parts == ["api", "workspace", "files"]:
+                controller = self.server.product.controller_for_workspace(_require_workspace_id(_workspace_id(parsed.query)))
+                self._json(HTTPStatus.OK, workspace_files_response(controller.config.workspace))
+                return
+            if parts == ["api", "git", "status"]:
+                controller = self.server.product.controller_for_workspace(_require_workspace_id(_workspace_id(parsed.query)))
+                self._json(HTTPStatus.OK, git_status_response(controller.config.workspace))
+                return
             if parts == ["api", "mcp", "servers"]:
                 controller = self.server.product.controller_for_workspace(_require_workspace_id(_workspace_id(parsed.query)))
                 self._json(HTTPStatus.OK, {"servers": controller.mcp_servers()})
@@ -183,6 +192,12 @@ class ProductRuntimeHandler(RuntimeHandler):
         parts = _path_parts(parsed.path)
         try:
             body = self._read_body()
+        except UnsupportedMediaType as exc:
+            if parts and parts[0] == "v1":
+                self._v1_error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type", str(exc))
+                return
+            self._json(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, {"error": str(exc)})
+            return
         except json.JSONDecodeError as exc:
             if parts and parts[0] == "v1":
                 self._v1_error(HTTPStatus.BAD_REQUEST, "bad_request", f"Invalid JSON body: {exc}")
@@ -496,3 +511,130 @@ def _workspace_id_for_controller(product: ProductRuntimeController, controller: 
         if product.controller_for_workspace(record.workspace_id) is controller:
             return record.workspace_id
     return ""
+
+
+def workspace_files_response(workspace: Path) -> dict[str, Any]:
+    files = _git_lines(workspace, ["ls-files", "-co", "--exclude-standard"])
+    if files is None:
+        files = _walk_workspace_files(workspace)
+    return {"files": sorted(path for path in files if path and (workspace / path).is_file())}
+
+
+def git_status_response(workspace: Path) -> dict[str, Any]:
+    if _git_text(workspace, ["rev-parse", "--is-inside-work-tree"]) != "true":
+        return {"isRepo": False, "clean": True, "files": [], "diff": "", "diffTruncated": False}
+    branch = _git_text(workspace, ["branch", "--show-current"]) or _git_text(workspace, ["rev-parse", "--short", "HEAD"]) or ""
+    ahead, behind = _git_ahead_behind(workspace)
+    files = [_parse_status_line(line) for line in (_git_lines(workspace, ["status", "--porcelain=v1"]) or [])]
+    files = [file for file in files if file is not None]
+    diff_parts = [
+        _git_text(workspace, ["diff", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/"]) or "",
+        _git_text(workspace, ["diff", "--cached", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/"]) or "",
+    ]
+    diff = "\n".join(part for part in diff_parts if part).strip()
+    limit = 200_000
+    truncated = len(diff) > limit
+    if truncated:
+        diff = diff[:limit]
+    return {
+        "isRepo": True,
+        "branch": branch,
+        "ahead": ahead,
+        "behind": behind,
+        "clean": not files,
+        "files": files,
+        "diff": diff,
+        "diffTruncated": truncated,
+    }
+
+
+def _git_ahead_behind(workspace: Path) -> tuple[int, int]:
+    raw = _git_text(workspace, ["rev-list", "--left-right", "--count", "@{upstream}...HEAD"])
+    if not raw:
+        return 0, 0
+    parts = raw.split()
+    if len(parts) != 2:
+        return 0, 0
+    try:
+        behind, ahead = int(parts[0]), int(parts[1])
+    except ValueError:
+        return 0, 0
+    return ahead, behind
+
+
+def _parse_status_line(line: str) -> dict[str, Any] | None:
+    if len(line) < 4:
+        return None
+    code = line[:2]
+    path = line[3:].strip()
+    old_path = None
+    if " -> " in path:
+        old_path, path = path.split(" -> ", 1)
+    status = "unknown"
+    if "?" in code:
+        status = "untracked"
+    elif "R" in code:
+        status = "renamed"
+    elif "C" in code:
+        status = "copied"
+    elif "A" in code:
+        status = "added"
+    elif "D" in code:
+        status = "deleted"
+    elif "T" in code:
+        status = "typechange"
+    elif "M" in code:
+        status = "modified"
+    item: dict[str, Any] = {"path": _unquote_git_path(path), "status": status}
+    if old_path:
+        item["oldPath"] = _unquote_git_path(old_path)
+    return item
+
+
+def _unquote_git_path(path: str) -> str:
+    if len(path) >= 2 and path[0] == '"' and path[-1] == '"':
+        try:
+            return bytes(path[1:-1], "utf-8").decode("unicode_escape")
+        except UnicodeDecodeError:
+            return path[1:-1]
+    return path
+
+
+def _git_lines(workspace: Path, args: list[str]) -> list[str] | None:
+    raw = _git_text(workspace, args)
+    if raw is None:
+        return None
+    return [line for line in raw.splitlines() if line]
+
+
+def _git_text(workspace: Path, args: list[str]) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(workspace), *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.rstrip("\n")
+
+
+def _walk_workspace_files(workspace: Path) -> list[str]:
+    ignored = {".git", ".tinyagent", "node_modules", "__pycache__", ".venv", "dist", "build"}
+    files: list[str] = []
+    for path in workspace.rglob("*"):
+        try:
+            rel = path.relative_to(workspace)
+        except ValueError:
+            continue
+        if any(part in ignored for part in rel.parts):
+            continue
+        if path.is_file():
+            files.append(rel.as_posix())
+        if len(files) >= 5000:
+            break
+    return files

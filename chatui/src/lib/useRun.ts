@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { tinyagent } from "./api";
-import type { ApprovalDecision, ConversationSummary, RunEvent, WorkspaceSummary } from "./api";
+import type { ApprovalDecision, ConversationSummary, GitSnapshot, RunEvent, WorkspaceSummary } from "./api";
 
 export type ToolStatus = "running" | "done" | "failed" | "blocked" | "cancelled";
 
@@ -134,6 +134,8 @@ export function useRun() {
   const [activeWorkspaceId, setActiveWorkspaceId] = useState<string | null>(null);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
+  const [workspaceFiles, setWorkspaceFiles] = useState<string[]>([]);
+  const [git, setGit] = useState<GitSnapshot | null>(null);
   const [phase, setPhase] = useState<"idle" | "thinking" | "streaming">("idle");
   const [error, setError] = useState<string | null>(null);
   const streamRef = useRef<AbortController | null>(null);
@@ -186,10 +188,31 @@ export function useRun() {
       .catch(() => undefined);
   }, []);
 
+  const refreshWorkspaceSurface = useCallback(() => {
+    const workspaceId = workspaceIdRef.current;
+    if (!workspaceId) {
+      setWorkspaceFiles([]);
+      setGit(null);
+      return;
+    }
+    void tinyagent.listWorkspaceFiles(workspaceId).then(setWorkspaceFiles).catch(() => setWorkspaceFiles([]));
+    void tinyagent.gitStatus(workspaceId).then(setGit).catch((err) => {
+      setGit({
+        isRepo: false,
+        clean: true,
+        files: [],
+        diff: "",
+        diffTruncated: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+  }, []);
+
   useEffect(() => {
     workspaceIdRef.current = activeWorkspaceId;
     refreshConversations();
-  }, [activeWorkspaceId, refreshConversations]);
+    refreshWorkspaceSurface();
+  }, [activeWorkspaceId, refreshConversations, refreshWorkspaceSurface]);
 
   const updateTurn = useCallback((id: string, fn: (t: Turn) => Turn) => {
     setTurns((prev) => prev.map((t) => (t.id === id ? fn(t) : t)));
@@ -436,6 +459,7 @@ export function useRun() {
           setPhase("idle");
           setArtifacts((prev) => prev.map((a) => ({ ...a, state: "done" })));
           refreshConversations();
+          refreshWorkspaceSurface();
           break;
         }
         case "run.failed": {
@@ -443,6 +467,7 @@ export function useRun() {
           clearActiveRun(turnId);
           setPhase("idle");
           refreshConversations();
+          refreshWorkspaceSurface();
           break;
         }
         case "run.cancelled": {
@@ -450,11 +475,12 @@ export function useRun() {
           clearActiveRun(turnId);
           setPhase("idle");
           refreshConversations();
+          refreshWorkspaceSurface();
           break;
         }
       }
     },
-    [clearActiveRun, refreshConversations, updateTurn]
+    [clearActiveRun, refreshConversations, refreshWorkspaceSurface, updateTurn]
   );
 
   const send = useCallback(
@@ -536,7 +562,8 @@ export function useRun() {
     setError(null);
     setPhase("idle");
     refreshConversations();
-  }, [refreshConversations, stopStream]);
+    refreshWorkspaceSurface();
+  }, [refreshConversations, refreshWorkspaceSurface, stopStream]);
 
   const selectWorkspace = useCallback(
     (workspaceId: string) => {
@@ -655,6 +682,8 @@ export function useRun() {
     workspaces,
     activeWorkspaceId,
     conversations,
+    workspaceFiles,
+    git,
     activeConversationId,
     error,
     send,
@@ -665,6 +694,7 @@ export function useRun() {
     newConversation,
     selectConversation,
     respondToApproval,
+    refreshWorkspaceSurface,
   };
 }
 
