@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import shlex
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path
@@ -239,6 +240,18 @@ class LocalPolicy:
                 matched_rule="bash.read_only_mutation",
                 permission="bash",
             )
+        outside_read = _outside_read_target(cmd, state, allow_run_artifacts=self.allow_run_artifacts)
+        if outside_read:
+            return self._decision(
+                call,
+                state,
+                "external_directory",
+                outside_read,
+                reason=f"shell reads outside workspace envelope: {outside_read}",
+                action_kind="workspace_escape",
+                risk="high",
+                command=cmd,
+            )
         if _NETWORK_SHELL_PATTERN.search(lower):
             return self._decision(
                 call,
@@ -300,6 +313,35 @@ _NETWORK_SHELL_PATTERN = re.compile(r"\b(curl|wget|ssh|scp|sftp|rsync|nc|ncat|te
 _REDIRECT_PATTERN = re.compile(r"(?:^|[\s;&|])(?:>|>>|<)\s*(?P<path>[^()\s;&|]+)")
 _WRITE_REDIRECT_PATTERN = re.compile(r"(?:^|[\s;&|])(?:>|>>)\s*(?P<path>[^()\s;&|]+)")
 _FILE_MUTATION_COMMANDS = frozenset({"tee", "mkdir", "touch", "rm", "mv", "cp"})
+_SIMPLE_READ_COMMANDS = frozenset({"cat", "head", "tail", "wc", "ls"})
+_RG_VALUE_FLAGS = frozenset(
+    {
+        "-A",
+        "-B",
+        "-C",
+        "-E",
+        "-g",
+        "-j",
+        "-m",
+        "-t",
+        "-T",
+        "--after-context",
+        "--before-context",
+        "--color",
+        "--colors",
+        "--context",
+        "--encoding",
+        "--glob",
+        "--max-count",
+        "--path-separator",
+        "--pre",
+        "--sort",
+        "--sortr",
+        "--threads",
+        "--type",
+        "--type-not",
+    }
+)
 _TINYAGENT_WRITE_PATTERN = re.compile(
     r"(?:(?:>|>>)\s*(?P<redirect>(?:\./)?\.tinyagent(?:/|\b)[^\s;&|]*)|"
     r"\b(?:tee|mkdir|touch|rm|mv|cp)\b[^\n;&|]*(?P<command>(?:\./)?\.tinyagent(?:/|\b)[^\s;&|]*))"
@@ -400,6 +442,129 @@ def _read_only_command_mutation(cmd: str) -> str:
     ):
         return "git diff --output"
     return ""
+
+
+def _outside_read_target(cmd: str, state: RunState, *, allow_run_artifacts: bool) -> str:
+    for raw in _read_targets(cmd):
+        if raw == "-":
+            continue
+        try:
+            resolve_workspace_path(state, raw, allow_run_artifacts=allow_run_artifacts)
+        except Exception:
+            return raw
+    return ""
+
+
+def _read_targets(cmd: str) -> list[str]:
+    words = _shell_words(cmd)
+    if not words:
+        return []
+    command = Path(words[0]).name
+    if command in _SIMPLE_READ_COMMANDS:
+        return _plain_path_operands(words[1:])
+    if command == "sed":
+        return _sed_path_operands(words[1:])
+    if command == "rg":
+        return _rg_path_operands(words[1:])
+    if command == "git" and len(words) > 2 and words[1] == "diff" and "--no-index" in words[2:]:
+        return _plain_path_operands(word for word in words[2:] if word != "--no-index")
+    return []
+
+
+def _plain_path_operands(words: Iterable[str]) -> list[str]:
+    operands: list[str] = []
+    take_rest = False
+    for word in words:
+        if word == "--":
+            take_rest = True
+            continue
+        if not take_rest and word.startswith("-"):
+            continue
+        if word in {"|", ";", "&&", "||"}:
+            continue
+        operands.append(word)
+    return operands
+
+
+def _sed_path_operands(words: list[str]) -> list[str]:
+    operands: list[str] = []
+    script_seen = False
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if word in {"-e", "--expression"}:
+            script_seen = True
+            index += 2
+            continue
+        if word.startswith("--expression=") or (word.startswith("-e") and word != "-e"):
+            script_seen = True
+            index += 1
+            continue
+        if word in {"-f", "--file"}:
+            if index + 1 < len(words):
+                operands.append(words[index + 1])
+                script_seen = True
+            index += 2
+            continue
+        if word.startswith("--file="):
+            operands.append(word.split("=", 1)[1])
+            script_seen = True
+            index += 1
+            continue
+        if word.startswith("-"):
+            index += 1
+            continue
+        if not script_seen:
+            script_seen = True
+        else:
+            operands.append(word)
+        index += 1
+    return operands
+
+
+def _rg_path_operands(words: list[str]) -> list[str]:
+    operands: list[str] = []
+    pattern_seen = any(word == "--files" for word in words)
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if word == "--":
+            operands.extend(words[index + 1 :] if pattern_seen else words[index + 2 :])
+            break
+        if word in {"-e", "--regexp"}:
+            pattern_seen = True
+            index += 2
+            continue
+        if word in {"-f", "--file"}:
+            if index + 1 < len(words):
+                operands.append(words[index + 1])
+                pattern_seen = True
+            index += 2
+            continue
+        if word.startswith("--regexp="):
+            pattern_seen = True
+            index += 1
+            continue
+        if word.startswith("--file="):
+            operands.append(word.split("=", 1)[1])
+            pattern_seen = True
+            index += 1
+            continue
+        if word in _RG_VALUE_FLAGS:
+            index += 2
+            continue
+        if any(word.startswith(f"{flag}=") for flag in _RG_VALUE_FLAGS if flag.startswith("--")):
+            index += 1
+            continue
+        if word.startswith("-"):
+            index += 1
+            continue
+        if pattern_seen:
+            operands.append(word)
+        else:
+            pattern_seen = True
+        index += 1
+    return operands
 
 
 def _protected_tinyagent_write(cmd: str) -> str:

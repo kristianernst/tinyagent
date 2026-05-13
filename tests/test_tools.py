@@ -1212,6 +1212,51 @@ def test_read_only_shell_allowlist_rejects_workspace_writes(tmp_path) -> None:
     assert git_diff_output.matched_rule == "bash.read_only_mutation"
 
 
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "cat ../outside-secret.txt",
+        "head ../outside-secret.txt",
+        "tail ../outside-secret.txt",
+        "sed -n '1,2p' ../outside-secret.txt",
+        "rg secret ..",
+        "git diff --no-index ../outside-secret.txt inside.txt",
+    ],
+)
+def test_read_only_shell_allowlist_rejects_outside_reads(tmp_path, cmd: str) -> None:
+    (tmp_path / "inside.txt").write_text("inside\n")
+    (tmp_path.parent / "outside-secret.txt").write_text("outside\n")
+    state = RunState.create("policy", Workspace(tmp_path), run_id="run_readonly_shell_read_policy")
+    policy = LocalPolicy()
+
+    decision = policy.evaluate(ToolCall(name="shell", args={"cmd": cmd}), state)
+
+    assert decision.kind == "needs_approval"
+    assert decision.matched_rule == "external_directory:*:ask"
+    assert decision.permission == "external_directory"
+    assert decision.approval is not None
+    assert decision.approval.action_kind == "workspace_escape"
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "cat inside.txt",
+        "sed -n '1,2p' inside.txt",
+        "rg inside .",
+        "git diff -- inside.txt",
+    ],
+)
+def test_read_only_shell_allowlist_keeps_workspace_reads_allowed(tmp_path, cmd: str) -> None:
+    (tmp_path / "inside.txt").write_text("inside\n")
+    state = RunState.create("policy", Workspace(tmp_path), run_id="run_readonly_shell_workspace_read_policy")
+    policy = LocalPolicy()
+
+    decision = policy.evaluate(ToolCall(name="shell", args={"cmd": cmd}), state)
+
+    assert decision.allowed is True
+
+
 def test_fake_provider_trace_shells_patches_answers_with_content_and_captures_diff(tmp_path) -> None:
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
     (tmp_path / "hello.txt").write_text("hello\n")

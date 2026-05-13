@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import http.client
 import json
+import shutil
+import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -132,6 +134,20 @@ def test_runtime_v1_single_workspace_errors_use_shared_shape(tmp_path) -> None:
         assert approvals["error"]["code"] == "run_not_found"
         artifacts = _request_error(base, "GET", "/v1/runs/missing/artifacts", expected=404)
         assert artifacts["error"]["code"] == "run_not_found"
+
+
+def test_runtime_rejects_browser_simple_post_content_type(tmp_path) -> None:
+    with _server(tmp_path) as base:
+        status, body = _raw_response(
+            base,
+            "POST",
+            "/api/runs",
+            b'{"task":"csrf","run_id":"csrf"}',
+            headers={"Origin": "https://attacker.example", "Content-Type": "text/plain"},
+        )
+
+        assert status == 415
+        assert b"application/json" in body
 
 
 def test_product_runtime_server_profile_overrides_workspace_default(tmp_path) -> None:
@@ -343,6 +359,80 @@ def test_product_runtime_lists_workspaces_and_scopes_conversations(tmp_path) -> 
 
         events = _request(base, "GET", f"/api/runs/run_workspace_a/events.json?workspace_id={record_a.workspace_id}")
         assert any(event["type"] == "run.completed" for event in events["events"])
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_product_runtime_rejects_browser_simple_post_before_state_change(tmp_path) -> None:
+    home = ProductHome(tmp_path / "home")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server = create_product_runtime_server(home, port=0, provider="fake", stream=True)
+    base = f"127.0.0.1:{server.server_port}"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, body = _raw_response(
+            base,
+            "POST",
+            "/api/workspaces",
+            json.dumps({"path": str(workspace), "name": "csrf"}).encode(),
+            headers={"Origin": "https://attacker.example", "Content-Type": "text/plain"},
+        )
+
+        assert status == 415
+        assert b"application/json" in body
+        if home.workspaces_dir.exists():
+            assert not list(home.workspaces_dir.glob("ws_*"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_product_runtime_reports_workspace_files_and_git_status(tmp_path) -> None:
+    if shutil.which("git") is None:
+        pytest.skip("git is required for workspace git status checks")
+
+    home = ProductHome(tmp_path / "home")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "README.md").write_text("initial\n")
+    (workspace / "deleted.md").write_text("delete me\n")
+    (workspace / "notes").mkdir()
+    (workspace / "notes" / "todo.md").write_text("todo\n")
+    for args in [
+        ["init"],
+        ["config", "user.email", "tinyagent@example.test"],
+        ["config", "user.name", "Tinyagent Tests"],
+        ["add", "README.md", "deleted.md"],
+        ["commit", "-m", "initial"],
+    ]:
+        subprocess.run(["git", *args], cwd=workspace, check=True, capture_output=True, text=True)
+    (workspace / "README.md").write_text("changed\n")
+    (workspace / "deleted.md").unlink()
+
+    record = WorkspaceStore(home).register(workspace, name="Workspace")
+    server = create_product_runtime_server(home, port=0, provider="fake", stream=True)
+    base = f"127.0.0.1:{server.server_port}"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        files = _request(base, "GET", f"/api/workspace/files?workspace_id={record.workspace_id}")["files"]
+        assert "README.md" in files
+        assert "notes/todo.md" in files
+        assert "deleted.md" not in files
+
+        git = _request(base, "GET", f"/api/git/status?workspace_id={record.workspace_id}")
+        assert git["isRepo"] is True
+        assert git["clean"] is False
+        assert git["diffTruncated"] is False
+        assert {"path": "README.md", "status": "modified"} in git["files"]
+        assert {"path": "deleted.md", "status": "deleted"} in git["files"]
+        assert "diff --git a/README.md b/README.md" in git["diff"]
+        assert "+changed" in git["diff"]
     finally:
         server.shutdown()
         server.server_close()

@@ -4,7 +4,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
+pytestmark = pytest.mark.skipif(not (ROOT / "examples").exists(), reason="examples directory is not present")
 
 
 def run_example(script: str, workspace: Path) -> subprocess.CompletedProcess[str]:

@@ -5,6 +5,7 @@ import { LeftSidebar, RightSidebar, SidebarToggle } from "./sidebars";
 import type { Conversation } from "./sidebars";
 import { IconSidebarL, IconSidebarR } from "./icons";
 import { useRun } from "./lib/useRun";
+import { AgentOrb } from "./AgentOrb";
 
 const SAMPLE_QUERIES = [
   "List the files in this workspace",
@@ -22,6 +23,8 @@ export function App() {
     workspaces,
     activeWorkspaceId,
     conversations,
+    workspaceFiles,
+    git,
     activeConversationId,
     error,
     send,
@@ -106,11 +109,15 @@ export function App() {
 
   const isEmpty = turns.length === 0;
   const approvalMode = mode === "yolo" ? "yolo" : "on-request";
+  const activeWorkspace = workspaces.find((workspace) => workspace.workspace_id === activeWorkspaceId);
   const sidebarConversations: Conversation[] = conversations.map((conversation) => ({
     id: conversation.conversation_id,
     title: conversation.title || "New conversation",
     time: formatConversationTime(conversation.updated_at),
+    running: conversation.conversation_id === activeConversationId && phase !== "idle",
   }));
+  const lastTurn = turns[turns.length - 1];
+  const activeOrbSeed = activeConversationId ?? lastTurn?.runId ?? lastTurn?.id ?? activeWorkspaceId ?? "tinyagent";
 
   const onSend = (text: string) => send(text, approvalMode);
 
@@ -151,7 +158,10 @@ export function App() {
             )}
           </div>
           <div className="topbar-title">
-            {turns.length > 0 ? turns[0].user.slice(0, 60) : "New conversation"}
+            <AgentOrb seed={activeOrbSeed} running={phase !== "idle"} size={15} />
+            <span className="topbar-title-text">
+              {turns.length > 0 ? turns[0].user.slice(0, 60) : "New conversation"}
+            </span>
           </div>
           <div className="topbar-right">
             <span className="topbar-date">
@@ -213,6 +223,9 @@ export function App() {
         open={rightOpen}
         onToggle={() => setRightOpen((o) => !o)}
         artifacts={artifacts}
+        git={git}
+        workspaceFiles={workspaceFiles}
+        workspaceName={activeWorkspace?.name ?? ""}
       />
     </div>
   );

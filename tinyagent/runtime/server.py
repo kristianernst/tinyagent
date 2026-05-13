@@ -80,6 +80,10 @@ DEFAULT_SURFACE_REDACTED_PATH_PATTERN = re.compile(
 )
 
 
+class UnsupportedMediaType(ValueError):
+    pass
+
+
 @dataclass(frozen=True)
 class RuntimeConfig:
     workspace: Path
@@ -767,6 +771,12 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         parts = _path_parts(parsed.path)
         try:
             body = self._read_body()
+        except UnsupportedMediaType as exc:
+            if parts and parts[0] == "v1":
+                self._v1_error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type", str(exc))
+                return
+            self._json(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, {"error": str(exc)})
+            return
         except json.JSONDecodeError as exc:
             if parts and parts[0] == "v1":
                 self._v1_error(HTTPStatus.BAD_REQUEST, "bad_request", f"Invalid JSON body: {exc}")
@@ -1148,6 +1158,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         return self.server.controller
 
     def _read_body(self) -> dict[str, Any]:
+        content_type = str(self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            raise UnsupportedMediaType("POST requests require Content-Type: application/json")
         length = int(self.headers.get("Content-Length") or "0")
         if length <= 0:
             return {}
