@@ -341,6 +341,18 @@ def test_tinyagent_run_fake_and_replay(tmp_path, capsys) -> None:
     assert "status: completed" in inspected.out
 
 
+def test_tinyagent_eval_fake_smoke_suite_passes(tmp_path, capsys) -> None:
+    suite = Path(__file__).parents[1] / "evals" / "tiny"
+
+    exit_code = main(["eval", str(suite), "--provider", "fake", "--output-dir", str(tmp_path / "eval-out")])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "cases: 3" in captured.out
+    assert "successes: 3" in captured.out
+    assert "solve_rate: 1.000" in captured.out
+
+
 def test_tinyagent_run_creates_product_home(tmp_path, capsys, monkeypatch) -> None:
     home = tmp_path / "home"
     workspace = tmp_path / "workspace"
@@ -690,7 +702,22 @@ def test_tinyagent_serve_uses_product_conversation_root(tmp_path, capsys, monkey
         profile_override,
         memory_enabled,
     ):
-        calls.append((Path(home_arg.root), provider, host, port, stream, debug_level, workspace_mode, approval_mode, sandbox_mode, profile, profile_override, memory_enabled))
+        calls.append(
+            (
+                Path(home_arg.root),
+                provider,
+                host,
+                port,
+                stream,
+                debug_level,
+                workspace_mode,
+                approval_mode,
+                sandbox_mode,
+                profile,
+                profile_override,
+                memory_enabled,
+            )
+        )
         return FakeServer()
 
     monkeypatch.setattr(cli, "create_product_runtime_server", fake_create_product_runtime_server)
