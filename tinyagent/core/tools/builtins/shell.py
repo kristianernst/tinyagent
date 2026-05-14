@@ -12,11 +12,10 @@ from pathlib import Path
 from typing import Any
 
 from tinyagent.core.container_sandbox import ContainerSandboxConfig, build_container_command
-from tinyagent.core.contextfs import model_readable_path, read_hints, write_context_tool_output
 from tinyagent.core.execution import build_execution_envelope
 from tinyagent.core.run_control import RunCancelled
 from tinyagent.core.state import RunState, ToolCall, ToolResult
-from tinyagent.core.tools.core import combined_output, error_result, visible_output, write_tool_output_artifact
+from tinyagent.core.tools.core import ToolOutputCapture, capture_tool_output, combined_output, duration_ms, error_result
 
 SHELL_PREFLIGHT_COMMANDS = ("rg", "git", "python3", "python", "sed")
 
@@ -90,53 +89,21 @@ class ShellTool:
             _terminate_container(launch)
             stdout, stderr = _terminate_process_group(process)
             output = combined_output(stdout, stderr) or f"Command timed out after {timeout}s."
-            artifact = write_tool_output_artifact(state, call, "command-output", output, kind="command_output")
-            context_artifact = write_context_tool_output(state, call, output, kind="shell_output")
-            context_read_path = model_readable_path(state, context_artifact)
-            preview = visible_output(output, state)
-            failure_data = _failure_data("timeout", capability="process", source="tool", recoverability="increase_timeout_or_simplify")
-            state.emit(
-                "command.timeout",
-                {
-                    "tool_call_id": call.id,
-                    "cmd": cmd,
-                    "ok": False,
-                    "timeout": True,
-                    "returncode": process.returncode,
-                    "output_artifact": artifact,
-                    "context_artifact": context_artifact,
-                    "output_chars": len(output),
-                    "duration_ms": _duration_ms(started),
-                    "failure_kind": "timeout",
-                    **failure_data,
-                    "execution_envelope": envelope.to_json_dict(),
-                },
-            )
-            return ToolResult(
-                tool_name=self.name,
-                call_id=call.id,
-                output=preview,
+            return _finish_command(
+                state,
+                call,
+                started,
+                envelope,
+                cmd,
+                process,
+                output,
+                event_type="command.timeout",
                 ok=False,
-                exit_code=process.returncode,
-                duration_ms=_duration_ms(started),
                 summary=f"Command timed out after {timeout}s.",
-                content_preview=preview,
-                artifact_path=context_artifact,
-                truncated=len(preview) < len(output),
                 failure_kind="timeout",
-                data={
-                    "cmd": cmd,
-                    "timeout": True,
-                    "returncode": process.returncode,
-                    "output_artifact": artifact,
-                    "context_artifact": context_artifact,
-                    "output_chars": len(output),
-                    "duration_ms": _duration_ms(started),
-                    "failure_kind": "timeout",
-                    **failure_data,
-                },
-                metadata={"cwd": str(envelope.cwd), "command_normalized": cmd, "execution_envelope": envelope.to_json_dict()},
-                read_hints=read_hints(context_read_path, failure=True),
+                recoverability="increase_timeout_or_simplify",
+                event_extra={"ok": False, "timeout": True, "returncode": process.returncode},
+                data_extra={"timeout": True},
             )
         except RunCancelled:
             state.request_cancel(
@@ -147,115 +114,121 @@ class ShellTool:
             _terminate_container(launch)
             stdout, stderr = _terminate_process_group(process)
             output = combined_output(stdout, stderr) or "Command cancelled."
-            artifact = write_tool_output_artifact(state, call, "command-output", output, kind="command_output")
-            context_artifact = write_context_tool_output(state, call, output, kind="shell_output")
-            context_read_path = model_readable_path(state, context_artifact)
-            preview = visible_output(output, state)
-            failure_data = _failure_data("user_aborted", capability="process", source="tool", recoverability="rerun_if_needed")
-            state.emit(
-                "command.cancelled",
-                {
-                    "tool_call_id": call.id,
-                    "cmd": cmd,
-                    "reason": state.cancel_reason or "cancelled",
-                    "returncode": process.returncode,
-                    "output_artifact": artifact,
-                    "context_artifact": context_artifact,
-                    "output_chars": len(output),
-                    "escalated": state.cancel_escalated,
-                    "duration_ms": _duration_ms(started),
-                    "failure_kind": "user_aborted",
-                    **failure_data,
-                    "execution_envelope": envelope.to_json_dict(),
-                },
-                visibility="user",
-            )
-            return ToolResult(
-                tool_name=self.name,
-                call_id=call.id,
-                output=preview,
+            reason = state.cancel_reason or "cancelled"
+            return _finish_command(
+                state,
+                call,
+                started,
+                envelope,
+                cmd,
+                process,
+                output,
+                event_type="command.cancelled",
                 ok=False,
-                exit_code=process.returncode,
-                duration_ms=_duration_ms(started),
-                summary=state.cancel_reason or "Command cancelled.",
-                content_preview=preview,
-                artifact_path=context_artifact,
-                truncated=len(preview) < len(output),
+                summary=reason,
                 failure_kind="user_aborted",
-                data={
-                    "cmd": cmd,
-                    "cancelled": True,
-                    "reason": state.cancel_reason or "cancelled",
-                    "returncode": process.returncode,
-                    "output_artifact": artifact,
-                    "context_artifact": context_artifact,
-                    "output_chars": len(output),
-                    "duration_ms": _duration_ms(started),
-                    "failure_kind": "user_aborted",
-                    **failure_data,
-                },
-                metadata={"cwd": str(envelope.cwd), "command_normalized": cmd, "execution_envelope": envelope.to_json_dict()},
-                read_hints=read_hints(context_read_path, failure=True),
+                recoverability="rerun_if_needed",
+                event_extra={"reason": reason, "returncode": process.returncode, "escalated": state.cancel_escalated},
+                data_extra={"cancelled": True, "reason": reason},
+                visibility="user",
             )
 
         output = combined_output(stdout, stderr) or f"Command exited {process.returncode}."
-        artifact = write_tool_output_artifact(state, call, "command-output", output, kind="command_output")
-        context_artifact = write_context_tool_output(state, call, output, kind="shell_output")
-        context_read_path = model_readable_path(state, context_artifact)
-        preview = visible_output(output, state)
         ok = process.returncode == 0
         failure_kind = None if ok else "command_failed"
-        failure_data = _failure_data(failure_kind, capability="process", source="tool", recoverability="inspect_output")
-        state.emit(
-            "command.completed" if ok else "command.failed",
-            {
-                "tool_call_id": call.id,
-                "cmd": cmd,
+        return _finish_command(
+            state,
+            call,
+            started,
+            envelope,
+            cmd,
+            process,
+            output,
+            event_type="command.completed" if ok else "command.failed",
+            ok=ok,
+            summary=f"Command exited {process.returncode}.",
+            failure_kind=failure_kind,
+            recoverability="inspect_output",
+            event_extra={
                 "ok": ok,
                 "timeout": False,
                 "returncode": process.returncode,
                 "stdout_chars": len(stdout),
                 "stderr_chars": len(stderr),
-                "output_artifact": artifact,
-                "context_artifact": context_artifact,
-                "output_chars": len(output),
-                "duration_ms": _duration_ms(started),
-                "failure_kind": failure_kind,
-                **failure_data,
-                "execution_envelope": envelope.to_json_dict(),
             },
+            metadata_extra={"stdout_chars": len(stdout), "stderr_chars": len(stderr)},
         )
-        return ToolResult(
-            tool_name=self.name,
-            call_id=call.id,
-            output=preview,
-            ok=ok,
-            exit_code=process.returncode,
-            duration_ms=_duration_ms(started),
-            summary=f"Command exited {process.returncode}.",
-            content_preview=preview,
-            artifact_path=context_artifact,
-            truncated=len(preview) < len(output),
-            failure_kind=failure_kind,
-            data={
-                "cmd": cmd,
-                "returncode": process.returncode,
-                "output_artifact": artifact,
-                "context_artifact": context_artifact,
-                "output_chars": len(output),
-                "duration_ms": _duration_ms(started),
-                "failure_kind": failure_kind,
-                **failure_data,
-            },
-            metadata={
-                "cwd": str(envelope.cwd),
-                "stdout_chars": len(stdout),
-                "stderr_chars": len(stderr),
-                "command_normalized": cmd,
-                "execution_envelope": envelope.to_json_dict(),
-            },
-            read_hints=read_hints(context_read_path, failure=not ok),
-        )
+
+
+def _capture_shell_output(state: RunState, call: ToolCall, output: str) -> ToolOutputCapture:
+    return capture_tool_output(state, call, output, prefix="command-output", kind="command_output", context_kind="shell_output")
+
+
+def _finish_command(
+    state: RunState,
+    call: ToolCall,
+    started: float,
+    envelope: Any,
+    cmd: str,
+    process: subprocess.Popen[str],
+    output: str,
+    *,
+    event_type: str,
+    ok: bool,
+    summary: str,
+    failure_kind: str | None,
+    recoverability: str,
+    event_extra: dict[str, Any],
+    data_extra: dict[str, Any] | None = None,
+    metadata_extra: dict[str, Any] | None = None,
+    visibility: str = "debug",
+) -> ToolResult:
+    captured = _capture_shell_output(state, call, output)
+    elapsed_ms = duration_ms(started)
+    failure_data = _failure_data(failure_kind, capability="process", source="tool", recoverability=recoverability)
+    state.emit(
+        event_type,
+        {
+            "tool_call_id": call.id,
+            "cmd": cmd,
+            **event_extra,
+            **captured.data,
+            "duration_ms": elapsed_ms,
+            "failure_kind": failure_kind,
+            **failure_data,
+            "execution_envelope": envelope.to_json_dict(),
+        },
+        visibility=visibility,
+    )
+    return captured.tool_result(
+        call.name,
+        call,
+        ok=ok,
+        exit_code=process.returncode,
+        duration_ms=elapsed_ms,
+        summary=summary,
+        failure_kind=failure_kind,
+        data={
+            "cmd": cmd,
+            "returncode": process.returncode,
+            **(data_extra or {}),
+            **captured.data,
+            "duration_ms": elapsed_ms,
+            "failure_kind": failure_kind,
+            **failure_data,
+        },
+        metadata=_command_metadata(envelope, cmd, **(metadata_extra or {})),
+        failure=not ok,
+    )
+
+
+def _command_metadata(envelope: Any, cmd: str, **extra: Any) -> dict[str, Any]:
+    return {
+        "cwd": str(envelope.cwd),
+        **extra,
+        "command_normalized": cmd,
+        "execution_envelope": envelope.to_json_dict(),
+    }
 
 
 def _communicate_with_cancel(process: subprocess.Popen[str], state: RunState, timeout: int) -> tuple[str, str]:
@@ -350,11 +323,6 @@ def _signal_process_group(process: subprocess.Popen[str], sig: signal.Signals) -
         os.killpg(process.pid, sig)
     except ProcessLookupError:
         return
-
-
-def _duration_ms(started: float) -> int:
-    return int((time.monotonic() - started) * 1000)
-
 
 def _failure_data(failure_kind: str | None, *, capability: str, source: str, recoverability: str) -> dict[str, str]:
     if not failure_kind:

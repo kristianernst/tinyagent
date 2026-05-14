@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from tinyagent.core.artifacts import TOOL_RESULT_ARTIFACT_KEYS
 from tinyagent.core.events import Event, load_events_jsonl
 
 
@@ -95,10 +96,9 @@ def _event_detail(event: Event) -> str:
             | "tool.execution.cancelled"
             | "tool.execution.blocked"
         ):
-            artifact = str(data.get("artifact_path") or "")
-            if isinstance(data.get("data"), dict):
-                artifact = artifact or str(data["data"].get("context_artifact") or data["data"].get("output_artifact") or "")
-            return f"{data.get('tool')} {data.get('tool_call_id')} {artifact}".strip()
+            return f"{data.get('tool')} {data.get('tool_call_id')} {_artifact_ref(data)}".strip()
+        case "tool.execution.output.snapshot":
+            return f"{data.get('tool')} {data.get('tool_call_id')} {_artifact_ref(data)}".strip()
         case "context.report.written":
             return f"model_call={data.get('model_call_index')} {data.get('context_report_artifact') or ''}".strip()
         case "contextfs.index.updated":
@@ -115,4 +115,19 @@ def _event_detail(event: Event) -> str:
             return f"available={data.get('available')} chars={data.get('chars')}"
         case "artifact.materialized":
             return str(data.get("path") or "")
+    return ""
+
+
+def _artifact_ref(data: dict) -> str:
+    artifact = str(data.get("artifact_path") or "")
+    if artifact:
+        return artifact
+    for key in TOOL_RESULT_ARTIFACT_KEYS:
+        if data.get(key):
+            return str(data[key])
+    nested = data.get("data")
+    if isinstance(nested, dict):
+        for key in TOOL_RESULT_ARTIFACT_KEYS:
+            if nested.get(key):
+                return str(nested[key])
     return ""

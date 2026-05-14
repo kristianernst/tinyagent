@@ -6,6 +6,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from tinyagent.core.artifacts import tool_result_artifact_refs
 from tinyagent.core.context.checkpoint import is_test_command_text
 from tinyagent.core.state import RunState, ToolCall, ToolResult
 
@@ -281,11 +282,7 @@ def _command_failure_observation(call: ToolCall, result: ToolResult, *, cmd: str
 
 
 def _result_refs(result: ToolResult) -> tuple[str, ...]:
-    refs: list[str] = []
-    for value in (result.artifact_path, result.data.get("context_artifact"), result.data.get("output_artifact")):
-        if isinstance(value, str) and value and value not in refs:
-            refs.append(value)
-    return tuple(refs)
+    return tool_result_artifact_refs(result)
 
 
 def _is_policy_block(result: ToolResult) -> bool:

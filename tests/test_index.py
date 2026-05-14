@@ -131,6 +131,25 @@ def test_workspace_index_context_read_blocks_protected_env(tmp_path) -> None:
     assert "protected environment file" in decision.reason
 
 
+def test_workspace_index_excludes_secret_paths_from_search(tmp_path) -> None:
+    (tmp_path / ".ssh").mkdir()
+    (tmp_path / ".ssh" / "config").write_text("hidden-needle\n")
+    (tmp_path / ".npmrc").write_text("hidden-needle\n")
+    (tmp_path / "visible.txt").write_text("visible-needle\n")
+    state = RunState.create("search", Workspace(tmp_path), run_id="run_search_secret_paths")
+    state.workspace_index = WorkspaceIndexManager.for_workspace(tmp_path)
+
+    hidden = SearchCodeTool().run(ToolCall(name="search_code", args={"query": "hidden-needle"}), state)
+    visible = SearchCodeTool().run(ToolCall(name="search_code", args={"query": "visible-needle"}), state)
+
+    assert hidden.ok is True
+    assert "No code results found" in hidden.output
+    assert ".ssh" not in hidden.output
+    assert ".npmrc" not in hidden.output
+    assert visible.ok is True
+    assert "visible.txt" in visible.output
+
+
 def test_search_code_semantic_mode_is_explicitly_unavailable(tmp_path) -> None:
     (tmp_path / "tiny.py").write_text("needle\n")
     state = RunState.create("search", Workspace(tmp_path), run_id="run_search_semantic")

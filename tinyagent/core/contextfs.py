@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import difflib
 import json
 import re
 import shlex
@@ -10,6 +9,7 @@ import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from tinyagent.core.artifacts import tool_result_artifact_refs
 from tinyagent.core.contextfs_render import (
     OPTIONAL_CONTEXT_FILE_RELS,
     STATIC_CONTEXT_FILE_RELS,
@@ -21,15 +21,35 @@ from tinyagent.core.contextfs_render import (
     render_tool_docs,
     static_context_file_specs,
 )
+from tinyagent.core.diffs import join_diff_parts, new_file_patch
+from tinyagent.core.path_safety import (
+    SECRET_DIR_NAMES,
+    SECRET_FILE_NAMES,
+    checked_relative_path,
+    looks_like_secret_path,
+    relative_path_is_within,
+    resolved_relative_to,
+    safe_artifact_name,
+)
 
 if TYPE_CHECKING:
-    from tinyagent.core.state import RunState, ToolCall, ToolStep
+    from tinyagent.core.state import RunState, ToolCall
 
 
 CONTEXT_DIR = "context"
-MAX_UNTRACKED_DIFF_BYTES = 1_000_000
 _STATIC_CONTEXT_FILES = frozenset(STATIC_CONTEXT_FILE_RELS)
-_SECRET_FILE_NAMES = frozenset({".env", ".npmrc", ".pypirc", ".netrc"})
+_TOOL_CONTEXT_DIRS = {
+    "apply_patch": "patch",
+    "shell": "shell",
+    "str_replace_edit": "patch",
+    "write_file": "patch",
+}
+_RECOVERY_ARTIFACT_RULES = (
+    ("artifacts/context-checkpoint-", ".md", "context_checkpoint"),
+    ("artifacts/context-search-", ".txt", "context_search_output"),
+    ("artifacts/context-read-", ".txt", "context_read_output"),
+    ("artifacts/workspace-delta-", "", "workspace_delta"),
+)
 
 
 def contextfs_index_path(state: "RunState") -> str:
@@ -73,25 +93,7 @@ def resolve_context_path(state: "RunState", value: str) -> Path:
         if rel_posix not in allowed_context_read_paths(state):
             raise ValueError(f"Context path is not part of the current run recovery surface: {value}")
         return candidate
-    if (
-        rel_posix.startswith("artifacts/context-checkpoint-")
-        and rel_posix.endswith(".md")
-        and artifact_kind(state, rel_posix) == "context_checkpoint"
-    ):
-        return candidate
-    if (
-        rel_posix.startswith("artifacts/context-search-")
-        and rel_posix.endswith(".txt")
-        and artifact_kind(state, rel_posix) == "context_search_output"
-    ):
-        return candidate
-    if (
-        rel_posix.startswith("artifacts/context-read-")
-        and rel_posix.endswith(".txt")
-        and artifact_kind(state, rel_posix) == "context_read_output"
-    ):
-        return candidate
-    if rel_posix.startswith("artifacts/workspace-delta-") and artifact_kind(state, rel_posix) == "workspace_delta":
+    if _recovery_artifact_allowed(state, rel_posix):
         return candidate
     raise ValueError(f"Context path is not an allowed recovery file: {value}")
 
@@ -110,14 +112,16 @@ def artifact_kind(state: "RunState", relative_path: str) -> str | None:
     return None
 
 
+def _recovery_artifact_allowed(state: "RunState", artifact: str) -> bool:
+    return any(
+        artifact.startswith(prefix) and (not suffix or artifact.endswith(suffix)) and artifact_kind(state, artifact) == kind
+        for prefix, suffix, kind in _RECOVERY_ARTIFACT_RULES
+    )
+
+
 def write_context_tool_output(state: "RunState", call: "ToolCall", output: str, *, kind: str) -> str:
     sequence = len(state.tool_steps) + 1
-    if call.name == "shell":
-        tool_dir = "shell"
-    elif call.name in {"apply_patch", "str_replace_edit", "write_file"}:
-        tool_dir = "patch"
-    else:
-        tool_dir = safe_artifact_name(call.name)
+    tool_dir = _TOOL_CONTEXT_DIRS.get(call.name, safe_artifact_name(call.name))
     path = Path(CONTEXT_DIR) / tool_dir / f"{sequence:04d}-{safe_artifact_name(call.id)}.txt"
     absolute = state.output_dir / path
     absolute.parent.mkdir(parents=True, exist_ok=True)
@@ -156,7 +160,7 @@ def allowed_context_read_paths(state: "RunState") -> set[str]:
             if isinstance(path, str) and path.startswith("context/"):
                 paths.add(path)
     for step in state.tool_steps:
-        for artifact in _tool_artifact_candidates(step):
+        for artifact in tool_result_artifact_refs(step.result):
             if isinstance(artifact, str) and artifact.startswith("context/"):
                 paths.add(artifact)
     for path in _diff_doc_paths(state):
@@ -203,19 +207,26 @@ def refresh_contextfs(state: "RunState") -> str:
 
 
 def _write_text(state: "RunState", relative: str, content: str) -> None:
-    rel = Path(relative)
-    if not rel.parts or rel.parts[0] != CONTEXT_DIR:
-        rel = Path(CONTEXT_DIR) / rel
+    rel = _context_relative_path(relative)
     path = state.output_dir / rel
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content)
+
+
+def _context_relative_path(relative: str) -> Path:
+    rel = checked_relative_path(relative, label="ContextFS path")
+    if rel.parts[0] != CONTEXT_DIR:
+        rel = Path(CONTEXT_DIR) / rel
+    if rel.parts == (CONTEXT_DIR,):
+        raise ValueError(f"ContextFS path must name a file inside {CONTEXT_DIR}: {relative}")
+    return rel
 
 
 def _context_render_helpers(state: "RunState") -> ContextRenderHelpers:
     return ContextRenderHelpers(
         context_ref=context_display_ref,
         safe_recovery_artifact_ref=lambda artifact: _safe_recovery_artifact_ref(state, artifact),
-        primary_tool_artifact=_primary_tool_artifact,
+        tool_artifact_refs=lambda step: tool_result_artifact_refs(step.result),
         safe_transcript_refs=lambda refs: _safe_transcript_refs(state, refs),
         sanitize_value=lambda value: _sanitize_context_value(state, value),
         sanitize_data=lambda value: _sanitize_context_data(state, value),
@@ -249,7 +260,7 @@ def _repo_diff_text(state: "RunState") -> str:
         diff_args = ["diff", "--no-ext-diff", "HEAD", "--", *paths] if _git_has_head(state) else ["diff", "--no-ext-diff", "--", *paths]
         diff = _git(state, diff_args) or ""
     untracked = _untracked_diff_text(state)
-    return _join_nonempty(diff, untracked)
+    return join_diff_parts(diff, untracked)
 
 
 def _raw_history_text(state: "RunState") -> str:
@@ -297,31 +308,7 @@ def _safe_recovery_artifact_ref(state: "RunState", artifact: object) -> str | No
         return None
     if artifact.startswith("context/"):
         return artifact
-    if artifact.startswith("artifacts/context-checkpoint-") and artifact.endswith(".md") and _artifact_kind(state, artifact) == "context_checkpoint":
-        return artifact
-    if artifact.startswith("artifacts/context-search-") and artifact.endswith(".txt") and _artifact_kind(state, artifact) == "context_search_output":
-        return artifact
-    if artifact.startswith("artifacts/context-read-") and artifact.endswith(".txt") and _artifact_kind(state, artifact) == "context_read_output":
-        return artifact
-    if artifact.startswith("artifacts/workspace-delta-") and _artifact_kind(state, artifact) == "workspace_delta":
-        return artifact
-    return None
-
-
-def _tool_artifact_candidates(step: "ToolStep") -> tuple[object, ...]:
-    return (
-        step.result.artifact_path,
-        step.result.data.get("context_artifact"),
-        step.result.data.get("output_artifact"),
-        step.result.data.get("captured_output_artifact"),
-    )
-
-
-def _primary_tool_artifact(step: "ToolStep") -> object:
-    for artifact in _tool_artifact_candidates(step):
-        if artifact:
-            return artifact
-    return None
+    return artifact if _recovery_artifact_allowed(state, artifact) else None
 
 
 def _diff_doc_paths(state: "RunState") -> list[str]:
@@ -343,13 +330,6 @@ def _diff_artifact_targets(state: "RunState") -> list[tuple[str, str]]:
     return output
 
 
-def _artifact_kind(state: "RunState", artifact: str) -> str | None:
-    for event in reversed(state.events):
-        if event.type == "artifact.created" and event.data.get("path") == artifact:
-            return str(event.data.get("kind") or "")
-    return None
-
-
 def _untracked_diff_text(state: "RunState") -> str:
     paths = _git(state, ["ls-files", "--others", "--exclude-standard"])
     if not paths:
@@ -359,37 +339,9 @@ def _untracked_diff_text(state: "RunState") -> str:
         if _is_hidden_recovery_path(state, path):
             continue
         absolute = state.workspace.root / path
-        if absolute.is_symlink() or not absolute.is_file():
-            continue
-        try:
-            file_size = absolute.stat().st_size
-        except OSError:
-            continue
-        header = f"diff --git a/{path} b/{path}\nnew file mode 100644\nindex 0000000..0000000\n"
-        if file_size > MAX_UNTRACKED_DIFF_BYTES:
-            parts.append(f"{header}Binary files /dev/null and b/{path} differ\n")
-            continue
-        try:
-            raw = absolute.read_bytes()
-        except OSError:
-            continue
-        if b"\0" in raw:
-            parts.append(f"{header}Binary files /dev/null and b/{path} differ\n")
-            continue
-        text = raw.decode(errors="replace")
-        body = "\n".join(difflib.unified_diff([], text.splitlines(), fromfile="/dev/null", tofile=f"b/{path}", lineterm=""))
-        parts.extend(
-            [
-                header.rstrip(),
-                body,
-                "",
-            ]
-        )
-    return "\n".join(parts)
-
-
-def _join_nonempty(*parts: str) -> str:
-    return "\n".join(part.rstrip() for part in parts if part and part.strip()) + ("\n" if any(part and part.strip() for part in parts) else "")
+        if absolute.is_file():
+            parts.append(new_file_patch(absolute, path))
+    return join_diff_parts(*parts)
 
 
 def _filter_hidden_status(state: "RunState", status: str) -> str:
@@ -419,22 +371,12 @@ def _is_hidden_recovery_path(state: "RunState", path: str) -> bool:
         return True
     if _is_output_dir_path(state, normalized):
         return True
-    for part in Path(normalized).parts:
-        if part == ".ssh":
-            return True
-        if part in _SECRET_FILE_NAMES or part.startswith(".env."):
-            return True
-    return False
+    return looks_like_secret_path(normalized)
 
 
 def _is_output_dir_path(state: "RunState", path: str) -> bool:
-    try:
-        output_relative = state.output_dir.resolve().relative_to(state.workspace.root.resolve()).as_posix()
-    except ValueError:
-        return False
-    if output_relative in {"", "."}:
-        return True
-    return path == output_relative or path.startswith(f"{output_relative}/")
+    output_relative = resolved_relative_to(state.output_dir, state.workspace.root)
+    return output_relative is not None and relative_path_is_within(path, output_relative)
 
 
 def _safe_event_data(state: "RunState", event_type: str, data: dict) -> dict[str, object]:
@@ -526,9 +468,9 @@ def _sanitize_context_value(state: "RunState", value: str) -> str:
     output = str(value)
     output = re.sub(r"artifacts/(model-(?:request|response)[A-Za-z0-9_.-]*|context-report-[A-Za-z0-9_.-]*|context-[0-9][A-Za-z0-9_.-]*)", "(internal artifact)", output)
     output = re.sub(r"(?i)(token|api[_-]?key|password|secret)=([^\s&]+)", r"\1=(redacted)", output)
-    for secret_name in _SECRET_FILE_NAMES:
+    output = re.sub(r"\.env(?:\.[A-Za-z0-9_.-]+)?", "(hidden)", output)
+    for secret_name in sorted((SECRET_FILE_NAMES | SECRET_DIR_NAMES) - {".env"}):
         output = output.replace(secret_name, "(hidden)")
-    output = re.sub(r"\.env\.[A-Za-z0-9_.-]+", "(hidden)", output)
     root_text = state.workspace.root.as_posix()
     output_text = state.output_dir.as_posix()
     output = output.replace(output_text, "(run output)")
@@ -554,7 +496,3 @@ def _git(state: "RunState", args: list[str]) -> str | None:
 
 def _git_has_head(state: "RunState") -> bool:
     return _git(state, ["rev-parse", "--verify", "HEAD"]) is not None
-
-
-def safe_artifact_name(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value or "call")

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from tinyagent.core.output import write_text_artifact
+from tinyagent.core.path_safety import safe_artifact_name
 from tinyagent.core.skills.registry import SkillRegistry
 from tinyagent.core.state import RunState, ToolCall, ToolResult
-from tinyagent.core.tools.core import error_result, safe_artifact_name, visible_output
+from tinyagent.core.tools.core import error_result, visible_output
 
 MAX_LOADED_SKILL_CHARS = 60_000
 

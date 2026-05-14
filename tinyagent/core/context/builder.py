@@ -7,6 +7,7 @@ import os
 from collections.abc import Sequence
 from typing import Any
 
+from tinyagent.core.artifacts import tool_result_artifact_refs
 from tinyagent.core.context.checkpoint import artifact_refs_from_tool_steps, is_test_command_text
 from tinyagent.core.context.instructions import load_project_instructions
 from tinyagent.core.context.types import BuiltContext, ContextConfig, ContextExclusion, ContextItem, ContextPlan, ProjectInstructions
@@ -301,15 +302,7 @@ def _observation_tool_indexes(steps: Sequence[ToolStep], state: RunState, kinds:
             if call_id and step.call.id == call_id:
                 indexes.add(index)
                 continue
-            step_refs = {
-                ref
-                for ref in (
-                    step.result.artifact_path,
-                    step.result.data.get("context_artifact"),
-                    step.result.data.get("output_artifact"),
-                )
-                if isinstance(ref, str)
-            }
+            step_refs = set(tool_result_artifact_refs(step.result))
             if refs & step_refs:
                 indexes.add(index)
     return indexes
@@ -340,7 +333,7 @@ def _render_tool_step(step: ToolStep, state: RunState) -> str:
     failure_kind = result.failure_kind or result.data.get("failure_kind")
     if failure_kind:
         lines.append(f"Failure kind: {failure_kind}")
-    artifact = result.artifact_path or result.data.get("context_artifact") or result.data.get("output_artifact")
+    artifact = next(iter(tool_result_artifact_refs(result)), None)
     if artifact:
         lines.append(f"Artifact: {artifact}")
     read_hints = _model_visible_read_hints(state, artifact, result.read_hints)
@@ -394,6 +387,7 @@ def _bounded_text(value: str, max_chars: int) -> str:
 def _small_tool_data(data: dict[str, Any]) -> dict[str, Any]:
     omitted = {
         "context_artifact",
+        "captured_output_artifact",
         "output_artifact",
         "output_chars",
         "stdout_chars",

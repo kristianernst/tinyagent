@@ -4,6 +4,7 @@ import subprocess
 from collections.abc import Sequence
 
 from tinyagent.core.context import ContextConfig, load_project_instructions
+from tinyagent.core.context.checkpoint import artifact_refs_from_tool_steps
 from tinyagent.core.contracts import Tool
 from tinyagent.core.kernel import Kernel
 from tinyagent.core.models import FakeModelProvider
@@ -356,3 +357,28 @@ def test_fake_model_remains_usable_with_layered_context(tmp_path, monkeypatch) -
     response = FakeModelProvider([ModelResponse(content="ok")]).complete(profile.build_messages(state), [], state)
 
     assert response.content == "ok"
+
+
+def test_artifact_refs_from_tool_steps_skips_empty_refs_and_dedupes() -> None:
+    steps = [
+        ToolStep(
+            call=ToolCall(name="shell", id="call_1"),
+            result=ToolResult(
+                tool_name="shell",
+                output="ok",
+                data={"context_artifact": "", "output_artifact": "artifacts/output.txt"},
+            ),
+        ),
+        ToolStep(
+            call=ToolCall(name="shell", id="call_2"),
+            result=ToolResult(
+                tool_name="shell",
+                output="ok",
+                data={"context_artifact": "artifacts/output.txt", "captured_output_artifact": "artifacts/captured.txt"},
+            ),
+        ),
+    ]
+
+    refs = artifact_refs_from_tool_steps(steps)
+
+    assert [ref.path for ref in refs] == ["artifacts/output.txt", "artifacts/captured.txt"]

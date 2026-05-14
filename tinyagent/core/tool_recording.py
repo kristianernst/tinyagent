@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from tinyagent.core.artifacts import tool_result_artifact_refs
 from tinyagent.core.events import small_event_data
 from tinyagent.core.observations import extract_observations
 from tinyagent.core.state import RunState, ToolCall, ToolResult, ToolStep
@@ -27,7 +28,7 @@ def record_tool_result_event(state: RunState, call: ToolCall, result: ToolResult
     output_limit = state.budgets.max_command_output_chars_visible
     output = result.output[:output_limit]
     output_chars = _output_chars(result)
-    if result.artifact_path or result.data.get("output_artifact"):
+    if tool_result_artifact_refs(result):
         state.emit(
             "tool.execution.output.snapshot",
             {
@@ -37,6 +38,7 @@ def record_tool_result_event(state: RunState, call: ToolCall, result: ToolResult
                 "artifact_path": result.artifact_path,
                 "output_artifact": result.data.get("output_artifact"),
                 "context_artifact": result.data.get("context_artifact"),
+                "captured_output_artifact": result.data.get("captured_output_artifact"),
             },
         )
     payload = {
@@ -64,15 +66,6 @@ def record_tool_result_event(state: RunState, call: ToolCall, result: ToolResult
 
 
 def append_tool_step(state: RunState, call: ToolCall, result: ToolResult) -> None:
-    artifact_refs = tuple(
-        ref
-        for ref in (
-            result.artifact_path,
-            result.data.get("context_artifact"),
-            result.data.get("output_artifact"),
-        )
-        if isinstance(ref, str) and ref
-    )
     state.transcript.record_tool_result(
         item_id=f"transcript-tool-result-{len(state.tool_steps) + 1:04d}",
         turn_id=state.current_turn_id,
@@ -81,7 +74,7 @@ def append_tool_step(state: RunState, call: ToolCall, result: ToolResult) -> Non
         ok=result.ok,
         summary=result.summary or _first_line(result.output) or ("ok" if result.ok else "failed"),
         failure_kind=result.failure_kind or result.data.get("failure_kind"),
-        artifact_refs=artifact_refs,
+        artifact_refs=tool_result_artifact_refs(result),
         synthetic=bool(result.data.get("blocked") or result.data.get("progress_blocked")),
         data={
             "exit_code": result.exit_code,

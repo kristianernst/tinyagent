@@ -11,10 +11,19 @@ import time
 import pytest
 
 from tinyagent.core.context import estimate_messages_tokens, estimate_tools_tokens
+from tinyagent.core.diffs import MAX_UNTRACKED_DIFF_BYTES
 from tinyagent.core.index import SearchCodeTool, WorkspaceIndexManager
 from tinyagent.core.kernel import Kernel
 from tinyagent.core.models import FakeModelProvider, ModelSpec
-from tinyagent.core.output import MAX_UNTRACKED_DIFF_BYTES, capture_final_diff
+from tinyagent.core.output import capture_final_diff, write_text_artifact
+from tinyagent.core.path_safety import (
+    checked_relative_path,
+    is_env_file_name,
+    looks_like_env_path,
+    looks_like_secret_path,
+    relative_path_is_within,
+    safe_artifact_name,
+)
 from tinyagent.core.policy import LocalPolicy
 from tinyagent.core.profile_catalog import (
     DEFAULT_RUNTIME_CAPABILITIES,
@@ -45,6 +54,35 @@ class WorkspaceShellPolicy(LocalPolicy):
         if decision.kind == "needs_approval" and decision.permission == "bash":
             return PolicyDecision.allow("test permits workspace shell", matched_rule="test.bash.allow", permission="bash")
         return decision
+
+
+def test_path_safety_helpers_cover_artifacts_envs_secrets_and_containment() -> None:
+    assert [safe_artifact_name(value) for value in ("call/with spaces:and*chars", "", ".", "..")] == [
+        "call_with_spaces_and_chars",
+        "call",
+        "call",
+        "call",
+    ]
+    assert [is_env_file_name(value) for value in (".env", ".env.local", "config.env")] == [True, True, False]
+    assert [looks_like_secret_path(value) for value in (".ssh/config", "package/.npmrc", "src/env.py")] == [True, True, False]
+    assert looks_like_env_path("config/.env.local")
+    assert checked_relative_path("nested/file.txt").as_posix() == "nested/file.txt"
+    for value in ("", "/tmp/file.txt", "../file.txt", "nested/../../file.txt"):
+        with pytest.raises(ValueError):
+            checked_relative_path(value)
+    containment_cases = (("out/file.txt", "out"), ("file.txt", "."), ("output/file.txt", "out"), ("out-file.txt", "out"))
+    assert [relative_path_is_within(path, parent) for path, parent in containment_cases] == [True, True, False, False]
+
+
+def test_write_text_artifact_rejects_names_outside_artifacts(tmp_path) -> None:
+    state = RunState.create("artifact boundary", Workspace(tmp_path), run_id="run_artifact_boundary")
+
+    for name in ("../escape.txt", "/tmp/tinyagent-escape.txt", "nested/../../escape.txt", ""):
+        with pytest.raises(ValueError):
+            write_text_artifact(state, name, "escape\n", kind="test")
+
+    assert not (tmp_path / "escape.txt").exists()
+    assert not any(event.type == "artifact.created" for event in state.events)
 
 
 def test_list_and_code_search_exclude_tinyagent_outputs(tmp_path) -> None:
@@ -140,6 +178,20 @@ def test_custom_output_dir_is_excluded_from_list_search_and_final_diff(tmp_path)
     assert "run-output" not in state.final_diff
 
 
+def test_final_diff_handles_output_dir_outside_workspace(tmp_path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    output_dir = tmp_path.parent / "outside-run-output"
+    output_dir.mkdir()
+    (output_dir / "events.jsonl").write_text("trace\n")
+    (tmp_path / "real.txt").write_text("workspace\n")
+    state = RunState.create("outside output", Workspace(tmp_path), run_id="run_outside_output", output_dir=output_dir)
+
+    capture_final_diff(state)
+
+    assert "real.txt" in state.final_diff
+    assert "outside-run-output" not in state.final_diff
+
+
 def test_final_diff_skips_untracked_symlink_without_reading_target(tmp_path) -> None:
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
     outside = tmp_path.parent / "outside-secret.txt"
@@ -165,6 +217,22 @@ def test_final_diff_caps_large_untracked_file_content(tmp_path) -> None:
 
     assert "secret" not in state.final_diff
     assert "Binary files /dev/null and b/large.txt differ" in state.final_diff
+
+
+def test_final_diff_excludes_untracked_secret_paths(tmp_path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    (tmp_path / ".env.local").write_text("TOKEN=final-diff-secret\n")
+    (tmp_path / ".npmrc").write_text("//registry.example/:_authToken=npm-secret\n")
+    (tmp_path / ".ssh").mkdir()
+    (tmp_path / ".ssh" / "config").write_text("Host hidden-ssh-secret\n")
+    (tmp_path / "visible.txt").write_text("visible\n")
+    state = RunState.create("test", Workspace(tmp_path), run_id="run_secret_final_diff")
+
+    capture_final_diff(state)
+
+    assert "visible.txt" in state.final_diff
+    for hidden in ("final-diff-secret", "npm-secret", "hidden-ssh-secret", ".env.local", ".npmrc", ".ssh"):
+        assert hidden not in state.final_diff
 
 
 def test_local_policy_blocks_outside_paths_and_risky_shell(tmp_path) -> None:

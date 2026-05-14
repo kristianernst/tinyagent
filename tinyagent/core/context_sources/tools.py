@@ -6,8 +6,9 @@ import time
 
 from tinyagent.core.context_sources.registry import ContextRegistry, context_registry_for_state
 from tinyagent.core.output import write_text_artifact
+from tinyagent.core.path_safety import safe_artifact_name
 from tinyagent.core.state import RunState, ToolCall, ToolResult
-from tinyagent.core.tools.core import error_result, safe_artifact_name, visible_output
+from tinyagent.core.tools.core import error_result, visible_output
 
 
 class ContextSearchTool:

@@ -12,6 +12,7 @@ from typing import Literal
 
 from tinyagent.core.contracts import PolicyEngine
 from tinyagent.core.index.safety import parse_code_ref
+from tinyagent.core.path_safety import looks_like_env_path, resolved_relative_to
 from tinyagent.core.state import ApprovalRequest, PolicyDecision, RunState, ToolCall
 from tinyagent.core.tools import patch_paths, resolve_workspace_path
 
@@ -425,7 +426,7 @@ def _is_protected_output_path(path: Path, state: RunState) -> bool:
         output_dir / "final.diff",
         output_dir / "metrics.json",
     }
-    if any(_is_relative_to(path, root.resolve()) for root in protected_dirs):
+    if any(resolved_relative_to(path, root) is not None for root in protected_dirs):
         return True
     return path in {file.resolve() for file in protected_files}
 
@@ -575,7 +576,7 @@ def _protected_tinyagent_write(cmd: str) -> str:
 def _env_file_access(cmd: str) -> str:
     for word in _shell_words(cmd):
         normalized = word.strip("'\"")
-        if _looks_like_env_path(normalized):
+        if looks_like_env_path(normalized):
             return normalized
     match = _ENV_FILE_PATTERN.search(cmd)
     return match.group("path").strip(" '\"(=") if match else ""
@@ -586,11 +587,6 @@ def _shell_words(cmd: str) -> list[str]:
         return shlex.split(cmd)
     except ValueError:
         return cmd.split()
-
-
-def _looks_like_env_path(value: str) -> bool:
-    parts = Path(value).parts
-    return any(part == ".env" or part.startswith(".env.") for part in parts)
 
 
 def _mcp_server_from_context_ref(ref: str) -> str:
@@ -667,14 +663,6 @@ def _resolve_permission(config: PolicyConfig, permission: str, target: str) -> R
             action = rule.action
             matched_rule = f"{permission}:{rule.pattern}:{rule.action}"
     return ResolvedPolicyRule(action=action, matched_rule=matched_rule)
-
-
-def _is_relative_to(path: Path, root: Path) -> bool:
-    try:
-        path.relative_to(root)
-    except ValueError:
-        return False
-    return True
 
 
 def _decision_from_action(

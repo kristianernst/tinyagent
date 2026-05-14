@@ -7,10 +7,10 @@ from pathlib import Path
 from tinyagent.core.contextfs import model_readable_path, read_hints, write_context_tool_output
 from tinyagent.core.contracts import Tool
 from tinyagent.core.index.safety import EXCLUDED_INDEX_DIRS, MAX_INDEX_FILE_BYTES, is_excluded_index_path
+from tinyagent.core.path_safety import resolved_relative_to
 from tinyagent.core.state import RunState, ToolCall, ToolResult
 from tinyagent.core.tools.core import (
     error_result,
-    is_relative_to,
     relative_workspace_path,
     resolve_workspace_path,
     visible_output,
@@ -161,14 +161,12 @@ def _iter_workspace_files(state: RunState, root: Path, *, max_files: int) -> lis
 
 
 def _excluded(state: RunState, path: Path) -> bool:
-    try:
-        resolved = path.resolve()
-        resolved.relative_to(state.workspace.root)
-    except ValueError:
+    resolved = path.resolve()
+    if resolved_relative_to(resolved, state.workspace.root) is None:
         return True
     if is_excluded_index_path(state.workspace.root, resolved):
         return True
-    return _output_dir_inside_workspace(state) is not None and is_relative_to(resolved, state.output_dir.resolve())
+    return _output_dir_inside_workspace(state) is not None and resolved_relative_to(resolved, state.output_dir) is not None
 
 
 def _excluded_search_labels(state: RunState) -> list[str]:
@@ -180,7 +178,5 @@ def _excluded_search_labels(state: RunState) -> list[str]:
 
 
 def _output_dir_inside_workspace(state: RunState) -> str | None:
-    try:
-        return state.output_dir.resolve().relative_to(state.workspace.root).as_posix()
-    except ValueError:
-        return None
+    relative = resolved_relative_to(state.output_dir, state.workspace.root)
+    return relative.as_posix() if relative is not None else None

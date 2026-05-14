@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from tinyagent.core.path_safety import SECRET_DIR_NAMES, SECRET_FILE_NAMES, looks_like_secret_path
+
 MAX_INDEX_FILE_BYTES = 1_000_000
 EXCLUDED_INDEX_DIRS = frozenset(
     {
@@ -21,9 +23,9 @@ EXCLUDED_INDEX_DIRS = frozenset(
         ".mypy_cache",
         ".pytest_cache",
         ".ruff_cache",
+        *SECRET_DIR_NAMES,
     }
 )
-SECRET_FILE_NAMES = frozenset({".env", ".npmrc", ".pypirc", ".netrc"})
 LINE_FRAGMENT_RE = re.compile(r"^L(?P<line>[1-9][0-9]*)$")
 
 
@@ -41,8 +43,7 @@ def is_excluded_index_path(root: Path, path: Path) -> bool:
         return True
     if any(part in EXCLUDED_INDEX_DIRS for part in relative.parts):
         return True
-    name = relative.name
-    return name in SECRET_FILE_NAMES or name.startswith(".env.")
+    return looks_like_secret_path(relative)
 
 
 def assert_index_file_readable(root: Path, path: Path, *, ref: str) -> None:
