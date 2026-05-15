@@ -904,6 +904,43 @@ def test_tiny_pi_profile_renders_finish_gate_and_prior_conversation(tmp_path) ->
     assert "Dynamic context sources:" not in combined
 
 
+def test_tiny_pi_profile_hides_unreadable_artifacts_in_direct_build(tmp_path) -> None:
+    state = RunState.create(
+        "follow up",
+        Workspace(tmp_path),
+        run_id="run_tiny_pi_hidden_artifacts",
+        prior_messages=(Message(role="user", content="previous turn"),),
+    )
+    state.prior_context_artifact = "artifacts/prior-context.json"
+    state.tool_steps.append(
+        ToolStep(
+            call=ToolCall(id="call_read", name="read_file", args={"path": "big.txt"}),
+            result=ToolResult(
+                tool_name="read_file",
+                call_id="call_read",
+                output="preview",
+                artifact_path="context/read_file/0001-call_read.txt",
+                read_hints=["tail -120 .tinyagent/runs/run_tiny_pi_hidden_artifacts/context/read_file/0001-call_read.txt"],
+                data={
+                    "path": "big.txt",
+                    "context_artifact": "context/read_file/0001-call_read.txt",
+                    "workspace_delta": {"diff_artifact": "artifacts/workspace-delta-0001.patch"},
+                },
+            ),
+        )
+    )
+
+    combined = "\n".join(str(message.content) for message in TinyPiProfile().build_context(state).messages)
+
+    assert "preview" in combined
+    assert "context/read_file" not in combined
+    assert "artifacts/workspace-delta" not in combined
+    assert "artifacts/prior-context" not in combined
+    assert "tail -120" not in combined
+    assert "context_read(" not in combined
+    assert "contextfs:" not in combined
+
+
 def test_tiny_pi_profile_selects_model_specific_edit_tool(tmp_path) -> None:
     state = RunState.create("test", Workspace(tmp_path), run_id="run_tiny_pi_edit_style")
     state.model_spec = ModelSpec(provider="anthropic", model="claude", protocol="anthropic", edit_style="str_replace").to_json_dict()

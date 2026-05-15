@@ -10,6 +10,10 @@ uv run ruff check .
 uv run scripts/size_report.py --export /tmp/tinyagent-code-export.md
 ```
 
+## Examples
+
+See `examples/README.md` for runnable harness examples, including the web-searcher stress test.
+
 ## CLI
 
 ```bash
@@ -22,6 +26,30 @@ tinyagent eval evals/tiny --provider fake
 Run artifacts are written under `.tinyagent/runs/<run_id>` by default. Events
 store small metadata; larger shell, search, patch, model context, and model
 payload data is written under each run's `artifacts/` directory.
+
+## Model Providers
+
+`fake` is deterministic and offline. `openai-compatible` targets
+`/v1/chat/completions` servers such as llama.cpp. `openai-responses` targets
+OpenAI-compatible `/v1/responses` servers:
+
+```bash
+export TINYAGENT_MODEL_API_KEY=...
+export TINYAGENT_MODEL_NAME=gpt-5.5
+tinyagent run "inspect this repo" --provider openai-responses --workspace .
+```
+
+`openai-codex` uses the same Responses transport with Codex/ChatGPT bearer auth.
+It accepts `TINYAGENT_CODEX_BEARER_TOKEN`, `TINYAGENT_CODEX_AUTH_COMMAND`, or an
+unexpired Codex CLI `auth.json` token:
+
+```bash
+export TINYAGENT_MODEL_NAME=gpt-5.5-codex
+tinyagent run "inspect this repo" --provider openai-codex --workspace .
+```
+
+For long-lived runs, prefer `TINYAGENT_CODEX_AUTH_COMMAND` so token refresh stays
+owned by a dedicated auth helper instead of depending on a cached CLI token.
 
 ## Default tool surface
 

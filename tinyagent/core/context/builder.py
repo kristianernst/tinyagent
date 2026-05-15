@@ -26,20 +26,27 @@ class ContextBuilder:
         self.system_prompt = system_prompt
         self.config = config or ContextConfig()
 
-    def build(self, state: RunState, plan: ContextPlan | None = None) -> BuiltContext:
+    def build(
+        self,
+        state: RunState,
+        plan: ContextPlan | None = None,
+        *,
+        visible_tool_names: Sequence[str] | None = None,
+    ) -> BuiltContext:
         plan = plan or ContextPlan()
+        tool_names = frozenset(visible_tool_names) if visible_tool_names is not None else None
         project_instructions = load_project_instructions(state.workspace.root, self.config)
         environment = render_environment_context(state, self.config)
         project = render_project_instructions(project_instructions)
-        conversation = render_conversation_history(state)
+        conversation = render_conversation_history(state, visible_tool_names=tool_names)
         task = f"Task:\n{state.task}"
         context_plan = render_context_plan(plan)
-        observations = render_observations(state, plan)
+        observations = render_observations(state, plan, visible_tool_names=tool_names)
         finish_gate = render_finish_gate_messages(state)
-        dynamic_sources = render_dynamic_context_sources(state)
-        contextfs_index_path, contextfs_index = render_contextfs_index(state)
-        checkpoint = render_context_checkpoint(state)
-        recent_tools = render_recent_tool_steps(state, self.config, plan)
+        dynamic_sources = render_dynamic_context_sources(state) if _can_search_context(tool_names) else ""
+        contextfs_index_path, contextfs_index = render_contextfs_index(state) if _can_read_context(tool_names) else (None, "")
+        checkpoint = render_context_checkpoint(state, visible_tool_names=tool_names)
+        recent_tools = render_recent_tool_steps(state, self.config, plan, visible_tool_names=tool_names)
         candidates = [
             _item("system:profile", "system", self.system_prompt, "system_prompt", 1000, stable=True),
             _item("environment:current", "user", environment, "environment", 850, stable=True),
@@ -158,7 +165,7 @@ def render_project_instructions(instructions: ProjectInstructions) -> str:
     )
 
 
-def render_conversation_history(state: RunState) -> str:
+def render_conversation_history(state: RunState, *, visible_tool_names: frozenset[str] | None = None) -> str:
     if not state.prior_messages:
         return ""
     lines = ["Conversation history:"]
@@ -167,16 +174,39 @@ def render_conversation_history(state: RunState) -> str:
         if len(content) > 2_000:
             content = content[:1_999] + "..."
         lines.append(f"[{index}] {message.role}: {content}")
-    artifact = f"\nPrior context artifact: {state.prior_context_artifact}" if state.prior_context_artifact else ""
+    artifact = (
+        f"\nPrior context artifact: {state.prior_context_artifact}"
+        if state.prior_context_artifact and _can_read_context(visible_tool_names)
+        else ""
+    )
     return "\n".join(lines) + artifact
 
 
-def render_context_checkpoint(state: RunState) -> str:
+def render_context_checkpoint(state: RunState, *, visible_tool_names: frozenset[str] | None = None) -> str:
     checkpoint = state.context_checkpoint.strip()
     if checkpoint:
-        artifact = f"\n\nCheckpoint artifact: {state.context_checkpoint_artifact}" if state.context_checkpoint_artifact else ""
+        if not _can_read_context(visible_tool_names):
+            checkpoint = _hide_checkpoint_artifacts(checkpoint)
+            artifact = ""
+        else:
+            artifact = f"\n\nCheckpoint artifact: {state.context_checkpoint_artifact}" if state.context_checkpoint_artifact else ""
         return f"Previous checkpoint:\n{checkpoint}{artifact}"
     return "Previous checkpoint:\nNo checkpoint yet."
+
+
+def _hide_checkpoint_artifacts(checkpoint: str) -> str:
+    lines: list[str] = []
+    skipping_artifacts = False
+    for line in checkpoint.splitlines():
+        if line == "## Important Artifacts":
+            lines.extend([line, "- Hidden in this tool surface."])
+            skipping_artifacts = True
+            continue
+        if skipping_artifacts and line.startswith("## "):
+            skipping_artifacts = False
+        if not skipping_artifacts:
+            lines.append(line)
+    return "\n".join(lines)
 
 
 def render_context_plan(plan: ContextPlan) -> str:
@@ -192,7 +222,7 @@ def render_context_plan(plan: ContextPlan) -> str:
     return "\n".join(lines)
 
 
-def render_observations(state: RunState, plan: ContextPlan) -> str:
+def render_observations(state: RunState, plan: ContextPlan, *, visible_tool_names: frozenset[str] | None = None) -> str:
     observations = state.observations[-20:]
     if plan.pinned_observation_kinds:
         pinned = [observation for observation in observations if observation.kind in plan.pinned_observation_kinds]
@@ -204,7 +234,8 @@ def render_observations(state: RunState, plan: ContextPlan) -> str:
         return ""
     lines = ["Recent observations:"]
     for observation in observations:
-        refs = f" refs={', '.join(observation.refs)}" if observation.refs else ""
+        visible_refs = _model_visible_refs(observation.refs, visible_tool_names=visible_tool_names)
+        refs = f" refs={', '.join(visible_refs)}" if visible_refs else ""
         lines.append(f"- {observation.kind}: {observation.summary}{refs}")
     return "\n".join(lines)
 
@@ -239,15 +270,22 @@ def render_finish_gate_messages(state: RunState) -> str:
     return "\n".join(lines)
 
 
-def render_recent_tool_steps(state: RunState, config: ContextConfig | None = None, plan: ContextPlan | None = None) -> str:
+def render_recent_tool_steps(
+    state: RunState,
+    config: ContextConfig | None = None,
+    plan: ContextPlan | None = None,
+    *,
+    visible_tool_names: Sequence[str] | None = None,
+) -> str:
     config = config or ContextConfig()
     plan = plan or ContextPlan()
+    tool_names = frozenset(visible_tool_names) if visible_tool_names is not None else None
     steps = _tool_steps_since_checkpoint(state)
     if not steps:
         label = "None since the last checkpoint." if state.context_checkpoint else "None yet."
         return f"Recent tool results:\n{label}"
 
-    rendered = [_render_tool_step(step, state) for step in steps]
+    rendered = [_render_tool_step(step, state, visible_tool_names=tool_names) for step in steps]
     selected_indexes = _select_recent_tool_indexes(steps, rendered, config, plan, state)
     sections = ["Recent tool results after latest checkpoint:" if state.context_checkpoint else "Recent tool results:"]
     for index in selected_indexes:
@@ -315,7 +353,7 @@ def _latest_index(steps: Sequence[ToolStep], predicate: Any) -> int | None:
     return None
 
 
-def _render_tool_step(step: ToolStep, state: RunState) -> str:
+def _render_tool_step(step: ToolStep, state: RunState, *, visible_tool_names: frozenset[str] | None = None) -> str:
     call = step.call
     result = step.result
     preview_source = result.content_preview or result.output
@@ -334,13 +372,14 @@ def _render_tool_step(step: ToolStep, state: RunState) -> str:
     if failure_kind:
         lines.append(f"Failure kind: {failure_kind}")
     artifact = next(iter(tool_result_artifact_refs(result)), None)
-    if artifact:
-        lines.append(f"Artifact: {artifact}")
-    read_hints = _model_visible_read_hints(state, artifact, result.read_hints)
+    visible_artifact = _model_visible_artifact_ref(artifact, visible_tool_names=visible_tool_names)
+    if visible_artifact:
+        lines.append(f"Artifact: {visible_artifact}")
+    read_hints = _model_visible_read_hints(state, artifact, result.read_hints, visible_tool_names=visible_tool_names)
     if read_hints:
         lines.append("Suggested read:")
         lines.extend(f"- {hint}" for hint in read_hints)
-    small_data = _small_tool_data(result.data)
+    small_data = _small_tool_data(result.data, visible_tool_names=visible_tool_names)
     if small_data:
         lines.append(f"Data: {_small_json(small_data, max_chars=500)}")
     lines.extend(
@@ -352,12 +391,63 @@ def _render_tool_step(step: ToolStep, state: RunState) -> str:
     return "\n".join(lines)
 
 
-def _model_visible_read_hints(state: RunState, artifact: object, read_hints: Sequence[str]) -> list[str]:
+def _model_visible_read_hints(
+    state: RunState,
+    artifact: object,
+    read_hints: Sequence[str],
+    *,
+    visible_tool_names: frozenset[str] | None = None,
+) -> list[str]:
     if isinstance(artifact, str):
-        if artifact.startswith("context/") or artifact.startswith(("artifacts/context-checkpoint-", "artifacts/workspace-delta-")):
-            return [f'context_read({{"ref":"contextfs:{artifact}"}})']
+        if _is_context_read_artifact(artifact):
+            if _can_read_context(visible_tool_names):
+                return [f'context_read({{"ref":"contextfs:{artifact}"}})']
+            return []
     output_dir = state.output_dir.as_posix()
-    return [hint for hint in read_hints if output_dir not in hint]
+    if not _tool_visible(visible_tool_names, "shell"):
+        return []
+    return [hint for hint in read_hints if output_dir not in hint and ".tinyagent/runs/" not in hint]
+
+
+def _model_visible_artifact_ref(artifact: object, *, visible_tool_names: frozenset[str] | None = None) -> str | None:
+    if not isinstance(artifact, str) or not artifact:
+        return None
+    if _is_context_read_artifact(artifact) and _can_read_context(visible_tool_names):
+        return f"contextfs:{artifact}"
+    if (artifact.startswith("context/") or artifact.startswith("artifacts/")) and not _can_read_context(visible_tool_names):
+        return None
+    return None
+
+
+def _model_visible_refs(refs: Sequence[str], *, visible_tool_names: frozenset[str] | None = None) -> list[str]:
+    visible_refs: list[str] = []
+    for ref in refs:
+        visible = _model_visible_artifact_ref(ref, visible_tool_names=visible_tool_names)
+        if visible:
+            visible_refs.append(visible)
+        elif not ref.startswith(("context/", "artifacts/")):
+            visible_refs.append(ref)
+    return visible_refs
+
+
+def _is_internal_artifact_ref(value: str) -> bool:
+    return value.startswith(("context/", "artifacts/"))
+
+
+def _is_context_read_artifact(artifact: str) -> bool:
+    return artifact.startswith("context/") or artifact.startswith(("artifacts/context-checkpoint-", "artifacts/workspace-delta-"))
+
+
+def _tool_visible(visible_tool_names: frozenset[str] | None, tool_name: str) -> bool:
+    return visible_tool_names is None or tool_name in visible_tool_names
+
+
+def _can_read_context(visible_tool_names: frozenset[str] | None) -> bool:
+    return _tool_visible(visible_tool_names, "context_read")
+
+
+def _can_search_context(visible_tool_names: frozenset[str] | None) -> bool:
+    return _tool_visible(visible_tool_names, "context_search") and _tool_visible(visible_tool_names, "context_read")
 
 
 def _is_diff_or_status_step(step: ToolStep) -> bool:
@@ -384,18 +474,56 @@ def _bounded_text(value: str, max_chars: int) -> str:
     return value[: max(0, max_chars - 3)] + "..."
 
 
-def _small_tool_data(data: dict[str, Any]) -> dict[str, Any]:
+def _small_tool_data(data: dict[str, Any], *, visible_tool_names: frozenset[str] | None = None) -> dict[str, Any]:
     omitted = {
         "context_artifact",
         "captured_output_artifact",
         "output_artifact",
+        "artifact_path",
+        "checkpoint_artifact",
+        "context_report_artifact",
+        "diff_artifact",
         "output_chars",
         "stdout_chars",
         "stderr_chars",
         "duration_ms",
         "failure_kind",
     }
-    return {key: value for key, value in data.items() if key not in omitted}
+    return {
+        key: cleaned
+        for key, value in data.items()
+        if key not in omitted
+        if (cleaned := _small_tool_data_value(value, visible_tool_names=visible_tool_names, omitted=omitted)) is not None
+    }
+
+
+def _small_tool_data_value(
+    value: object,
+    *,
+    visible_tool_names: frozenset[str] | None,
+    omitted: set[str],
+) -> object | None:
+    if isinstance(value, dict):
+        cleaned = {
+            key: nested
+            for key, nested_value in value.items()
+            if key not in omitted
+            if (nested := _small_tool_data_value(nested_value, visible_tool_names=visible_tool_names, omitted=omitted)) is not None
+        }
+        return cleaned or None
+    if isinstance(value, list):
+        cleaned_list = [
+            nested
+            for item in value
+            if (nested := _small_tool_data_value(item, visible_tool_names=visible_tool_names, omitted=omitted)) is not None
+        ]
+        return cleaned_list
+    if isinstance(value, str):
+        if _is_internal_artifact_ref(value) and not _can_read_context(visible_tool_names):
+            return None
+        if ".tinyagent/runs/" in value:
+            return None
+    return value
 
 
 def _item(

@@ -12,6 +12,7 @@ from typing import Any, Protocol
 from tinyagent.core.contracts import ModelProvider
 from tinyagent.core.models import FakeModelProvider, ProviderError
 from tinyagent.core.providers.openai_compat import OpenAICompatibleProvider
+from tinyagent.core.providers.openai_responses import OpenAIResponsesProvider
 from tinyagent.core.state import ModelResponse, ToolCall
 
 
@@ -76,9 +77,37 @@ class OpenAICompatibleProviderFactory:
         return OpenAICompatibleProvider.from_env(values)
 
 
+class OpenAIResponsesProviderFactory:
+    kind = "openai-responses"
+
+    def create(self, spec: ProviderSpec, task: str, env: Mapping[str, str] | None = None) -> ModelProvider:
+        del task
+        values = dict(os.environ if env is None else env)
+        if spec.model:
+            values["TINYAGENT_MODEL_NAME"] = spec.model
+        if spec.reasoning is not None:
+            values["TINYAGENT_MODEL_REASONING_JSON"] = json.dumps(spec.reasoning, sort_keys=True)
+        return OpenAIResponsesProvider.from_env(values)
+
+
+class OpenAICodexProviderFactory:
+    kind = "openai-codex"
+
+    def create(self, spec: ProviderSpec, task: str, env: Mapping[str, str] | None = None) -> ModelProvider:
+        del task
+        values = dict(os.environ if env is None else env)
+        if spec.model:
+            values["TINYAGENT_MODEL_NAME"] = spec.model
+        if spec.reasoning is not None:
+            values["TINYAGENT_MODEL_REASONING_JSON"] = json.dumps(spec.reasoning, sort_keys=True)
+        return OpenAIResponsesProvider.codex_from_env(values)
+
+
 DEFAULT_PROVIDER_REGISTRY = ProviderRegistry()
 DEFAULT_PROVIDER_REGISTRY.register(FakeProviderFactory())
 DEFAULT_PROVIDER_REGISTRY.register(OpenAICompatibleProviderFactory())
+DEFAULT_PROVIDER_REGISTRY.register(OpenAIResponsesProviderFactory())
+DEFAULT_PROVIDER_REGISTRY.register(OpenAICodexProviderFactory())
 
 
 def _fake_responses(task: str) -> list[ModelResponse]:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from typing import Any
@@ -34,7 +35,7 @@ def build_context(
     refresh_contextfs_if_enabled(state, contextfs_enabled=contextfs_enabled)
     build_profile_context = getattr(profile, "build_context", None)
     if callable(build_profile_context):
-        built_context = build_profile_context(state)
+        built_context = _call_profile_build_context(build_profile_context, state, visible_tools)
     else:
         messages = list(profile.build_messages(state))
         built_context = BuiltContext(
@@ -47,6 +48,19 @@ def build_context(
     token_estimate = built_context.token_estimate + estimate_tools_tokens(visible_tools)
     state.context_token_estimate = token_estimate
     return replace(built_context, token_estimate=token_estimate)
+
+
+def _call_profile_build_context(
+    build_profile_context: Callable[..., BuiltContext],
+    state: RunState,
+    visible_tools: list[Tool],
+) -> BuiltContext:
+    parameters = inspect.signature(build_profile_context).parameters
+    if "visible_tools" in parameters:
+        return build_profile_context(state, visible_tools=visible_tools)
+    if "visible_tool_names" in parameters:
+        return build_profile_context(state, visible_tool_names=[tool.name for tool in visible_tools])
+    return build_profile_context(state)
 
 
 def profile_should_compact(profile: Profile, state: RunState) -> bool:
