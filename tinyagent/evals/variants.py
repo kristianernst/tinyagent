@@ -11,6 +11,7 @@ from typing import Any
 
 from tinyagent.core.config import RunConfig
 from tinyagent.core.providers.factory import DEFAULT_PROVIDER_REGISTRY
+from tinyagent.core.state import RunBudgets
 
 VARIANT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
@@ -66,6 +67,8 @@ def validate_supported_eval_compare(config: RunConfig) -> None:
         raise ValueError(f"Unsupported workspace_mode: {config.workspace_mode}")
     if config.approval_mode not in {"never", "on-request", "yolo"}:
         raise ValueError(f"Unsupported approval_mode: {config.approval_mode}")
+    if config.approvals_reviewer not in {"user", "auto_review"}:
+        raise ValueError(f"Unsupported approvals_reviewer: {config.approvals_reviewer}")
     if config.approval_mode == "on-request":
         raise ValueError("approval_mode=on-request is not supported for eval compare")
     if config.sandbox_mode not in {"none", "container", "native"}:
@@ -77,10 +80,9 @@ def validate_supported_eval_compare(config: RunConfig) -> None:
         unsupported.append("policy")
     if config.hooks:
         unsupported.append("hooks")
-    if config.budgets:
-        unsupported.append("budgets")
     if unsupported:
         raise ValueError(f"Unsupported eval config fields: {', '.join(unsupported)}")
+    RunBudgets.from_mapping(config.budgets)
 
 
 def _validate_variant_name(name: str) -> None:

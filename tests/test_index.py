@@ -11,6 +11,7 @@ from tinyagent.core.models import FakeModelProvider
 from tinyagent.core.policy import LocalPolicy, PolicyRule, default_policy_config
 from tinyagent.core.profiles import ApexCoderProfile, TinyPiProfile
 from tinyagent.core.resources import LoadedResources
+from tinyagent.core.run_control import RunCancelled
 from tinyagent.core.state import ModelResponse, RunBudgets, RunState, ToolCall, ToolResult, Workspace
 from tinyagent.core.tools import default_tools
 
@@ -25,14 +26,14 @@ def _assert_subsequence(types: list[str], expected: list[str]) -> None:
 class TinyPiCancellingStreamingModel:
     name = "tiny-pi-cancelling-stream"
 
-    def complete(self, messages, tools, state):
-        del messages, tools, state
+    def complete(self, messages, tools, request):
+        del messages, tools, request
         raise AssertionError("streaming cancellation test should not call complete")
 
-    def stream(self, messages, tools, state):
-        del messages, tools
+    def stream(self, messages, tools, request):
+        del messages, tools, request
         yield ModelDelta(kind="text_delta", delta="partial")
-        state.request_cancel("tiny-pi cancellation")
+        raise RunCancelled("tiny-pi cancellation")
 
 
 def test_search_code_returns_compact_refs_and_events(tmp_path) -> None:
@@ -269,7 +270,7 @@ def test_tiny_pi_failed_run_finalization_does_not_emit_contextfs_events(tmp_path
         profile=TinyPiProfile(),
         tools=default_tools(),
         policy=LocalPolicy(),
-        budgets=RunBudgets(max_turns=0),
+        budgets=RunBudgets(max_model_calls=0),
     ).run("fail before model", workspace=tmp_path, output_dir=tmp_path / "run")
 
     event_types = [event.type for event in state.events]

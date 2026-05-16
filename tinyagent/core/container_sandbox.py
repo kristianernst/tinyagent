@@ -55,7 +55,7 @@ def default_container_image() -> str:
 
 
 def validate_container_image(image: str) -> None:
-    if not image or image.startswith("-") or any(char.isspace() for char in image):
+    if not image or image.startswith("-") or any(ch.isspace() for ch in image):
         raise ValueError("TINYAGENT_CONTAINER_IMAGE must be a non-empty image reference and cannot start with '-'")
 
 

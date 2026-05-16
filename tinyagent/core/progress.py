@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 from tinyagent.core.state import RunState, ToolCall
@@ -23,6 +24,13 @@ class ProgressDecision:
 
 class ProgressGuard:
     def before_tool_call(self, state: RunState, call: ToolCall) -> ProgressDecision:
+        if call.name != "shell":
+            key = _tool_call_key(call)
+            if _same_successful_tool_call_count_since_mutation(state, key) >= 2:
+                return ProgressDecision.blocked(
+                    "Progress guard blocked repeated tool call with identical input and no file changes since the earlier "
+                    f"successful calls: {key}. The output has already been returned; use that evidence or choose different input."
+                )
         if call.name == "shell":
             cmd = _normalized_cmd(call)
             if _failed_same_shell_command_count(state, cmd) >= 2:
@@ -45,6 +53,41 @@ class ProgressGuard:
 
 def _normalized_cmd(call: ToolCall) -> str:
     return " ".join(str(call.args.get("cmd") or "").split())
+
+
+def _tool_call_key(call: ToolCall) -> str:
+    try:
+        args = json.dumps(call.args, sort_keys=True, ensure_ascii=False)
+    except TypeError:
+        args = repr(call.args)
+    return f"{call.name}({args})"
+
+
+def _same_successful_tool_call_count_since_mutation(state: RunState, key: str) -> int:
+    count = 0
+    checkpoint = max(state.context_checkpoint_tool_step_count, 0)
+    for step in reversed(state.tool_steps[checkpoint:]):
+        if _step_mutated_workspace(step):
+            break
+        if not step.result.ok:
+            continue
+        if _tool_call_key(step.call) == key:
+            count += 1
+    return count
+
+
+def _step_mutated_workspace(step: object) -> bool:
+    metadata = getattr(getattr(step, "result", None), "metadata", {})
+    if isinstance(metadata, dict):
+        delta = metadata.get("workspace_delta")
+        if isinstance(delta, dict) and delta.get("mutated"):
+            return True
+    data = getattr(getattr(step, "result", None), "data", {})
+    if isinstance(data, dict):
+        delta = data.get("workspace_delta")
+        if isinstance(delta, dict) and delta.get("mutated"):
+            return True
+    return False
 
 
 def _failed_same_shell_command_count(state: RunState, cmd: str) -> int:

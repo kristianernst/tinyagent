@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from tinyagent.core.contracts import ToolRuntime
 from tinyagent.core.state import RunState, ToolCall, ToolResult
 from tinyagent.core.tools.core import (
     ToolError,
@@ -20,6 +21,7 @@ from tinyagent.core.tools.core import (
 
 class ApplyPatchTool:
     name = "apply_patch"
+    runtime = ToolRuntime(parallel_safe=False, mutates_workspace=True, lock_key="workspace")
     schema = {
         "name": "apply_patch",
         "description": "Apply a patch inside the workspace.",

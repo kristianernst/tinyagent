@@ -11,10 +11,12 @@ import time
 import pytest
 
 from tinyagent.core.context import estimate_messages_tokens, estimate_tools_tokens
+from tinyagent.core.context_sources.tools import ContextReadTool, ContextSearchTool
+from tinyagent.core.contracts import DEFAULT_TOOL_RUNTIME, tool_runtime
 from tinyagent.core.diffs import MAX_UNTRACKED_DIFF_BYTES
 from tinyagent.core.index import SearchCodeTool, WorkspaceIndexManager
 from tinyagent.core.kernel import Kernel
-from tinyagent.core.models import FakeModelProvider, ModelSpec
+from tinyagent.core.models import FakeModelProvider, ModelCapabilities, ModelSpec
 from tinyagent.core.output import capture_final_diff, write_text_artifact
 from tinyagent.core.path_safety import (
     checked_relative_path,
@@ -32,6 +34,7 @@ from tinyagent.core.profile_catalog import (
 from tinyagent.core.profiles import ApexCoderProfile, TinyPiProfile, profile_for
 from tinyagent.core.run_control import CancelToken
 from tinyagent.core.state import Message, ModelResponse, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, ToolStep, Workspace
+from tinyagent.core.token_utils import estimate_tokens
 from tinyagent.core.tools import (
     ApplyPatchTool,
     ListFilesTool,
@@ -45,6 +48,8 @@ from tinyagent.core.tools import (
 )
 from tinyagent.core.tools.builtins.patch import apply_openai_patch
 from tinyagent.core.tools.repo import MAX_READ_FILE_BYTES, repo_inspect_tools
+from tinyagent.core.skills.tools import ListSkillsTool, LoadSkillTool
+from tinyagent.extensions.todo_memory.tools import TodoReadTool, TodoWriteTool
 from tinyagent.runtime.replay import replay_run
 
 
@@ -57,8 +62,8 @@ class WorkspaceShellPolicy(LocalPolicy):
 
 
 def test_path_safety_helpers_cover_artifacts_envs_secrets_and_containment() -> None:
-    assert [safe_artifact_name(value) for value in ("call/with spaces:and*chars", "", ".", "..")] == [
-        "call_with_spaces_and_chars",
+    assert [safe_artifact_name(value) for value in ("call/with spaces:and*symbols", "", ".", "..")] == [
+        "call_with_spaces_and_symbols",
         "call",
         "call",
         "call",
@@ -113,7 +118,7 @@ def test_list_and_code_search_exclude_tinyagent_outputs(tmp_path) -> None:
 def test_read_file_emits_artifact_metadata(tmp_path) -> None:
     (tmp_path / "hello.txt").write_text("needle\n" * 30)
     state = RunState.create("test", Workspace(tmp_path), run_id="run_structured_inspection")
-    state.budgets = RunBudgets(max_command_output_chars_visible=80)
+    state.budgets = RunBudgets(max_tool_output_tokens_visible=20)
 
     read = ReadFileTool().run(ToolCall(name="read_file", args={"path": "hello.txt", "max_lines": 30}), state)
 
@@ -477,7 +482,7 @@ def test_shell_sanitizes_environment_and_persists_full_output(tmp_path, monkeypa
     assert result.ok is True
     assert result.output.splitlines() == ["missing", "missing", str(state.output_dir / "home"), "1"]
     assert result.data["cmd"]
-    assert result.data["output_chars"] == len(result.output)
+    assert result.data["output_tokens"] == estimate_tokens(result.output)
     artifact = state.output_dir / result.data["output_artifact"]
     assert artifact.read_text() == result.output
 
@@ -793,7 +798,7 @@ def test_apex_profile_exposes_structured_inspection_edit_and_shell_by_default(tm
 
 def test_apex_profile_selects_claude_like_edit_tool_from_model_spec(tmp_path) -> None:
     state = RunState.create("test", Workspace(tmp_path), run_id="run_test")
-    state.model_spec = ModelSpec(provider="anthropic", model="claude", protocol="anthropic", edit_style="str_replace").to_json_dict()
+    state.model_spec = ModelSpec(provider="anthropic", model="claude", protocol="anthropic_messages", edit_style="str_replace").to_json_dict()
     tools = _default_kernel_tools()
 
     visible = ApexCoderProfile().visible_tools(state, tools)
@@ -860,6 +865,94 @@ def test_tools_public_export_surface_stays_small() -> None:
         "patch_paths",
         "resolve_workspace_path",
     ]
+
+
+def test_tool_runtime_metadata_marks_safe_and_mutating_tools() -> None:
+    assert tool_runtime(ReadFileTool()).parallel_safe is True
+    assert tool_runtime(ListFilesTool()).parallel_safe is True
+    assert tool_runtime(SearchCodeTool()).to_json_dict() == {
+        "parallel_safe": True,
+        "mutates_workspace": False,
+        "requires_shell": False,
+        "requires_network": False,
+        "lock_key": "workspace_index",
+    }
+
+    assert tool_runtime(ContextSearchTool()).parallel_safe is True
+    assert tool_runtime(ContextReadTool()).parallel_safe is True
+    assert tool_runtime(ListSkillsTool()).lock_key == "skills"
+    assert tool_runtime(LoadSkillTool()).parallel_safe is True
+    assert tool_runtime(TodoReadTool()).parallel_safe is True
+    assert tool_runtime(TodoWriteTool()).parallel_safe is False
+
+    for tool in (ApplyPatchTool(), StrReplaceEditTool(), WriteFileTool()):
+        runtime = tool_runtime(tool)
+        assert runtime.parallel_safe is False
+        assert runtime.mutates_workspace is True
+        assert runtime.lock_key == "workspace"
+
+    shell = tool_runtime(ShellTool())
+    assert shell.parallel_safe is False
+    assert shell.mutates_workspace is True
+    assert shell.requires_shell is True
+    assert shell.lock_key == "shell"
+
+    class RuntimeLessTool:
+        name = "runtime_less"
+        schema = {"name": "runtime_less", "parameters": {"type": "object", "properties": {}}}
+
+        def run(self, call: ToolCall, state: RunState) -> ToolResult:
+            return ToolResult(tool_name=self.name, call_id=call.id, output="ok")
+
+    assert tool_runtime(RuntimeLessTool()) is DEFAULT_TOOL_RUNTIME
+
+
+def test_apex_profile_adds_parallel_guidance_only_when_supported(tmp_path) -> None:
+    state = RunState.create("test", Workspace(tmp_path), run_id="run_parallel_context")
+    state.model_spec = ModelSpec(
+        provider="openai-responses",
+        model="gpt-test",
+        protocol="openai_responses",
+        capabilities=ModelCapabilities(supports_parallel_tool_calls=True),
+    ).to_json_dict()
+
+    context = ApexCoderProfile().build_context(state, visible_tools=[ReadFileTool(), ApplyPatchTool(), ShellTool()])
+    combined = "\n".join(str(message.content) for message in context.messages)
+
+    assert "Parallel tool use:" in combined
+    assert "Batchable tools in this context: read_file." in combined
+    assert "Do not batch mutating tools" in combined
+
+    unsupported = RunState.create("test", Workspace(tmp_path), run_id="run_no_parallel_context")
+    unsupported.model_spec = ModelSpec(
+        provider="openai-compatible",
+        model="chat-test",
+        capabilities=ModelCapabilities(supports_parallel_tool_calls=False),
+    ).to_json_dict()
+
+    unsupported_context = ApexCoderProfile().build_context(
+        unsupported,
+        visible_tools=[ReadFileTool(), ApplyPatchTool(), ShellTool()],
+    )
+    unsupported_combined = "\n".join(str(message.content) for message in unsupported_context.messages)
+
+    assert "Parallel tool use:" not in unsupported_combined
+
+
+def test_tiny_pi_profile_uses_same_parallel_guidance_gate(tmp_path) -> None:
+    state = RunState.create("test", Workspace(tmp_path), run_id="run_tiny_pi_parallel_context")
+    state.model_spec = ModelSpec(
+        provider="openai-responses",
+        model="gpt-test",
+        protocol="openai_responses",
+        capabilities=ModelCapabilities(supports_parallel_tool_calls=True),
+    ).to_json_dict()
+
+    context = TinyPiProfile().build_context(state, visible_tools=[ReadFileTool(), ApplyPatchTool(), ShellTool()])
+    combined = "\n".join(str(message.content) for message in context.messages)
+
+    assert "Parallel tool use:" in combined
+    assert "Batchable tools in this context: read_file." in combined
 
 
 def test_apex_profile_visible_tools_are_overridable_for_ablations(tmp_path) -> None:
@@ -943,7 +1036,7 @@ def test_tiny_pi_profile_hides_unreadable_artifacts_in_direct_build(tmp_path) ->
 
 def test_tiny_pi_profile_selects_model_specific_edit_tool(tmp_path) -> None:
     state = RunState.create("test", Workspace(tmp_path), run_id="run_tiny_pi_edit_style")
-    state.model_spec = ModelSpec(provider="anthropic", model="claude", protocol="anthropic", edit_style="str_replace").to_json_dict()
+    state.model_spec = ModelSpec(provider="anthropic", model="claude", protocol="anthropic_messages", edit_style="str_replace").to_json_dict()
     tools = _default_kernel_tools()
 
     visible = TinyPiProfile().visible_tools(state, tools)
@@ -963,8 +1056,8 @@ def test_tiny_pi_kernel_keeps_model_specific_edit_tool(tmp_path, edit_style, edi
         def __init__(self) -> None:
             self.tools: list[str] = []
 
-        def complete(self, messages, tools, state):
-            del messages, state
+        def complete(self, messages, tools, request):
+            del messages, request
             self.tools = [tool.name for tool in tools]
             return ModelResponse(content="done", finish_reason="stop")
 
@@ -1243,60 +1336,83 @@ def test_workspace_auto_uses_worktree_for_clean_git_repo(tmp_path) -> None:
     assert metrics["workspace_effective_mode"] == "worktree"
 
 
-def test_yolo_approval_mode_does_not_allow_network_shell(tmp_path) -> None:
-    shell_call = ToolCall(name="shell", args={"cmd": "curl https://example.com"})
+def test_yolo_approval_mode_bypasses_policy_denials(tmp_path) -> None:
+    shell_call = ToolCall(name="shell", args={"cmd": "printf yolo > created.txt"})
     model = FakeModelProvider(
         [
             ModelResponse(tool_calls=(shell_call,)),
-            ModelResponse(content="Network command was denied by policy; no command ran.", finish_reason="stop"),
+            ModelResponse(content="YOLO command ran.", finish_reason="stop"),
         ]
     )
     kernel = Kernel(
         model=model,
-        profile=ApexCoderProfile(),
+        profile=TinyPiProfile(),
         tools=default_tools(),
         policy=LocalPolicy(),
         approval_mode="yolo",
     )
 
-    state = kernel.run("try network", workspace=tmp_path, run_id="run_network_block")
+    state = kernel.run("try workspace write", workspace=tmp_path, run_id="run_yolo_policy_bypass")
 
     assert state.failed is False
-    assert "command.started" not in [event.type for event in state.events]
+    assert (tmp_path / "created.txt").read_text(encoding="utf-8") == "yolo"
+    assert "command.started" in [event.type for event in state.events]
     assert not any(event.type == "approval.requested" for event in state.events)
-    denial = next(event for event in state.events if event.type == "policy.evaluated" and event.data["tool_call_id"] == shell_call.id)
-    assert denial.data["kind"] == "deny"
-    assert denial.data["permission"] == "network"
-    blocked = next(event for event in state.events if event.type == "tool.execution.blocked")
-    assert blocked.data["tool_call_id"] == shell_call.id
+    decision = next(event for event in state.events if event.type == "policy.evaluated" and event.data["tool_call_id"] == shell_call.id)
+    assert decision.data["kind"] == "allow"
+    assert decision.data["matched_rule"] == "approval_mode:yolo:allow"
 
 
-def test_default_yolo_approval_mode_does_not_execute_unknown_shell(tmp_path) -> None:
+def test_default_yolo_approval_mode_executes_arbitrary_visible_shell(tmp_path) -> None:
     script = "from pathlib import Path; Path('created.txt').write_text('created')"
     shell_call = ToolCall(name="shell", args={"cmd": f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"})
     model = FakeModelProvider(
         [
             ModelResponse(tool_calls=(shell_call,)),
-            ModelResponse(content="Unknown shell command was denied.", finish_reason="stop"),
+            ModelResponse(content="Unknown shell command ran.", finish_reason="stop"),
         ]
     )
     kernel = Kernel(
         model=model,
-        profile=ApexCoderProfile(),
+        profile=TinyPiProfile(),
         tools=default_tools(),
         policy=LocalPolicy(),
     )
 
-    state = kernel.run("try unknown shell write", workspace=tmp_path, run_id="run_unknown_shell_block")
+    state = kernel.run("try unknown shell write", workspace=tmp_path, run_id="run_unknown_shell_yolo")
 
     assert state.failed is False
-    assert not (tmp_path / "created.txt").exists()
-    assert "command.started" not in [event.type for event in state.events]
-    resolution = next(event for event in state.events if event.type == "approval.resolved")
-    assert resolution.data["decision"] == "denied"
-    assert resolution.data["reason"] == "approval-mode=yolo does not allow shell"
-    blocked = next(event for event in state.events if event.type == "tool.execution.blocked")
-    assert blocked.data["tool_call_id"] == shell_call.id
+    assert (tmp_path / "created.txt").read_text(encoding="utf-8") == "created"
+    assert "command.started" in [event.type for event in state.events]
+    assert not any(event.type == "approval.resolved" for event in state.events)
+    decision = next(event for event in state.events if event.type == "policy.evaluated" and event.data["tool_call_id"] == shell_call.id)
+    assert decision.data["matched_rule"] == "approval_mode:yolo:allow"
+
+
+def test_policy_allows_common_python_verification_commands_without_broad_python_shell(tmp_path) -> None:
+    state = RunState.create("policy", Workspace(tmp_path), run_id="run_python_verification_policy")
+    policy = LocalPolicy()
+
+    unittest_decision = policy.evaluate(ToolCall(name="shell", args={"cmd": "python3 -m unittest discover -s tests"}), state)
+    validate_decision = policy.evaluate(ToolCall(name="shell", args={"cmd": "python3 scripts/validate.py"}), state)
+    arbitrary_python = policy.evaluate(ToolCall(name="shell", args={"cmd": "python3 -c \"open('created.txt', 'w').write('x')\""}), state)
+
+    assert unittest_decision.kind == "allow"
+    assert validate_decision.kind == "allow"
+    assert arbitrary_python.kind == "needs_approval"
+
+
+def test_policy_allows_safe_find_listing_but_blocks_mutating_find_pipelines(tmp_path) -> None:
+    state = RunState.create("policy", Workspace(tmp_path), run_id="run_find_policy")
+    policy = LocalPolicy()
+
+    safe_find = policy.evaluate(ToolCall(name="shell", args={"cmd": "find . -type f -not -path '*/.git/*' | head -80"}), state)
+    mutating_find = policy.evaluate(ToolCall(name="shell", args={"cmd": "find . -type f -delete"}), state)
+    dangerous_pipe = policy.evaluate(ToolCall(name="shell", args={"cmd": "find . -type f | xargs rm"}), state)
+
+    assert safe_find.kind == "allow"
+    assert mutating_find.kind == "needs_approval"
+    assert dangerous_pipe.kind == "needs_approval"
 
 
 def test_read_only_shell_allowlist_rejects_workspace_writes(tmp_path) -> None:
@@ -1532,7 +1648,7 @@ def test_golden_trace_covers_context_artifacts_tool_args_shell_artifact_and_untr
     assert shell_requested.data["args"] == {"cmd": shell_call.args["cmd"]}
     shell_result = next(result for result in state.tool_results if result.tool_name == "shell" and result.call_id == shell_call.id)
     assert (state.output_dir / shell_result.data["output_artifact"]).read_text() == "shell output\n"
-    assert shell_result.data["output_chars"] == len("shell output\n")
+    assert shell_result.data["output_tokens"] == estimate_tokens("shell output\n")
 
     replay = replay_run(state.output_dir)
     assert "context/shell" in replay

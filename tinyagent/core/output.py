@@ -8,11 +8,12 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from tinyagent.core.contracts import Tool
+from tinyagent.core.contracts import Tool, tool_runtime
 from tinyagent.core.diffs import join_diff_parts, new_file_patch
 from tinyagent.core.events import json_safe
 from tinyagent.core.path_safety import checked_relative_path, looks_like_secret_path, relative_path_is_within, resolved_relative_to
 from tinyagent.core.state import Message, ModelResponse, RunState
+from tinyagent.core.token_utils import estimate_tokens
 
 ARTIFACTS_DIR = "artifacts"
 
@@ -70,7 +71,7 @@ def capture_final_diff(state: RunState) -> None:
             "available": diff.returncode == 0,
             "reason": "" if diff.returncode == 0 else (diff.stderr.strip() or "git diff failed"),
             "path": "final.diff",
-            "chars": len(state.final_diff),
+            "tokens": estimate_tokens(state.final_diff),
             "untracked_file_count": len(untracked),
         },
     )
@@ -78,7 +79,7 @@ def capture_final_diff(state: RunState) -> None:
 
 def _finalize_diff_unavailable(state: RunState, reason: str) -> None:
     state.final_diff = ""
-    state.emit("diff.finalized", {"available": False, "reason": reason, "path": "final.diff", "chars": 0})
+    state.emit("diff.finalized", {"available": False, "reason": reason, "path": "final.diff", "tokens": 0})
 
 
 def _final_diff_command(root: Path) -> list[str]:
@@ -142,6 +143,9 @@ def write_model_request_artifacts(
         f"model-request-logical-{call_index:04d}.json",
         {
             "provider": provider,
+            "conversation_state": (
+                state.model_conversation_state.to_json_dict() if state.model_conversation_state is not None else None
+            ),
             "messages": [_message_dict(message) for message in messages],
             "tools": [_tool_dict(tool) for tool in tools],
         },
@@ -222,6 +226,9 @@ def write_model_response_artifact(
             "content": response.content,
             "finish_reason": response.finish_reason,
             "tool_calls": [_tool_call_dict(call) for call in response.tool_calls],
+            "conversation_state": (
+                response.conversation_state.to_json_dict() if response.conversation_state is not None else None
+            ),
             "raw": response.raw,
         },
         kind="model_response",
@@ -246,7 +253,7 @@ def _metrics(state: RunState) -> dict[str, Any]:
         "cancel_requested": state.cancelled,
         "cancel_signal_count": max(state.cancel_signal_count, state.cancel_token.signal_count),
         "cancel_escalated": state.cancel_escalated,
-        "final_output_chars": len(state.final_output),
+        "final_output_tokens": estimate_tokens(state.final_output),
         "final_output_path": "final.md",
         "task": state.task,
         "workspace_root": str(state.workspace.root),
@@ -254,6 +261,9 @@ def _metrics(state: RunState) -> dict[str, Any]:
         "output_dir": str(state.output_dir),
         "turn_count": state.turn_count,
         "model_call_count": state.model_call_count,
+        "model_conversation_state": (
+            state.model_conversation_state.to_json_dict() if state.model_conversation_state is not None else None
+        ),
         "tool_call_count": state.tool_call_count,
         "event_count": state.seq,
         "durable_event_count": len(state.events),
@@ -325,7 +335,7 @@ def _message_dict(message: Message) -> dict[str, Any]:
 
 
 def _tool_dict(tool: Tool) -> dict[str, Any]:
-    return {"name": tool.name, "schema": dict(tool.schema)}
+    return {"name": tool.name, "schema": dict(tool.schema), "runtime": tool_runtime(tool).to_json_dict()}
 
 
 def _tool_call_dict(call: Any) -> dict[str, Any]:

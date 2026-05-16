@@ -295,7 +295,10 @@ def render_tool_docs(state: "RunState", helpers: ContextRenderHelpers) -> tuple[
         for artifact in artifacts:
             readable = helpers.context_ref(artifact)
             entries.append(f"- {readable}: `{step.call.id}` {'ok' if step.result.ok else 'failed'}")
-    for tool_name, description in TOOL_CONTEXT_DESCRIPTIONS.items():
+    tool_names = list(TOOL_CONTEXT_DESCRIPTIONS)
+    tool_names.extend(sorted(tool_name for tool_name in by_tool if tool_name not in TOOL_CONTEXT_DESCRIPTIONS))
+    for tool_name in tool_names:
+        description = TOOL_CONTEXT_DESCRIPTIONS.get(tool_name, "Tool outputs captured during this run.")
         safe_name = helpers.safe_artifact_name(tool_name)
         entries = by_tool.get(tool_name, ["- No readable output artifacts yet."])
         tool_doc = "# Tool Output: " + tool_name + "\n\n" + description + "\n\n" + "\n".join(entries) + "\n"

@@ -61,7 +61,7 @@ def _event_detail(event: Event) -> str:
         case "worktree.created":
             return str(data.get("path") or "")
         case "model.message.completed":
-            return f"{data.get('role', 'assistant')} {data.get('content_chars')} chars {data.get('output_path', '')}".strip()
+            return f"{data.get('role', 'assistant')} {data.get('content_tokens')} tokens {data.get('output_path', '')}".strip()
         case "model.call.started":
             artifacts = [
                 data.get("context_artifact"),
@@ -112,7 +112,7 @@ def _event_detail(event: Event) -> str:
         case "approval.requested" | "approval.resolved" | "approval.expired":
             return f"{data.get('approval_id')} {data.get('decision', '')} {data.get('reason', '')}".strip()
         case "diff.finalized":
-            return f"available={data.get('available')} chars={data.get('chars')}"
+            return f"available={data.get('available')} tokens={data.get('tokens')}"
         case "artifact.materialized":
             return str(data.get("path") or "")
     return ""

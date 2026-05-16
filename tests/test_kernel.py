@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from io import StringIO
@@ -9,7 +10,8 @@ from pathlib import Path
 import pytest
 
 from tinyagent.core.approval import record_policy_decision
-from tinyagent.core.contracts import Tool
+from tinyagent.core.auto_review import AutoReviewApprovalHandler
+from tinyagent.core.contracts import Tool, ToolRuntime
 from tinyagent.core.events import (
     DURABLE_EVENT_TYPES,
     EVENT_DEBUG_LEVELS,
@@ -26,10 +28,13 @@ from tinyagent.core.events import (
 from tinyagent.core.kernel import Kernel
 from tinyagent.core.model_recording import record_model_tool_calls
 from tinyagent.core.model_stream import ModelDelta
+from tinyagent.core.run_control import RunCancelled
 from tinyagent.core.state import (
     ApprovalRequest,
     ApprovalResolution,
     Message,
+    ModelConversationState,
+    ModelRequestContext,
     ModelResponse,
     PolicyDecision,
     RunBudgets,
@@ -141,9 +146,12 @@ class StaticModel:
     def __init__(self, responses: list[ModelResponse]) -> None:
         self.responses = responses
         self.calls = 0
+        self.requests: list[object] = []
 
-    def complete(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState) -> ModelResponse:
+    def complete(self, messages: Sequence[Message], tools: Sequence[Tool], request: ModelRequestContext) -> ModelResponse:
+        del messages, tools
         self.calls += 1
+        self.requests.append(request)
         if not self.responses:
             return ModelResponse(content="no response", finish_reason="stop")
         return self.responses.pop(0)
@@ -157,13 +165,13 @@ class StreamingModel:
         self.stream_calls = 0
         self.complete_calls = 0
 
-    def complete(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState) -> ModelResponse:
-        del messages, tools, state
+    def complete(self, messages: Sequence[Message], tools: Sequence[Tool], request: ModelRequestContext) -> ModelResponse:
+        del messages, tools, request
         self.complete_calls += 1
         raise AssertionError("streaming test should not call complete")
 
-    def stream(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState):
-        del messages, tools, state
+    def stream(self, messages: Sequence[Message], tools: Sequence[Tool], request: ModelRequestContext):
+        del messages, tools, request
         self.stream_calls += 1
         if not self.responses:
             return
@@ -173,11 +181,13 @@ class StreamingModel:
 class EventsFileCheckingModel:
     name = "events-file-checking-model"
 
-    def __init__(self) -> None:
+    def __init__(self, output_dir: Path) -> None:
+        self.output_dir = output_dir
         self.saw_incremental_events = False
 
-    def complete(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState) -> ModelResponse:
-        events_path = state.output_dir / "events.jsonl"
+    def complete(self, messages: Sequence[Message], tools: Sequence[Tool], request: ModelRequestContext) -> ModelResponse:
+        del messages, tools, request
+        events_path = self.output_dir / "events.jsonl"
         text = events_path.read_text()
         self.saw_incremental_events = all(event_type in text for event_type in ["run.started", "context.built", "model.call.started"])
         return ModelResponse(content="done", finish_reason="stop")
@@ -189,6 +199,30 @@ class NoopTool:
 
     def run(self, call: ToolCall, state: RunState) -> ToolResult:
         return ToolResult(tool_name=self.name, output="ok")
+
+
+class ParallelBarrierTool:
+    name = "parallel_barrier"
+    runtime = ToolRuntime(parallel_safe=True)
+    schema = {"name": "parallel_barrier"}
+
+    def __init__(self, parties: int) -> None:
+        self.barrier = threading.Barrier(parties, timeout=2)
+
+    def run(self, call: ToolCall, state: RunState) -> ToolResult:
+        del state
+        value = str(call.args.get("value") or "")
+        self.barrier.wait()
+        return ToolResult(tool_name=self.name, call_id=call.id, output=f"ok {value}")
+
+
+class UnsafeRecordingTool:
+    name = "unsafe_recording"
+    schema = {"name": "unsafe_recording"}
+
+    def run(self, call: ToolCall, state: RunState) -> ToolResult:
+        del state
+        return ToolResult(tool_name=self.name, call_id=call.id, output=str(call.args.get("value") or "unsafe"))
 
 
 class ExplodingTool:
@@ -205,6 +239,15 @@ class LongOutputTool:
 
     def run(self, call: ToolCall, state: RunState) -> ToolResult:
         return ToolResult(tool_name=self.name, output="abcdef", data={"output_artifact": "artifacts/tool.txt"})
+
+
+class RawLongOutputTool:
+    name = "raw_long_output"
+    schema = {"name": "raw_long_output"}
+
+    def run(self, call: ToolCall, state: RunState) -> ToolResult:
+        del call, state
+        return ToolResult(tool_name=self.name, output="HEAD-" + ("x" * 40) + "-TAIL")
 
 
 class CancellingTool:
@@ -233,22 +276,22 @@ class LargeDataTool:
 class CancellingStreamingModel:
     name = "cancelling-streaming-model"
 
-    def complete(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState) -> ModelResponse:
-        del messages, tools, state
+    def complete(self, messages: Sequence[Message], tools: Sequence[Tool], request: ModelRequestContext) -> ModelResponse:
+        del messages, tools, request
         raise AssertionError("streaming cancellation test should not call complete")
 
-    def stream(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState):
-        del messages, tools
+    def stream(self, messages: Sequence[Message], tools: Sequence[Tool], request: ModelRequestContext):
+        del messages, tools, request
         yield ModelDelta(kind="text_delta", delta="partial")
-        state.request_cancel("model cancelled")
+        raise RunCancelled("model cancelled")
         yield ModelDelta(kind="text_delta", delta="ignored")
 
 
 class TimeoutModel:
     name = "timeout-model"
 
-    def complete(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState) -> ModelResponse:
-        del messages, tools, state
+    def complete(self, messages: Sequence[Message], tools: Sequence[Tool], request: ModelRequestContext) -> ModelResponse:
+        del messages, tools, request
         raise TimeoutError("request timeout")
 
 
@@ -346,6 +389,13 @@ def test_kernel_dispatches_model_policy_tool_then_finishes_from_content(tmp_path
     assert "noop" in context
     assert request["provider"] == "static-model"
     assert request["messages"][1] == {"role": "user", "content": "run a tool then answer"}
+    assert request["tools"][0]["runtime"] == {
+        "parallel_safe": False,
+        "mutates_workspace": False,
+        "requires_shell": False,
+        "requires_network": False,
+        "lock_key": None,
+    }
     assert response["tool_calls"] == [{"id": noop_call.id, "name": "noop", "args": {}}]
     tool_finished = next(event for event in state.events if event.type == "tool.execution.completed")
     assert tool_finished.data == {
@@ -354,7 +404,7 @@ def test_kernel_dispatches_model_policy_tool_then_finishes_from_content(tmp_path
         "ok": True,
         "blocked": False,
         "output": "ok",
-        "output_chars": 2,
+        "output_tokens": 1,
         "output_truncated": False,
         "data": {},
     }
@@ -387,14 +437,14 @@ def test_kernel_writes_exact_prior_context_snapshot(tmp_path) -> None:
     assert [event.to_json_dict() for event in loaded_events] == [event.to_json_dict() for event in state.events]
 
 
-def test_kernel_max_turn_failure_writes_required_outputs(tmp_path) -> None:
+def test_kernel_max_model_call_failure_writes_required_outputs(tmp_path) -> None:
     model = StaticModel([ModelResponse(content="should not be called")])
     kernel = Kernel(
         model=model,
         profile=BasicProfile(),
         tools=[NoopTool()],
         policy=AllowAllPolicy(),
-        budgets=RunBudgets(max_turns=0),
+        budgets=RunBudgets(max_model_calls=0),
     )
 
     state = kernel.run("budget failure", workspace=tmp_path)
@@ -402,7 +452,7 @@ def test_kernel_max_turn_failure_writes_required_outputs(tmp_path) -> None:
     assert model.calls == 0
     assert state.done is True
     assert state.failed is True
-    assert state.failure_reason == "Run exceeded max_turns budget."
+    assert state.failure_reason == "Run exceeded max_model_calls budget."
     assert_subsequence(
         event_types(state),
         [
@@ -422,7 +472,8 @@ def test_kernel_max_turn_failure_writes_required_outputs(tmp_path) -> None:
 
 
 def test_events_are_persisted_before_run_finishes(tmp_path) -> None:
-    model = EventsFileCheckingModel()
+    output_dir = tmp_path / "run"
+    model = EventsFileCheckingModel(output_dir)
     kernel = Kernel(
         model=model,
         profile=BasicProfile(),
@@ -430,7 +481,7 @@ def test_events_are_persisted_before_run_finishes(tmp_path) -> None:
         policy=AllowAllPolicy(),
     )
 
-    state = kernel.run("check incremental events", workspace=tmp_path)
+    state = kernel.run("check incremental events", workspace=tmp_path, output_dir=output_dir)
 
     assert state.failed is False
     assert model.saw_incremental_events is True
@@ -462,10 +513,168 @@ def test_kernel_max_tool_call_failure_is_evented(tmp_path) -> None:
     assert state.failure_reason == "Run exceeded max_tool_calls budget."
     assert state.turn_count == 1
     assert state.tool_call_count == 1
+    blocked = [event for event in state.events if event.type == "tool.execution.blocked"]
+    assert len(blocked) == 1
+    assert blocked[0].data["reason"] == "Run exceeded max_tool_calls budget."
+    terminal = [
+        event
+        for event in state.events
+        if event.type == "tool.execution.failed" and event.data.get("data", {}).get("budget_exceeded")
+    ]
+    assert len(terminal) == 1
+    assert check_event_invariants(state.events) == []
     assert event_types(state)[-1] == "run.failed"
     metrics = json.loads((state.output_dir / "metrics.json").read_text())
     assert metrics["status"] == "failed"
     assert metrics["tool_call_count"] == 1
+
+
+def test_kernel_records_model_conversation_state_in_events_and_artifacts(tmp_path) -> None:
+    conversation_state = ModelConversationState(
+        provider="openai-responses",
+        adapter="tinyagent.openai_responses.v1",
+        mode="stateless_replay",
+        response_id="resp_1",
+        prompt_cache_key="thread_1",
+        opaque={"large": "x" * 20_000},
+    )
+    call = ToolCall(name="noop", id="call_1")
+    state = Kernel(
+        model=StaticModel(
+            [
+                ModelResponse(tool_calls=(call,), conversation_state=conversation_state),
+                ModelResponse(content="done", finish_reason="stop"),
+            ]
+        ),
+        profile=BasicProfile(),
+        tools=[NoopTool()],
+        policy=AllowAllPolicy(),
+        workspace_mode="current",
+    ).run("use provider state", workspace=tmp_path, run_id="run_provider_state")
+
+    assert state.model_conversation_state == conversation_state
+    expected_state = conversation_state.to_json_dict()
+    assert expected_state["opaque"]["_truncated"] is True
+    assert len(expected_state["opaque"]["preview"]) < 5_000
+    completed = next(event for event in state.events if event.type == "model.call.completed")
+    assert completed.data["conversation_state"] == expected_state
+    response_artifact = json.loads((state.output_dir / "artifacts" / "model-response-0001.json").read_text())
+    assert response_artifact["conversation_state"] == expected_state
+    followup_request = json.loads((state.output_dir / "artifacts" / "model-request-logical-0002.json").read_text())
+    assert followup_request["conversation_state"] == expected_state
+    metrics = json.loads((state.output_dir / "metrics.json").read_text())
+    assert metrics["model_conversation_state"] == expected_state
+
+
+def test_kernel_emits_usage_for_non_streaming_model_response(tmp_path) -> None:
+    state = Kernel(
+        model=StaticModel(
+            [
+                ModelResponse(
+                    content="done",
+                    finish_reason="stop",
+                    raw={"usage": {"input_tokens": 3, "cached_input_tokens": 1, "output_tokens": 4, "total_tokens": 7}},
+                )
+            ]
+        ),
+        profile=BasicProfile(),
+        tools=[NoopTool()],
+        policy=AllowAllPolicy(),
+        workspace_mode="current",
+    ).run("record usage", workspace=tmp_path, run_id="run_model_usage")
+
+    usage = next(event for event in state.events if event.type == "model.usage")
+    assert usage.data == {
+        "provider": "static-model",
+        "model_call_id": "model-call-0001",
+        "model_call_index": 1,
+        "input_tokens": 3,
+        "cached_input_tokens": 1,
+        "output_tokens": 4,
+        "total_tokens": 7,
+    }
+    response_artifact = json.loads((state.output_dir / "artifacts" / "model-response-0001.json").read_text())
+    assert response_artifact["raw"]["usage"] == {
+        "input_tokens": 3,
+        "cached_input_tokens": 1,
+        "output_tokens": 4,
+        "total_tokens": 7,
+    }
+
+
+def test_kernel_passes_normalized_request_context_to_model_providers(tmp_path) -> None:
+    class ContextCapturingProvider:
+        name = "context-provider"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequestContext] = []
+
+        def complete(self, messages, tools, request):
+            del messages, tools
+            self.requests.append(request)
+            if not request.tool_steps:
+                return ModelResponse(tool_calls=(ToolCall(name="noop", id="call_1"),))
+            return ModelResponse(content="done", finish_reason="stop")
+
+    provider = ContextCapturingProvider()
+    state = Kernel(
+        model=provider,
+        profile=BasicProfile(),
+        tools=[NoopTool()],
+        policy=AllowAllPolicy(),
+        workspace_mode="current",
+    ).run("use context", workspace=tmp_path, run_id="run_provider_context")
+
+    assert state.failed is False
+    assert all(isinstance(request, ModelRequestContext) for request in provider.requests)
+    assert provider.requests[0].run_id == "run_provider_context"
+    assert provider.requests[0].tool_steps == ()
+    assert provider.requests[1].tool_steps[0].call.id == "call_1"
+    assert provider.requests[1].tool_steps_since_checkpoint()[0].call.name == "noop"
+
+
+def test_kernel_batches_parallel_safe_tools_and_preserves_result_order(tmp_path) -> None:
+    calls = (
+        ToolCall(name="parallel_barrier", id="call_a", args={"value": "a"}),
+        ToolCall(name="parallel_barrier", id="call_b", args={"value": "b"}),
+    )
+    state = Kernel(
+        model=StaticModel([ModelResponse(tool_calls=calls), ModelResponse(content="done", finish_reason="stop")]),
+        profile=BasicProfile(),
+        tools=[ParallelBarrierTool(parties=2)],
+        policy=AllowAllPolicy(),
+        workspace_mode="current",
+    ).run("batch safe reads", workspace=tmp_path, run_id="run_parallel_batch")
+
+    assert state.failed is False
+    assert [result.output for result in state.tool_results] == ["ok a", "ok b"]
+    assert check_event_invariants(state.events) == []
+
+    started = [event for event in state.events if event.type == "tool.execution.started"]
+    completed = [event for event in state.events if event.type == "tool.execution.completed"]
+    batch_ids = {event.data.get("batch_id") for event in started + completed}
+    assert len(batch_ids) == 1
+    assert None not in batch_ids
+    assert max(event.seq for event in started) < min(event.seq for event in completed)
+
+
+def test_kernel_keeps_unsafe_tool_calls_sequential(tmp_path) -> None:
+    calls = (
+        ToolCall(name="unsafe_recording", id="call_unsafe_1", args={"value": "one"}),
+        ToolCall(name="unsafe_recording", id="call_unsafe_2", args={"value": "two"}),
+    )
+    state = Kernel(
+        model=StaticModel([ModelResponse(tool_calls=calls), ModelResponse(content="done", finish_reason="stop")]),
+        profile=BasicProfile(),
+        tools=[UnsafeRecordingTool()],
+        policy=AllowAllPolicy(),
+        workspace_mode="current",
+    ).run("unsafe stays sequential", workspace=tmp_path, run_id="run_unsafe_sequential")
+
+    assert state.failed is False
+    assert [result.output for result in state.tool_results] == ["one", "two"]
+    assert check_event_invariants(state.events) == []
+    assert all("batch_id" not in event.data for event in state.events if event.type.startswith("tool.execution"))
 
 
 def test_denied_tool_call_gets_finished_event_and_counts_requested_call(tmp_path) -> None:
@@ -476,13 +685,14 @@ def test_denied_tool_call_gets_finished_event_and_counts_requested_call(tmp_path
         profile=BasicProfile(),
         tools=[NoopTool()],
         policy=DenyAllPolicy(),
-        budgets=RunBudgets(max_turns=1),
+        budgets=RunBudgets(max_model_calls=1),
+        approval_mode="never",
     )
 
     state = kernel.run("deny tool", workspace=tmp_path)
 
     assert state.failed is True
-    assert state.failure_reason == "Run exceeded max_turns budget."
+    assert state.failure_reason == "Run exceeded max_model_calls budget."
     assert state.tool_call_count == 1
     result = state.tool_results[0]
     assert result.tool_name == "noop"
@@ -505,7 +715,7 @@ def test_denied_tool_call_gets_finished_event_and_counts_requested_call(tmp_path
     assert transcript_result.data["synthetic"] is True
     assert state.transcript.pending_tool_call_ids == set()
     assert check_event_invariants(state.events) == []
-    assert tool_finished.data["output_chars"] == len("noop denied")
+    assert tool_finished.data["output_tokens"] == 3
     assert tool_finished.data["output_truncated"] is False
     assert tool_finished.data["data"]["blocked"] is True
     assert tool_finished.data["data"]["source"] == "policy"
@@ -537,7 +747,7 @@ def test_approval_mode_never_fails_closed_and_blocks_execution(tmp_path) -> None
     assert resolution.data["reason"] == "approval_mode_never"
 
 
-def test_approval_mode_yolo_approves_workspace_safe_approval_once(tmp_path) -> None:
+def test_approval_mode_yolo_bypasses_policy_enforcement(tmp_path) -> None:
     call = ToolCall(name="noop")
     model = StaticModel([ModelResponse(tool_calls=[call]), ModelResponse(content="done", finish_reason="stop")])
     kernel = Kernel(
@@ -550,12 +760,86 @@ def test_approval_mode_yolo_approves_workspace_safe_approval_once(tmp_path) -> N
 
     state = kernel.run("approval yolo", workspace=tmp_path)
 
-    resolution = next(event for event in state.events if event.type == "approval.resolved")
     assert state.failed is False
-    assert resolution.data["decision"] == "approved"
-    assert resolution.data["scope"] == "once"
-    assert resolution.data["reason"] == "approval_mode_yolo_in_workspace"
+    assert "approval.requested" not in event_types(state)
+    decision = next(event for event in state.events if event.type == "policy.evaluated")
+    assert decision.data["kind"] == "allow"
+    assert decision.data["matched_rule"] == "approval_mode:yolo:allow"
     assert len([event for event in state.events if event.type == "tool.execution.completed"]) == 1
+
+
+def test_on_request_auto_review_approves_with_selected_model(tmp_path) -> None:
+    call = ToolCall(name="noop")
+    model = StaticModel(
+        [
+            ModelResponse(tool_calls=[call]),
+            ModelResponse(content='{"outcome":"allow"}', finish_reason="stop"),
+            ModelResponse(content="done", finish_reason="stop"),
+        ]
+    )
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[NoopTool()],
+        policy=ApprovalPolicy(),
+        approval_handler=AutoReviewApprovalHandler(model),
+        approval_mode="on-request",
+    )
+
+    state = kernel.run("auto review approval", workspace=tmp_path)
+
+    assert state.failed is False
+    assert state.final_output == "done"
+    assert model.calls == 3
+    assert isinstance(model.requests[1], ModelRequestContext)
+    assert "auto_review.started" in event_types(state)
+    completed = next(event for event in state.events if event.type == "auto_review.completed")
+    assert completed.data["status"] == "approved"
+    resolution = next(event for event in state.events if event.type == "approval.resolved")
+    assert resolution.data["decision"] == "approved"
+    assert resolution.data["reason"].startswith("auto_review_allow:")
+    assert len([event for event in state.events if event.type == "tool.execution.completed"]) == 1
+
+
+def test_on_request_auto_review_denies_and_blocks_execution(tmp_path) -> None:
+    call = ToolCall(name="noop")
+    model = StaticModel(
+        [
+            ModelResponse(tool_calls=[call]),
+            ModelResponse(
+                content=json.dumps(
+                    {
+                        "risk_level": "high",
+                        "user_authorization": "unknown",
+                        "outcome": "deny",
+                        "rationale": "The requested side effect is not authorized.",
+                    }
+                ),
+                finish_reason="stop",
+            ),
+            ModelResponse(content="done", finish_reason="stop"),
+        ]
+    )
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[NoopTool()],
+        policy=ApprovalPolicy(),
+        approval_handler=AutoReviewApprovalHandler(model),
+        approval_mode="on-request",
+    )
+
+    state = kernel.run("auto review denial", workspace=tmp_path)
+
+    assert state.failed is False
+    assert state.final_output == "done"
+    completed = next(event for event in state.events if event.type == "auto_review.completed")
+    assert completed.data["status"] == "denied"
+    resolution = next(event for event in state.events if event.type == "approval.resolved")
+    assert resolution.data["decision"] == "denied"
+    blocked = next(event for event in state.events if event.type == "tool.execution.blocked")
+    assert "materially safer alternative" in blocked.data["reason"]
+    assert "tool.execution.started" not in event_types(state)
 
 
 def test_on_request_without_approval_handler_denies_without_wait_step(tmp_path) -> None:
@@ -763,6 +1047,7 @@ def test_policy_exception_fails_closed_and_records_tool_result(tmp_path) -> None
         profile=BasicProfile(),
         tools=[NoopTool()],
         policy=ExplodingPolicy(),
+        approval_mode="never",
     )
 
     state = kernel.run("policy error", workspace=tmp_path)
@@ -796,13 +1081,13 @@ def test_tool_exception_gets_finished_event(tmp_path) -> None:
         profile=BasicProfile(),
         tools=[ExplodingTool()],
         policy=AllowAllPolicy(),
-        budgets=RunBudgets(max_turns=1),
+        budgets=RunBudgets(max_model_calls=1),
     )
 
     state = kernel.run("explode", workspace=tmp_path)
 
     assert state.failed is True
-    assert state.failure_reason == "Run exceeded max_turns budget."
+    assert state.failure_reason == "Run exceeded max_model_calls budget."
     assert state.tool_call_count == 1
     assert state.tool_results[0].call_id == call.id
     assert state.tool_results[0].ok is False
@@ -811,7 +1096,7 @@ def test_tool_exception_gets_finished_event(tmp_path) -> None:
     assert tool_finished.data["tool_call_id"] == call.id
     assert tool_finished.data["ok"] is False
     assert tool_finished.data["output"] == "Tool error: boom"
-    assert tool_finished.data["output_chars"] == len("Tool error: boom")
+    assert tool_finished.data["output_tokens"] == 4
     assert tool_finished.data["output_truncated"] is False
     assert tool_finished.data["data"] == {"error_type": "RuntimeError"}
 
@@ -983,13 +1268,13 @@ def test_unknown_tool_records_result_with_available_tools_and_can_recover(tmp_pa
         profile=BasicProfile(),
         tools=[NoopTool()],
         policy=AllowAllPolicy(),
-        budgets=RunBudgets(max_turns=2),
+        budgets=RunBudgets(max_model_calls=2),
     )
 
     state = kernel.run("missing tool", workspace=tmp_path)
 
     assert state.failed is True
-    assert state.failure_reason == "Run exceeded max_turns budget."
+    assert state.failure_reason == "Run exceeded max_model_calls budget."
     assert state.turn_count == 1
     assert state.model_call_count == 2
     assert state.tool_call_count == 2
@@ -1008,12 +1293,12 @@ def test_unknown_tool_is_rejected_before_policy(tmp_path) -> None:
         profile=BasicProfile(),
         tools=[NoopTool()],
         policy=ExplodingPolicy(),
-        budgets=RunBudgets(max_turns=1),
+        budgets=RunBudgets(max_model_calls=1),
     )
 
     state = kernel.run("missing tool", workspace=tmp_path)
 
-    assert state.failure_reason == "Run exceeded max_turns budget."
+    assert state.failure_reason == "Run exceeded max_model_calls budget."
     assert "policy.evaluated" not in event_types(state)
     assert state.tool_results[0].data["error_type"] == "UnknownTool"
 
@@ -1026,7 +1311,7 @@ def test_tool_finished_output_is_truncated(tmp_path) -> None:
         profile=BasicProfile(),
         tools=[LongOutputTool()],
         policy=AllowAllPolicy(),
-        budgets=RunBudgets(max_turns=1, max_command_output_chars_visible=3),
+        budgets=RunBudgets(max_model_calls=1, max_tool_output_tokens_visible=1),
     )
 
     state = kernel.run("long output", workspace=tmp_path)
@@ -1036,10 +1321,39 @@ def test_tool_finished_output_is_truncated(tmp_path) -> None:
     assert snapshot.seq < tool_finished.seq
     assert snapshot.data["tool_call_id"] == call.id
     assert snapshot.data["output_artifact"] == "artifacts/tool.txt"
-    assert tool_finished.data["output"] == "abc"
-    assert tool_finished.data["output_chars"] == 6
+    assert tool_finished.data["output"] == "abcd"
+    assert tool_finished.data["output_tokens"] == 2
     assert tool_finished.data["output_truncated"] is True
-    assert tool_finished.data["data"] == {"output_artifact": "artifacts/tool.txt"}
+    assert tool_finished.data["data"] == {"output_artifact": "artifacts/tool.txt", "output_tokens": 2}
+
+
+def test_kernel_captures_uncaptured_large_tool_output_for_contextfs(tmp_path) -> None:
+    call = ToolCall(name="raw_long_output")
+    model = StaticModel([ModelResponse(tool_calls=[call])])
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[RawLongOutputTool()],
+        policy=AllowAllPolicy(),
+        budgets=RunBudgets(max_model_calls=1, max_tool_output_tokens_visible=6),
+    )
+
+    state = kernel.run("long output", workspace=tmp_path)
+
+    result = state.tool_results[0]
+    assert result.truncated is True
+    assert result.output.startswith("HEAD-")
+    assert "[truncated]" in result.output
+    assert result.output.endswith("-TAIL")
+    assert result.artifact_path and result.artifact_path.startswith("context/raw_long_output/")
+    assert result.data["context_artifact"] == result.artifact_path
+    assert (state.output_dir / result.artifact_path).read_text() == "HEAD-" + ("x" * 40) + "-TAIL"
+    assert (state.output_dir / result.data["output_artifact"]).read_text() == "HEAD-" + ("x" * 40) + "-TAIL"
+
+    index = (state.output_dir / "context/INDEX.md").read_text()
+    tool_doc = (state.output_dir / "context/tools/raw_long_output.md").read_text()
+    assert f"contextfs:{result.artifact_path}" in index
+    assert result.artifact_path in tool_doc
 
 
 def test_tool_finished_large_data_is_summarized(tmp_path) -> None:
@@ -1050,14 +1364,14 @@ def test_tool_finished_large_data_is_summarized(tmp_path) -> None:
         profile=BasicProfile(),
         tools=[LargeDataTool()],
         policy=AllowAllPolicy(),
-        budgets=RunBudgets(max_turns=1),
+        budgets=RunBudgets(max_model_calls=1),
     )
 
     state = kernel.run("large data", workspace=tmp_path)
 
     tool_finished = next(event for event in state.events if event.type == "tool.execution.completed")
     assert tool_finished.data["data"]["_truncated"] is True
-    assert tool_finished.data["data"]["json_chars"] > 4_000
+    assert tool_finished.data["data"]["json_tokens"] > 1_000
     assert len(tool_finished.data["data"]["preview"]) == 4_000
 
 
@@ -1161,7 +1475,7 @@ def test_streaming_reasoning_visibility_distinguishes_visible_and_private(tmp_pa
     assert safe_summary.data["model_call_id"] == "model-call-0001"
     assert private_summary.visibility == "debug"
     assert private_summary.data == {
-        "chars": 13,
+        "tokens": 4,
         "item_id": None,
         "model_call_id": "model-call-0001",
         "provider_field": "reasoning_content",
@@ -1356,10 +1670,10 @@ def test_streamed_tool_call_completed_args_are_bounded_in_events(tmp_path) -> No
         event for event in state.events if event.type == "model.tool_call.assembly.completed"
     ][0]
     assert completed_assembly.data["args"]["_truncated"] is True
-    assert completed_assembly.data["args"]["json_chars"] > 4_000
+    assert completed_assembly.data["args"]["json_tokens"] > 1_000
     arg_delta = [event for event in sink.events if event.type == "model.tool_call.args.delta"][0]
     assert arg_delta.data["model_call_id"] == "model-call-0001"
-    assert arg_delta.data["chars"] > 4_000
+    assert arg_delta.data["tokens"] > 1_000
     assert arg_delta.data["delta_truncated"] is True
     assert "delta" not in arg_delta.data
     assert "delta_preview" not in arg_delta.data
@@ -1673,8 +1987,8 @@ def test_jsonl_stream_sink_filters_events_by_debug_level() -> None:
         Event(run_id="run_test", type="model.call.completed", data={"provider": "fake"}),
         Event(run_id="run_test", type="context.built"),
         Event(run_id="run_test", type="model.tool_call.args.delta", data={"delta": "{}"}, durability="ephemeral"),
-        Event(run_id="run_test", type="model.reasoning.delta", data={"chars": 3}, durability="ephemeral"),
-        Event(run_id="run_test", type="reasoning.encrypted", data={"chars": 8}, durability="ephemeral"),
+        Event(run_id="run_test", type="model.reasoning.delta", data={"tokens": 1}, durability="ephemeral"),
+        Event(run_id="run_test", type="reasoning.encrypted", data={"tokens": 2}, durability="ephemeral"),
     ]
 
     for event in events:
@@ -1715,7 +2029,7 @@ def test_console_text_sink_renders_selected_live_events_and_closes_lines() -> No
             type="model.tool_call.assembly.completed",
             data={"tool": "shell", "args": {"cmd": "pytest -q"}},
         ),
-        Event(run_id="run_test", type="tool.execution.completed", data={"tool": "shell", "output_chars": 12}),
+        Event(run_id="run_test", type="tool.execution.completed", data={"tool": "shell", "output_tokens": 3}),
         Event(run_id="run_test", type="model.text.delta", data={"delta": "done"}, visibility="user", durability="ephemeral"),
         Event(run_id="run_test", type="turn.completed", visibility="user"),
     ]
@@ -1727,7 +2041,7 @@ def test_console_text_sink_renders_selected_live_events_and_closes_lines() -> No
         "answer\n"
         "[reasoning] safe summary\n"
         "[tool] shell: pytest -q\n"
-        "[ok] shell completed, 12 chars\n"
+        "[ok] shell completed, 3 tokens\n"
         "done\n"
     )
 

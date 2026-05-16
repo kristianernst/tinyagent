@@ -32,7 +32,7 @@ class ToolCallRecord:
     ok: bool | None = None
     blocked: bool = False
     cancelled: bool = False
-    output_chars: int = 0
+    output_tokens: int = 0
     output_artifact: str = ""
 
 
@@ -43,7 +43,7 @@ class CommandRecord:
     timeout: bool = False
     cancelled: bool = False
     returncode: int | None = None
-    output_chars: int = 0
+    output_tokens: int = 0
     output_artifact: str = ""
 
 
@@ -57,9 +57,9 @@ class RunRecord:
     status: str = "unknown"
     failure_reason: str = ""
     final_output_path: str = "final.md"
-    final_output_chars: int = 0
+    final_output_tokens: int = 0
     final_diff_path: str = "final.diff"
-    final_diff_chars: int = 0
+    final_diff_tokens: int = 0
     final_diff_available: bool = False
     duration_seconds: float = 0.0
     turn_count: int = 0
@@ -92,7 +92,7 @@ def load_run_record(run_path: Path) -> RunRecord:
     tool_calls = _tool_calls(events)
     commands = _commands(events)
     diff_event = _last_event(events, "diff.finalized")
-    final_diff_chars = int(diff_event.data.get("chars", len(final_diff))) if diff_event else len(final_diff)
+    final_diff_tokens = int(diff_event.data.get("tokens") or 0) if diff_event else 0
     final_diff_available = bool(diff_event.data.get("available")) if diff_event else bool(final_diff)
 
     return RunRecord(
@@ -104,8 +104,8 @@ def load_run_record(run_path: Path) -> RunRecord:
         status=status,
         failure_reason=failure_reason,
         final_output_path=str(metrics.get("final_output_path") or "final.md"),
-        final_output_chars=int(metrics.get("final_output_chars") or 0),
-        final_diff_chars=final_diff_chars,
+        final_output_tokens=int(metrics.get("final_output_tokens") or 0),
+        final_diff_tokens=final_diff_tokens,
         final_diff_available=final_diff_available,
         duration_seconds=float(metrics.get("duration_seconds") or 0.0),
         turn_count=int(metrics.get("turn_count") or 0),
@@ -139,8 +139,8 @@ def render_run_inspection(record: RunRecord) -> str:
         f"patches: {record.patch_count}",
         f"events: {record.event_count}",
         f"artifacts: {record.artifact_count}",
-        f"final_output: {record.final_output_path} ({record.final_output_chars} chars)",
-        f"final_diff: {record.final_diff_path} ({record.final_diff_chars} chars, available={record.final_diff_available})",
+        f"final_output: {record.final_output_path} ({record.final_output_tokens} tokens)",
+        f"final_diff: {record.final_diff_path} ({record.final_diff_tokens} tokens, available={record.final_diff_available})",
     ]
     if record.failure_reason:
         lines.append(f"failure: {record.failure_reason}")
@@ -159,7 +159,7 @@ def render_run_inspection(record: RunRecord) -> str:
         for call in record.tool_calls:
             lines.append(
                 f"- {call.tool} {call.tool_call_id} ok={call.ok} blocked={call.blocked} cancelled={call.cancelled} "
-                f"output_chars={call.output_chars} {call.output_artifact}".strip()
+                f"output_tokens={call.output_tokens} {call.output_artifact}".strip()
             )
     else:
         lines.append("- none")
@@ -168,7 +168,7 @@ def render_run_inspection(record: RunRecord) -> str:
         for command in record.commands:
             lines.append(
                 f"- ok={command.ok} timeout={command.timeout} cancelled={command.cancelled} returncode={command.returncode} "
-                f"output_chars={command.output_chars} cmd={command.cmd!r} {command.output_artifact}".strip()
+                f"output_tokens={command.output_tokens} cmd={command.cmd!r} {command.output_artifact}".strip()
             )
     else:
         lines.append("- none")
@@ -229,7 +229,7 @@ def _tool_calls(events: list[Event]) -> list[ToolCallRecord]:
                 ok=bool(data.get("ok")),
                 blocked=bool(data.get("blocked")),
                 cancelled=event.type == "tool.execution.cancelled",
-                output_chars=int(data.get("output_chars") or 0),
+                output_tokens=int(data.get("output_tokens") or 0),
                 output_artifact=str(payload.get("output_artifact") or ""),
             )
     return [ToolCallRecord(**record) for record in records.values()]
@@ -249,7 +249,7 @@ def _commands(events: list[Event]) -> list[CommandRecord]:
                 ok=bool(data.get("ok")),
                 timeout=bool(data.get("timeout")) or event.type == "command.timeout",
                 returncode=data.get("returncode"),
-                output_chars=int(data.get("output_chars") or 0),
+                output_tokens=int(data.get("output_tokens") or 0),
                 output_artifact=str(data.get("output_artifact") or ""),
             )
         elif event.type == "command.cancelled":
@@ -257,7 +257,7 @@ def _commands(events: list[Event]) -> list[CommandRecord]:
                 ok=False,
                 cancelled=True,
                 returncode=data.get("returncode"),
-                output_chars=int(data.get("output_chars") or 0),
+                output_tokens=int(data.get("output_tokens") or 0),
                 output_artifact=str(data.get("output_artifact") or ""),
             )
     return [CommandRecord(**record) for record in records.values()]

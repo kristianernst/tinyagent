@@ -15,7 +15,7 @@ import tinyagent.cli as cli
 from tinyagent.app.product import ProductHome, WorkspaceStore
 from tinyagent.app.server import create_product_runtime_server
 from tinyagent.core.model_stream import ModelDelta
-from tinyagent.core.state import Message, ModelResponse, RunState, ToolCall
+from tinyagent.core.state import Message, ModelRequestContext, ModelResponse, RunState, ToolCall
 from tinyagent.runtime.conversation import ConversationStore
 from tinyagent.runtime.server import RunController, RuntimeConfig, RuntimeHTTPServer, create_runtime_server
 
@@ -937,12 +937,12 @@ def _wait_for_conversation_turns(base: str, conversation_id: str, expected_types
 class _InternalReasoningProvider:
     name = "internal-reasoning"
 
-    def complete(self, messages, tools, state: RunState) -> ModelResponse:
-        del messages, tools, state
+    def complete(self, messages, tools, request: ModelRequestContext) -> ModelResponse:
+        del messages, tools, request
         return ModelResponse(content="public answer", finish_reason="stop")
 
-    def stream(self, messages: list[Message], tools, state: RunState):
-        del messages, tools, state
+    def stream(self, messages: list[Message], tools, request: ModelRequestContext):
+        del messages, tools, request
         yield ModelDelta(
             kind="reasoning_summary_delta",
             delta="private thought",
@@ -958,8 +958,8 @@ class _ContextReadProvider:
     def __init__(self) -> None:
         self.calls = 0
 
-    def complete(self, messages, tools, state: RunState) -> ModelResponse:
-        del messages, tools, state
+    def complete(self, messages, tools, request: ModelRequestContext) -> ModelResponse:
+        del messages, tools, request
         self.calls += 1
         if self.calls == 1:
             return ModelResponse(

@@ -85,7 +85,7 @@ def _skill_files(root: Path) -> tuple[str, ...]:
 
 
 def _skill_id(source: str, name: str) -> str:
-    safe = "".join(char if char.isalnum() else "_" for char in f"{source}_{name}")
+    safe = "".join(ch if ch.isalnum() else "_" for ch in f"{source}_{name}")
     return f"skill_{safe.strip('_')}"
 
 

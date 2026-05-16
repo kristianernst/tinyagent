@@ -11,6 +11,7 @@ from uuid import uuid4
 from tinyagent.core.artifacts import tool_result_artifact_refs
 from tinyagent.core.events import json_safe, utc_now
 from tinyagent.core.state import Message, RunState
+from tinyagent.core.token_utils import estimate_tokens
 
 ConversationStatus = Literal["open", "closed", "archived"]
 
@@ -160,10 +161,10 @@ class ConversationStore:
                 "role": assistant_message.role,
                 "content_artifact": "final.md",
                 "content_preview": _preview(content),
-                "content_chars": len(content),
+                "content_tokens": estimate_tokens(content),
             },
             "tool_summary": tool_summary or [],
-            "token_estimate": _estimate_tokens(str(user_message.content or "")) + _estimate_tokens(content),
+            "token_estimate": estimate_tokens(str(user_message.content or "")) + estimate_tokens(content),
             "created_at": _now(),
         }
         self._append_turn(conversation_id, entry)
@@ -279,10 +280,6 @@ def _assistant_content(turn: dict[str, Any], assistant: dict[str, Any]) -> str:
             return text.strip()
     preview = assistant.get("content_preview")
     return str(preview or "")
-
-
-def _estimate_tokens(text: str) -> int:
-    return max(1, (len(text) + 3) // 4) if text else 0
 
 
 def _preview(text: str, limit: int = 240) -> str:

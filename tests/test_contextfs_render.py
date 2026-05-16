@@ -140,7 +140,7 @@ def test_contextfs_exposes_truncated_context_tool_output_artifacts(tmp_path) -> 
         "truncated dynamic context",
         Workspace(tmp_path),
         run_id="run_contextfs_truncated_context_tools",
-        budgets=RunBudgets(max_command_output_chars_visible=80),
+        budgets=RunBudgets(max_tool_output_tokens_visible=20),
     )
     refresh_contextfs(state)
     search = ContextSearchTool().run(ToolCall(id="call_search", name="context_search", args={"query": "truncated", "source": "contextfs"}), state)

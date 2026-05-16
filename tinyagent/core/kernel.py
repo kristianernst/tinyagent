@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -22,6 +24,7 @@ from tinyagent.core.contracts import (
     Profile,
     ProfileRuntimeCapabilities,
     Tool,
+    tool_runtime,
 )
 from tinyagent.core.events import EventSink, json_safe
 from tinyagent.core.extensions import Extension, ExtensionHost
@@ -50,6 +53,7 @@ from tinyagent.core.state import (
     ApprovalMode,
     FinishDecision,
     Message,
+    ModelRequestContext,
     ModelResponse,
     PolicyDecision,
     RunBudgets,
@@ -57,6 +61,7 @@ from tinyagent.core.state import (
     ToolCall,
     ToolResult,
 )
+from tinyagent.core.tool_outputs import normalize_tool_result_output
 from tinyagent.core.tool_recording import (
     append_tool_step,
     record_tool_blocked,
@@ -334,9 +339,9 @@ class Kernel:
                     "token_estimate": built_context.token_estimate,
                     "model_call_token_estimate": actual_token_estimate,
                     "tool_schema_tokens": estimate_tools_tokens(visible_tools),
-                    "static_context_chars": built_context.static_context_chars,
-                    "tool_context_chars": built_context.tool_context_chars,
-                    "project_instruction_chars": built_context.project_instruction_chars,
+                    "static_context_tokens": built_context.static_context_tokens,
+                    "tool_context_tokens": built_context.tool_context_tokens,
+                    "project_instruction_tokens": built_context.project_instruction_tokens,
                     "context_artifacts": [artifact.path for artifact in built_context.artifacts],
                     "context_report_artifact": None,
                     "contextfs_index_path": built_context.contextfs_index_path,
@@ -448,6 +453,8 @@ class Kernel:
                 state.fail(f"Model provider error: {exc}")
                 return
             state.model_call_count += 1
+            if response.conversation_state is not None:
+                state.model_conversation_state = response.conversation_state
             tool_recording_error = record_model_tool_calls(
                 state,
                 response.tool_calls,
@@ -464,6 +471,17 @@ class Kernel:
                 call_index=model_call_index,
                 response=response,
             )
+            usage = response.raw.get("usage")
+            if not response.raw.get("streamed") and isinstance(usage, dict):
+                state.emit(
+                    "model.usage",
+                    {
+                        "provider": self.model.name,
+                        "model_call_id": model_call_id,
+                        "model_call_index": model_call_index,
+                        **usage,
+                    },
+                )
             state.transcript.record_model_response(
                 item_id=f"transcript-model-response-{model_call_index:04d}",
                 turn_id=state.current_turn_id,
@@ -485,6 +503,9 @@ class Kernel:
                     "finish_reason": response.finish_reason,
                     "response_artifact": response_artifact,
                     "streamed": bool(response.raw.get("streamed")),
+                    "conversation_state": (
+                        response.conversation_state.to_json_dict() if response.conversation_state is not None else None
+                    ),
                 },
             )
             state.finish_step("completed", data={"provider": self.model.name})
@@ -513,13 +534,9 @@ class Kernel:
                     state.fail("Model returned no content and no tool calls.")
                 return
 
-            for call in response.tool_calls:
-                state.raise_if_cancelled()
-                if self._tool_budget_exhausted(state):
-                    return
-                self._dispatch_tool_call(state, call, visible_tool_names=visible_tool_names)
-                if state.done:
-                    return
+            self._dispatch_tool_calls(state, response.tool_calls, visible_tool_names=visible_tool_names)
+            if state.done:
+                return
 
             if self.profile.should_finish(state):
                 candidate = response.content or state.final_output or "Run finished by profile."
@@ -541,6 +558,194 @@ class Kernel:
                     )
                     continue
                 return
+
+    def _dispatch_tool_calls(
+        self,
+        state: RunState,
+        calls: Sequence[ToolCall],
+        *,
+        visible_tool_names: frozenset[str],
+    ) -> None:
+        index = 0
+        while index < len(calls):
+            state.raise_if_cancelled()
+            if self._tool_budget_exhausted(state):
+                self._record_budget_blocked_tool_calls(state, calls[index:])
+                return
+
+            batch = self._parallel_candidate_batch(state, calls[index:], visible_tool_names=visible_tool_names)
+            if len(batch) > 1:
+                self._dispatch_parallel_safe_batch(state, batch)
+                if state.done:
+                    return
+                index += len(batch)
+                continue
+
+            self._dispatch_tool_call(state, calls[index], visible_tool_names=visible_tool_names)
+            if state.done:
+                return
+            index += 1
+
+    def _parallel_candidate_batch(
+        self,
+        state: RunState,
+        calls: Sequence[ToolCall],
+        *,
+        visible_tool_names: frozenset[str],
+    ) -> list[_ParallelToolCall]:
+        if state.approval_mode != "yolo" or self.hooks or not isinstance(self.executor, LocalExecutor):
+            return []
+        remaining = state.budgets.max_tool_calls - state.tool_call_count
+        if remaining < 2:
+            return []
+
+        batch: list[_ParallelToolCall] = []
+        seen_keys: set[str] = set()
+        for call in calls[:remaining]:
+            tool = self.tools.get(call.name)
+            if tool is None or call.name not in visible_tool_names:
+                break
+            runtime = tool_runtime(tool)
+            if (
+                not runtime.parallel_safe
+                or runtime.mutates_workspace
+                or runtime.requires_shell
+                or runtime.requires_network
+                or runtime.lock_key is not None
+            ):
+                break
+            key = _tool_call_key(call)
+            if key in seen_keys:
+                break
+            progress = self.progress_guard.before_tool_call(state, call)
+            if not progress.allow:
+                break
+            seen_keys.add(key)
+            batch.append(_ParallelToolCall(call=call, tool=tool))
+        return batch if len(batch) > 1 else []
+
+    def _dispatch_parallel_safe_batch(self, state: RunState, batch: Sequence[_ParallelToolCall]) -> None:
+        batch_id = f"tool-batch-{uuid4().hex[:12]}"
+        state.tool_call_count += len(batch)
+        before_deltas = {}
+        for index, item in enumerate(batch, start=1):
+            state.raise_if_cancelled()
+            decision = self._policy_decision(state, item.call)
+            record_policy_decision(state, item.call, decision)
+            if not decision.allowed:
+                reason = decision.reason or "Policy denied tool call."
+                raise RuntimeError(f"Parallel batch received non-allow policy decision for {item.call.name}: {reason}")
+            tool_execution_id = f"tool-exec-{item.call.id}"
+            state.emit(
+                "workspace.delta.started",
+                {"tool_call_id": item.call.id, "tool": item.call.name, "batch_id": batch_id},
+            )
+            before_deltas[item.call.id] = self.workspace_delta_observer.snapshot(state)
+            state.emit(
+                "tool.execution.started",
+                {
+                    "tool_call_id": item.call.id,
+                    "tool_execution_id": tool_execution_id,
+                    "tool": item.call.name,
+                    "batch_id": batch_id,
+                    "batch_index": index,
+                    "batch_size": len(batch),
+                },
+                visibility="user",
+            )
+            state.emit(
+                "step.started",
+                {
+                    "step_kind": "tool_execution",
+                    "step_id": tool_execution_id,
+                    "tool_call_id": item.call.id,
+                    "tool": item.call.name,
+                    "batch_id": batch_id,
+                },
+            )
+
+        with ThreadPoolExecutor(max_workers=len(batch), thread_name_prefix="tinyagent-tool") as pool:
+            results = list(pool.map(lambda item: self._run_parallel_tool(item.tool, item.call, state), batch))
+
+        for item, result in zip(batch, results, strict=True):
+            call = item.call
+            if not result.call_id:
+                result = replace(result, call_id=call.id)
+            result.metadata["batch_id"] = batch_id
+            result = normalize_tool_result_output(state, call, result)
+            result.metadata["batch_id"] = batch_id
+            after_delta = self.workspace_delta_observer.snapshot(state)
+            workspace_delta = self.workspace_delta_observer.diff(state, before_deltas[call.id], after_delta, call)
+            if workspace_delta.mutated:
+                result.metadata["workspace_delta"] = workspace_delta.to_json_dict()
+                result.data["workspace_delta"] = workspace_delta.to_json_dict()
+            else:
+                result.metadata["workspace_delta"] = workspace_delta.to_json_dict()
+            append_tool_step(state, call, result)
+            record_tool_result_event(state, call, result)
+            if workspace_delta.mutated:
+                self._record_workspace_delta(state, call, result, workspace_delta)
+            else:
+                state.emit(
+                    "workspace.delta.completed",
+                    {
+                        "tool_call_id": call.id,
+                        "tool": call.name,
+                        "mutated": False,
+                        "ok": result.ok,
+                        "batch_id": batch_id,
+                    },
+                )
+            self._refresh_contextfs(state, {"tool_call_id": call.id, "batch_id": batch_id})
+            status = "cancelled" if result.data.get("cancelled") else "completed" if result.ok else "failed"
+            step_event = {
+                "completed": "step.completed",
+                "failed": "step.failed",
+                "cancelled": "step.cancelled",
+            }[status]
+            step_data: dict[str, Any] = {
+                "step_kind": "tool_execution",
+                "step_id": f"tool-exec-{call.id}",
+                "tool_call_id": call.id,
+                "tool": call.name,
+                "batch_id": batch_id,
+            }
+            if result.data.get("cancelled"):
+                step_data["reason"] = result.data.get("reason") or "cancelled"
+            state.emit(step_event, step_data, visibility="user" if status != "completed" else "debug")
+            if result.data.get("cancelled"):
+                state.request_cancel(str(result.data.get("reason") or state.cancel_reason or "cancelled"))
+
+    def _run_parallel_tool(self, tool: Tool, call: ToolCall, state: RunState) -> ToolResult:
+        try:
+            return self.executor.run_tool(tool, call, state)
+        except RunCancelled as exc:
+            state.request_cancel(
+                str(exc) or "cancelled",
+                source="sigint" if state.cancel_token.reason == "sigint" else "harness",
+                escalate=state.cancel_token.escalated,
+            )
+            return ToolResult(
+                tool_name=call.name,
+                call_id=call.id,
+                output=state.cancel_reason or "cancelled",
+                ok=False,
+                data={"cancelled": True, "reason": state.cancel_reason or "cancelled"},
+                failure_kind="unknown",
+                summary=state.cancel_reason or "cancelled",
+                content_preview=state.cancel_reason or "cancelled",
+            )
+        except Exception as exc:
+            return ToolResult(
+                tool_name=call.name,
+                call_id=call.id,
+                output=f"Tool error: {exc}",
+                ok=False,
+                data={"error_type": type(exc).__name__},
+                failure_kind="unknown",
+                summary=f"Tool error: {exc}",
+                content_preview=f"Tool error: {exc}",
+            )
 
     def _dispatch_tool_call(self, state: RunState, call: ToolCall, *, visible_tool_names: frozenset[str]) -> None:
         state.raise_if_cancelled()
@@ -595,7 +800,7 @@ class Kernel:
             return
 
         try:
-            decision = self.policy.evaluate(call, state)
+            decision = self._policy_decision(state, call)
         except Exception as exc:
             decision = PolicyDecision.deny(f"Policy engine error: {exc}")
             record_policy_decision(state, call, decision)
@@ -622,7 +827,7 @@ class Kernel:
         if isinstance(hook_result, ToolCall):
             call = hook_result
             try:
-                decision = self.policy.evaluate(call, state)
+                decision = self._policy_decision(state, call)
             except Exception as exc:
                 decision = PolicyDecision.deny(f"Policy engine error after hook mutation: {exc}")
             record_policy_decision(state, call, decision)
@@ -716,6 +921,7 @@ class Kernel:
             )
         if not result.call_id:
             result = replace(result, call_id=call.id)
+        result = normalize_tool_result_output(state, call, result)
         after_delta = self.workspace_delta_observer.snapshot(state)
         workspace_delta = self.workspace_delta_observer.diff(state, before_delta, after_delta, call)
         if workspace_delta.mutated:
@@ -740,11 +946,35 @@ class Kernel:
         if result.data.get("cancelled"):
             state.request_cancel(str(result.data.get("reason") or state.cancel_reason or "cancelled"))
 
+    def _policy_decision(self, state: RunState, call: ToolCall) -> PolicyDecision:
+        if state.approval_mode == "yolo":
+            return PolicyDecision.allow(
+                "approval-mode=yolo bypasses policy enforcement",
+                matched_rule="approval_mode:yolo:allow",
+                permission="yolo",
+            )
+        return self.policy.evaluate(call, state)
+
     def _record_blocked_tool_call(self, state: RunState, call: ToolCall, result: ToolResult) -> None:
         append_tool_step(state, call, result)
         record_tool_result_event(state, call, result)
         record_tool_blocked(state, call, result.output)
         self._refresh_contextfs(state, {"tool_call_id": call.id})
+
+    def _record_budget_blocked_tool_calls(self, state: RunState, calls: Sequence[ToolCall]) -> None:
+        reason = state.failure_reason or "Run exceeded max_tool_calls budget."
+        for call in calls:
+            result = ToolResult(
+                tool_name=call.name,
+                call_id=call.id,
+                output=reason,
+                ok=False,
+                data={"blocked": True, "budget_exceeded": True, "failure_kind": "budget_exceeded"},
+                failure_kind="budget_exceeded",
+                summary=reason,
+                content_preview=reason,
+            )
+            self._record_blocked_tool_call(state, call, result)
 
     def _record_workspace_delta(self, state: RunState, call: ToolCall, result: ToolResult, delta) -> None:
         payload = {"tool_call_id": call.id, "tool": call.name, "ok": result.ok, "failure_kind": result.failure_kind, **delta.to_json_dict()}
@@ -835,8 +1065,8 @@ class Kernel:
         if state.elapsed_seconds() > state.budgets.max_run_seconds:
             state.fail("Run exceeded max_run_seconds budget.")
             return True
-        if state.model_call_count >= state.budgets.max_turns:
-            state.fail("Run exceeded max_turns budget.")
+        if state.model_call_count >= state.budgets.max_model_calls:
+            state.fail("Run exceeded max_model_calls budget.")
             return True
         if state.tool_call_count >= state.budgets.max_tool_calls:
             state.fail("Run exceeded max_tool_calls budget.")
@@ -861,7 +1091,7 @@ class Kernel:
         build_payload = getattr(self.model, "build_stream_payload" if stream else "build_payload", None)
         if not callable(build_payload):
             return None
-        payload = build_payload(messages, tools, state)
+        payload = build_payload(messages, tools, ModelRequestContext.from_run_state(state))
         if not isinstance(payload, dict):
             return None
         return write_model_http_request_artifact(state, call_index=call_index, payload=payload)
@@ -910,6 +1140,16 @@ def _blocked_result_data(decision: PolicyDecision) -> dict[str, object]:
         "permission": capability,
         "matched_rule": decision.matched_rule,
     }
+
+
+@dataclass(frozen=True)
+class _ParallelToolCall:
+    call: ToolCall
+    tool: Tool
+
+
+def _tool_call_key(call: ToolCall) -> str:
+    return f"{call.name}:{json.dumps(json_safe(call.args), sort_keys=True)}"
 
 
 def _context_budget(profile: Profile, state: RunState, capabilities=None) -> int:

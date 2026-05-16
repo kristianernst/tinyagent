@@ -216,7 +216,7 @@ def test_mcp_extension_adds_tools_and_context_source_to_default_kernel(tmp_path)
         tools=default_tools(),
         policy=LocalPolicy(),
         extensions=[McpExtension({"github": client})],
-        budgets=RunBudgets(max_turns=1),
+        budgets=RunBudgets(max_model_calls=1),
     ).run("mcp", workspace=tmp_path, run_id="run_mcp_kernel")
 
     context_built = next(event for event in state.events if event.type == "context.built")

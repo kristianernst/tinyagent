@@ -20,9 +20,9 @@ from tinyagent.core.context import (
     render_recent_tool_steps,
 )
 from tinyagent.core.context.builder import render_conversation_history, render_finish_gate_messages
-from tinyagent.core.context.checkpoint import is_test_command_text
+from tinyagent.core.context.checkpoint import is_test_command_text, is_verification_command_text
 from tinyagent.core.context.instructions import load_project_instructions
-from tinyagent.core.contracts import Tool
+from tinyagent.core.contracts import Tool, tool_runtime
 from tinyagent.core.profile_catalog import (
     DEFAULT_PROFILE_NAMES,
     DEFAULT_RUNTIME_CAPABILITIES,
@@ -30,8 +30,17 @@ from tinyagent.core.profile_catalog import (
     TINY_PI_RUNTIME_CAPABILITIES,
 )
 from tinyagent.core.state import FinishDecision, Message, ModelResponse, RunState, ToolStep
+from tinyagent.core.token_utils import estimate_tokens
 
 PROFILE_ROOT = Path(__file__).resolve().parents[1] / "profiles"
+
+DEFAULT_CODER_SYSTEM_PROMPT = (
+    "You are tinyagent's default coding profile. Use shell for inspection, search, tests, and git. "
+    "Use apply_patch for edits. Inspect enough context to act, then implement; do not re-read files already shown "
+    "unless they changed, were truncated, or a failure requires it. After a successful apply_patch, trust the patch "
+    "result and move to verification or diff inspection instead of re-reading the same file. Finish by returning "
+    "assistant content when done."
+)
 
 
 class ApexCoderProfile:
@@ -74,7 +83,7 @@ class ApexCoderProfile:
         self.system_prompt_path = system_prompt_path or PROFILE_ROOT / "tiny-coder" / "system.md"
         self.recent_results = recent_results
         self.visible_tool_names = tuple(visible_tool_names) if visible_tool_names is not None else self.DEFAULT_VISIBLE_TOOL_NAMES
-        self.context_config = context_config or ContextConfig()
+        self.context_config = context_config or ContextConfig(compact_after_tool_steps=64)
         if recent_tool_token_budget is not None:
             self.context_config = replace(self.context_config, max_recent_tool_tokens=recent_tool_token_budget)
         self._system_prompt = self._load_system_prompt()
@@ -85,14 +94,15 @@ class ApexCoderProfile:
     def _load_system_prompt(self) -> str:
         if self.system_prompt_path.exists():
             return self.system_prompt_path.read_text()
-        return (
-            "You are tinyagent's default coding profile. Use shell for inspection, search, tests, and git. "
-            "Use apply_patch for edits. Finish by returning assistant content when done."
-        )
+        return DEFAULT_CODER_SYSTEM_PROMPT
 
     def build_context(self, state: RunState, *, visible_tools: Sequence[Tool] | None = None) -> BuiltContext:
-        visible_tool_names = [tool.name for tool in visible_tools] if visible_tools is not None else self.visible_tool_names
-        return ContextBuilder(system_prompt=self.system_prompt(), config=self._context_config_for_state(state)).build(
+        visible_tool_objects = tuple(visible_tools or ())
+        visible_tool_names = [tool.name for tool in visible_tool_objects] if visible_tools is not None else self.visible_tool_names
+        return ContextBuilder(
+            system_prompt=_system_prompt_with_parallel_guidance(self.system_prompt(), state, visible_tool_objects),
+            config=self._context_config_for_state(state),
+        ).build(
             state,
             plan=self.plan_next_context(state),
             visible_tool_names=visible_tool_names,
@@ -239,7 +249,7 @@ class TinyPiProfile:
         self.recent_results = recent_results
         self.visible_tool_names = tuple(visible_tool_names) if visible_tool_names is not None else self.DEFAULT_VISIBLE_TOOL_NAMES
         self.context_config = context_config or ContextConfig(
-            project_instruction_max_chars=8_000,
+            project_instruction_max_tokens=2_000,
             max_recent_tool_tokens=2_000,
             compact_after_tool_steps=12,
             compact_at_tokens=48_000,
@@ -258,7 +268,9 @@ class TinyPiProfile:
 
     def build_context(self, state: RunState, *, visible_tools: Sequence[Tool] | None = None) -> BuiltContext:
         config = self._context_config_for_state(state)
-        visible_tool_names = [tool.name for tool in visible_tools] if visible_tools is not None else self.visible_tool_names
+        visible_tool_objects = tuple(visible_tools or ())
+        visible_tool_names = [tool.name for tool in visible_tool_objects] if visible_tools is not None else self.visible_tool_names
+        system_prompt = _system_prompt_with_parallel_guidance(self.system_prompt(), state, visible_tool_objects)
         instructions = load_project_instructions(state.workspace.root, config)
         recent = render_recent_tool_steps(
             state,
@@ -267,7 +279,7 @@ class TinyPiProfile:
             visible_tool_names=visible_tool_names,
         )
         messages = [
-            Message(role="system", content=self.system_prompt()),
+            Message(role="system", content=system_prompt),
             Message(role="user", content=render_environment_context(state, config)),
             Message(role="user", content=render_project_instructions(instructions)),
             Message(role="user", content=f"Task:\n{state.task}"),
@@ -280,7 +292,7 @@ class TinyPiProfile:
         if finish_gate:
             messages.append(Message(role="user", content=finish_gate))
         included = [
-            _context_item("system:profile", self.system_prompt(), "system_prompt", 1000, stable=True),
+            _context_item("system:profile", system_prompt, "system_prompt", 1000, stable=True),
             _context_item("environment:current", str(messages[1].content), "environment", 850, stable=True),
             _context_item("project:instructions", str(messages[2].content), "project_instructions", 800, stable=True),
             *([_context_item("conversation:history", conversation, "conversation_history", 925, stable=True)] if conversation else []),
@@ -291,9 +303,9 @@ class TinyPiProfile:
         return BuiltContext(
             messages=messages,
             token_estimate=estimate_messages_tokens(messages),
-            static_context_chars=sum(len(str(message.content)) for message in messages),
-            tool_context_chars=len(recent),
-            project_instruction_chars=instructions.chars,
+            static_context_tokens=sum(estimate_tokens(str(message.content)) for message in messages),
+            tool_context_tokens=estimate_tokens(recent),
+            project_instruction_tokens=instructions.token_estimate,
             included=included,
             context_plan=ContextPlan(mode="explore", reason="tiny-pi lean context"),
         )
@@ -384,6 +396,49 @@ def profile_for(
     raise ValueError(f"Unknown profile: {name}")
 
 
+def _system_prompt_with_parallel_guidance(system_prompt: str, state: RunState, visible_tools: Sequence[Tool]) -> str:
+    guidance = _parallel_exploration_guidance(state, visible_tools)
+    return f"{system_prompt.rstrip()}\n\n{guidance}" if guidance else system_prompt
+
+
+def _parallel_exploration_guidance(state: RunState, visible_tools: Sequence[Tool]) -> str:
+    capabilities = (state.model_spec or {}).get("capabilities")
+    if not isinstance(capabilities, dict) or capabilities.get("supports_parallel_tool_calls") is not True:
+        return ""
+    tool_names = _parallel_batchable_tool_names(visible_tools)
+    if not tool_names:
+        return ""
+    return "\n".join(
+        [
+            "Parallel tool use:",
+            "- Batch independent read-only calls in one model response when all inputs are already known.",
+            f"- Batchable tools in this context: {', '.join(tool_names)}.",
+            "- Do not batch mutating tools, shell commands, network tools, or calls whose arguments depend on a previous result.",
+            "- After edits, verify with tests or diff evidence instead of re-reading unchanged files.",
+        ]
+    )
+
+
+def _parallel_batchable_tool_names(visible_tools: Sequence[Tool]) -> tuple[str, ...]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for tool in visible_tools:
+        runtime = tool_runtime(tool)
+        if (
+            not runtime.parallel_safe
+            or runtime.mutates_workspace
+            or runtime.requires_shell
+            or runtime.requires_network
+            or runtime.lock_key is not None
+        ):
+            continue
+        if tool.name in seen:
+            continue
+        seen.add(tool.name)
+        names.append(tool.name)
+    return tuple(names)
+
+
 def _latest_index(steps: list[ToolStep], predicate) -> int | None:
     for index in range(len(steps) - 1, -1, -1):
         if predicate(steps[index]):
@@ -419,7 +474,7 @@ def _context_item(item_id: str, text: str, source: str, priority: int, *, stable
         text=text,
         source=source,
         priority=priority,
-        token_estimate=max(1, len(text) // 4),
+        token_estimate=estimate_tokens(text),
         stable=stable,
     )
 
@@ -475,9 +530,7 @@ def _is_successful_verification(step: ToolStep) -> bool:
     if step.call.name != "shell" or not step.result.ok:
         return False
     cmd = str(step.call.args.get("cmd", ""))
-    return is_test_command_text(cmd) or any(
-        token in cmd.lower() for token in ("-m pytest", "-m unittest", "npm test", "cargo test", "go test", "ruff", "mypy")
-    )
+    return is_verification_command_text(cmd)
 
 
 def _is_failed_verification(step: ToolStep) -> bool:

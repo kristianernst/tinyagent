@@ -8,14 +8,15 @@ from pathlib import Path
 
 from tinyagent.core.events import utc_now
 from tinyagent.core.state import RunState
+from tinyagent.core.token_utils import token_budget_to_text_limit
 from tinyagent.extensions.todo_memory.types import TodoItem, TodoState
 
 TODO_JSON = Path("context/memory/todo.json")
 TODO_MD = Path("context/memory/todo.md")
 MAX_TODO_ITEMS = 100
-MAX_TODO_ID_CHARS = 80
-MAX_TODO_TEXT_CHARS = 500
-MAX_TODO_NOTES_CHARS = 4_000
+MAX_TODO_ID_TOKENS = 20
+MAX_TODO_TEXT_TOKENS = 125
+MAX_TODO_NOTES_TOKENS = 1_000
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_.:-]+")
 
 
@@ -37,7 +38,7 @@ class TodoStore:
         }
         used_ids: set[str] = set()
         for index, raw in enumerate(items[:MAX_TODO_ITEMS], start=1):
-            text = str(raw.get("text") or "").strip()[:MAX_TODO_TEXT_CHARS]
+            text = str(raw.get("text") or "").strip()[: token_budget_to_text_limit(MAX_TODO_TEXT_TOKENS)]
             if not text:
                 continue
             raw_id = str(raw.get("id") or "").strip()
@@ -57,7 +58,7 @@ class TodoStore:
                     source="model",
                 )
             )
-        todo = TodoState(items=tuple(next_items), notes=str(notes)[:MAX_TODO_NOTES_CHARS])
+        todo = TodoState(items=tuple(next_items), notes=str(notes)[: token_budget_to_text_limit(MAX_TODO_NOTES_TOKENS)])
         _atomic_write(state.output_dir / TODO_JSON, json.dumps(todo.to_json_dict(), indent=2, sort_keys=True) + "\n")
         markdown = render_todo_markdown(todo)
         _atomic_write(state.output_dir / TODO_MD, markdown)
@@ -94,7 +95,7 @@ def _atomic_write(path: Path, content: str) -> None:
 
 
 def _safe_id(value: str) -> str:
-    cleaned = _SAFE_ID_RE.sub("_", value)[:MAX_TODO_ID_CHARS].strip("._:-")
+    cleaned = _SAFE_ID_RE.sub("_", value)[: token_budget_to_text_limit(MAX_TODO_ID_TOKENS)].strip("._:-")
     return cleaned or "todo"
 
 

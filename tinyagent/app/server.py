@@ -36,6 +36,7 @@ class ProductRuntimeController:
         debug_level: int = 0,
         workspace_mode: WorkspaceMode = "current",
         approval_mode: ApprovalMode = "yolo",
+        approvals_reviewer: str = "user",
         sandbox_mode: SandboxModeInput = "none",
         profile: str = "tiny-coder",
         profile_override: bool = False,
@@ -49,6 +50,7 @@ class ProductRuntimeController:
         self.debug_level = debug_level
         self.workspace_mode = workspace_mode
         self.approval_mode = approval_mode
+        self.approvals_reviewer = approvals_reviewer
         self.sandbox_mode = sandbox_mode
         self.profile = profile
         self.profile_override = profile_override
@@ -93,6 +95,7 @@ class ProductRuntimeController:
                 debug_level=self.debug_level,
                 workspace_mode=self.workspace_mode,
                 approval_mode=self.approval_mode,
+                approvals_reviewer=self.approvals_reviewer,
                 sandbox_mode=self.sandbox_mode,
                 profile=self.profile if self.profile_override else record.default_profile,
                 conversation_store=ConversationStore(workspace_root_path / "conversations"),
@@ -231,6 +234,7 @@ class ProductRuntimeHandler(RuntimeHandler):
                         task,
                         run_id=body.get("run_id"),
                         approval_mode=str(body.get("approval_mode") or controller.config.approval_mode),
+                        approvals_reviewer=str(body.get("approvals_reviewer") or controller.config.approvals_reviewer),
                         profile=str(body.get("profile") or controller.config.profile),
                     ),
                 )
@@ -247,6 +251,7 @@ class ProductRuntimeHandler(RuntimeHandler):
                     turn_id=body.get("turn_id"),
                     parent_turn_id=body.get("parent_turn_id"),
                     approval_mode=str(body.get("approval_mode") or controller.config.approval_mode),
+                    approvals_reviewer=str(body.get("approvals_reviewer") or controller.config.approvals_reviewer),
                     profile=str(body.get("profile") or controller.config.profile),
                 )
                 payload["events_url"] = f"/api/runs/{payload['run_id']}/events?workspace_id={workspace_id}"
@@ -377,6 +382,7 @@ class ProductRuntimeHandler(RuntimeHandler):
                         turn_id=body.get("turn_id"),
                         parent_turn_id=body.get("parent_turn_id"),
                         approval_mode=str(body.get("approval_mode") or controller.config.approval_mode),
+                        approvals_reviewer=str(body.get("approvals_reviewer") or controller.config.approvals_reviewer),
                         profile=str(body.get("profile") or controller.config.profile),
                     )
                 else:
@@ -384,6 +390,7 @@ class ProductRuntimeHandler(RuntimeHandler):
                         task,
                         run_id=body.get("run_id"),
                         approval_mode=str(body.get("approval_mode") or controller.config.approval_mode),
+                        approvals_reviewer=str(body.get("approvals_reviewer") or controller.config.approvals_reviewer),
                         profile=str(body.get("profile") or controller.config.profile),
                     )
                 self._json(
@@ -440,6 +447,7 @@ def create_product_runtime_server(
     debug_level: int = 0,
     workspace_mode: WorkspaceMode = "current",
     approval_mode: ApprovalMode = "yolo",
+    approvals_reviewer: str = "user",
     sandbox_mode: SandboxModeInput = "none",
     profile: str = "tiny-coder",
     profile_override: bool = False,
@@ -455,6 +463,7 @@ def create_product_runtime_server(
         debug_level=debug_level,
         workspace_mode=workspace_mode,
         approval_mode=approval_mode,
+        approvals_reviewer=approvals_reviewer,
         sandbox_mode=sandbox_mode,
         profile=profile,
         profile_override=profile_override or profile != "tiny-coder",

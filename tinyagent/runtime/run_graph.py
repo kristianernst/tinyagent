@@ -9,6 +9,7 @@ from pathlib import Path
 from tinyagent.core.events import Event, load_events_jsonl
 from tinyagent.core.output import write_text_artifact
 from tinyagent.core.state import RunState
+from tinyagent.core.token_utils import estimate_tokens
 
 
 def fork_run(run_path: Path, at_event_id: str, output_dir: Path | None = None) -> Path:
@@ -52,7 +53,7 @@ def record_child_summary(parent: RunState, child: RunState) -> str:
             f"child_run_id: {child.run_id}",
             f"status: {child.status}",
             f"output_dir: {child.output_dir}",
-            f"final_output_chars: {len(child.final_output)}",
+            f"final_output_tokens: {estimate_tokens(child.final_output)}",
             "",
             child.final_output,
             "",

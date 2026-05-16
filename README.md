@@ -31,7 +31,7 @@ payload data is written under each run's `artifacts/` directory.
 
 `fake` is deterministic and offline. `openai-compatible` targets
 `/v1/chat/completions` servers such as llama.cpp. `openai-responses` targets
-OpenAI-compatible `/v1/responses` servers:
+OpenAI's `/v1/responses` API:
 
 ```bash
 export TINYAGENT_MODEL_API_KEY=...
@@ -50,6 +50,28 @@ tinyagent run "inspect this repo" --provider openai-codex --workspace .
 
 For long-lived runs, prefer `TINYAGENT_CODEX_AUTH_COMMAND` so token refresh stays
 owned by a dedicated auth helper instead of depending on a cached CLI token.
+
+`open-responses` targets stateless Responses-compatible local or gateway
+servers without assuming OpenAI state/cache features:
+
+```bash
+export TINYAGENT_MODEL_BASE_URL=http://127.0.0.1:11434/v1
+export TINYAGENT_MODEL_NAME=...
+tinyagent run "inspect this repo" --provider open-responses --workspace .
+```
+
+`anthropic` and `gemini` use their native tool-calling protocols rather than an
+OpenAI-shaped compatibility layer:
+
+```bash
+export TINYAGENT_MODEL_API_KEY=...
+export TINYAGENT_MODEL_NAME=claude-...
+tinyagent run "inspect this repo" --provider anthropic --workspace .
+
+export TINYAGENT_MODEL_API_KEY=...
+export TINYAGENT_MODEL_NAME=gemini-...
+tinyagent run "inspect this repo" --provider gemini --workspace .
+```
 
 ## Default tool surface
 

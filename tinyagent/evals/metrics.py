@@ -14,10 +14,20 @@ from tinyagent.evals.invariants import check_event_invariants
 
 @dataclass(frozen=True)
 class RunMetrics:
+    provider: str = ""
+    model: str = ""
+    protocol: str = ""
+    adapter: str = ""
     context_token_estimate: int = 0
     static_prompt_tokens: int = 0
     tool_schema_tokens: int = 0
     model_call_token_estimates: list[int] = field(default_factory=list)
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+    total_tokens: int = 0
     profile_visible_tools: list[str] = field(default_factory=list)
     tool_error_count: int = 0
     tool_error_kinds: dict[str, int] = field(default_factory=dict)
@@ -30,6 +40,8 @@ class RunMetrics:
     hidden_artifact_fetch_failures: int = 0
     artifact_bytes_written: int = 0
     compaction_count: int = 0
+    parallel_batch_count: int = 0
+    batched_tool_call_count: int = 0
     repeated_tool_call_count: int = 0
     time_to_first_tool_seconds: float = 0.0
     time_to_first_edit_seconds: float = 0.0
@@ -39,7 +51,7 @@ class RunMetrics:
     progress_guard_interventions: int = 0
     output_truncation_count: int = 0
     large_output_artifact_count: int = 0
-    recent_tool_context_chars: int = 0
+    recent_tool_context_tokens: int = 0
     context_search_count: int = 0
     context_read_count: int = 0
     search_code_count: int = 0
@@ -68,7 +80,17 @@ def extract_run_metrics(run_path: Path) -> RunMetrics:
     tool_schema_tokens = 0
     model_call_token_estimates: list[int] = []
     pending_context_estimate: int | None = None
-    recent_tool_context_chars = 0
+    provider = ""
+    model = ""
+    protocol = ""
+    adapter = ""
+    input_tokens = 0
+    cached_input_tokens = 0
+    cache_creation_input_tokens = 0
+    output_tokens = 0
+    reasoning_tokens = 0
+    total_tokens = 0
+    recent_tool_context_tokens = 0
     artifact_bytes = 0
     policy_denials = 0
     approval_requests = 0
@@ -87,26 +109,45 @@ def extract_run_metrics(run_path: Path) -> RunMetrics:
     progress_guard_interventions = 0
     truncations = 0
     large_outputs = 0
+    parallel_batch_ids: set[str] = set()
+    batched_tool_calls: set[str] = set()
     tool_counts: Counter[str] = Counter()
     profile_visible_tools: list[str] = []
     for event in events:
         if event.type == "run.started":
+            provider = _event_str(event, "provider")
+            model = _event_str(event, "model")
+            protocol = _event_str(event, "protocol")
+            adapter = _event_str(event, "adapter")
             visible = event.data.get("profile_visible_tools")
             if isinstance(visible, list):
                 profile_visible_tools = [str(item) for item in visible if isinstance(item, str)]
+        elif event.type == "model.usage":
+            input_tokens += _event_int(event, "input_tokens")
+            cached_input_tokens += _event_int(event, "cached_input_tokens")
+            cache_creation_input_tokens += _event_int(event, "cache_creation_input_tokens")
+            output_tokens += _event_int(event, "output_tokens")
+            reasoning_tokens += _event_int(event, "reasoning_tokens")
+            total_tokens += _event_int(event, "total_tokens")
         if event.type == "model.tool_call.assembly.completed":
             if first_tool_event is None:
                 first_tool_event = event
             tool = str(event.data.get("tool") or "")
             if tool:
                 tool_counts[tool] += 1
+        elif event.type == "tool.execution.started":
+            batch_id = event.data.get("batch_id")
+            tool_call_id = event.data.get("tool_call_id")
+            if isinstance(batch_id, str) and batch_id:
+                parallel_batch_ids.add(batch_id)
+                if isinstance(tool_call_id, str) and tool_call_id:
+                    batched_tool_calls.add(tool_call_id)
         if event.type == "context.built":
             context_token_estimate = int(event.data.get("token_estimate") or context_token_estimate)
             pending_context_estimate = int(event.data.get("model_call_token_estimate") or context_token_estimate)
-            static_context_chars = int(event.data.get("static_context_chars") or 0)
-            static_prompt_tokens = max(static_prompt_tokens, static_context_chars // 4)
+            static_prompt_tokens = max(static_prompt_tokens, _event_static_context_tokens(event))
             tool_schema_tokens = max(tool_schema_tokens, int(event.data.get("tool_schema_tokens") or 0))
-            recent_tool_context_chars = int(event.data.get("tool_context_chars") or recent_tool_context_chars)
+            recent_tool_context_tokens = max(recent_tool_context_tokens, _event_tool_context_tokens(event))
         elif event.type == "model.call.started":
             if pending_context_estimate is not None:
                 model_call_token_estimates.append(pending_context_estimate)
@@ -145,13 +186,13 @@ def extract_run_metrics(run_path: Path) -> RunMetrics:
                 commands[cmd] += 1
                 if first_edit_seq is None and _is_inspection_command(cmd):
                     pre_edit_inspection = True
-            if int(event.data.get("output_chars") or 0) > 12_000:
+            if _event_output_tokens(event) > 3_000:
                 large_outputs += 1
         elif event.type in {"file.read", "search.completed", "code.search.completed"}:
             if first_edit_seq is None:
                 pre_edit_inspection = True
         elif event.type == "tool.execution.output.snapshot":
-            if int(event.data.get("output_chars") or 0) > 12_000:
+            if _event_output_tokens(event) > 3_000:
                 large_outputs += 1
         elif event.type == "patch.applied" and event.data.get("ok", True):
             if first_edit_seq is None:
@@ -185,10 +226,20 @@ def extract_run_metrics(run_path: Path) -> RunMetrics:
         finish_blocks=finish_blocks,
     )
     return RunMetrics(
+        provider=provider,
+        model=model,
+        protocol=protocol,
+        adapter=adapter,
         context_token_estimate=context_token_estimate,
         static_prompt_tokens=static_prompt_tokens,
         tool_schema_tokens=tool_schema_tokens,
         model_call_token_estimates=model_call_token_estimates,
+        input_tokens=input_tokens,
+        cached_input_tokens=cached_input_tokens,
+        cache_creation_input_tokens=cache_creation_input_tokens,
+        output_tokens=output_tokens,
+        reasoning_tokens=reasoning_tokens,
+        total_tokens=total_tokens,
         profile_visible_tools=profile_visible_tools,
         tool_error_count=sum(tool_error_kinds.values()),
         tool_error_kinds=dict(sorted(tool_error_kinds.items())),
@@ -200,6 +251,8 @@ def extract_run_metrics(run_path: Path) -> RunMetrics:
         approval_request_count=approval_requests,
         artifact_bytes_written=artifact_bytes,
         compaction_count=compactions,
+        parallel_batch_count=len(parallel_batch_ids),
+        batched_tool_call_count=len(batched_tool_calls),
         repeated_tool_call_count=sum(count - 1 for count in commands.values() if count > 1),
         time_to_first_tool_seconds=_elapsed_seconds(events, first_tool_event),
         time_to_first_edit_seconds=_elapsed_seconds(events, first_edit_event),
@@ -209,7 +262,7 @@ def extract_run_metrics(run_path: Path) -> RunMetrics:
         progress_guard_interventions=progress_guard_interventions,
         output_truncation_count=truncations,
         large_output_artifact_count=large_outputs,
-        recent_tool_context_chars=recent_tool_context_chars,
+        recent_tool_context_tokens=recent_tool_context_tokens,
         context_search_count=tool_counts["context_search"],
         context_read_count=tool_counts["context_read"],
         search_code_count=tool_counts["search_code"],
@@ -277,6 +330,31 @@ def _error_kind(event: Event) -> str:
 def _tool_call_id(event: Event) -> str | None:
     value = event.data.get("tool_call_id")
     return value if isinstance(value, str) and value else None
+
+
+def _event_output_tokens(event: Event) -> int:
+    output_tokens = event.data.get("output_tokens")
+    return output_tokens if isinstance(output_tokens, int) else 0
+
+
+def _event_int(event: Event, key: str) -> int:
+    value = event.data.get(key)
+    return value if isinstance(value, int) else 0
+
+
+def _event_str(event: Event, key: str) -> str:
+    value = event.data.get(key)
+    return value if isinstance(value, str) else ""
+
+
+def _event_static_context_tokens(event: Event) -> int:
+    static_context_tokens = event.data.get("static_context_tokens")
+    return static_context_tokens if isinstance(static_context_tokens, int) else 0
+
+
+def _event_tool_context_tokens(event: Event) -> int:
+    tool_context_tokens = event.data.get("tool_context_tokens")
+    return tool_context_tokens if isinstance(tool_context_tokens, int) else 0
 
 
 def _is_unknown_tool(event: Event) -> bool:

@@ -40,9 +40,9 @@ class VisibleAwareProfile(TinyProfile):
         return BuiltContext(
             messages=messages,
             token_estimate=estimate_messages_tokens(messages),
-            static_context_chars=sum(len(str(message.content)) for message in messages),
-            tool_context_chars=0,
-            project_instruction_chars=0,
+            static_context_tokens=estimate_messages_tokens(messages),
+            tool_context_tokens=0,
+            project_instruction_tokens=0,
         )
 
 
@@ -76,9 +76,9 @@ def test_build_context_preserves_profile_built_context_and_adds_visible_tool_tok
     profile_context = BuiltContext(
         messages=profile_messages,
         token_estimate=17,
-        static_context_chars=3,
-        tool_context_chars=5,
-        project_instruction_chars=7,
+        static_context_tokens=3,
+        tool_context_tokens=5,
+        project_instruction_tokens=7,
         contextfs_index_path="context/INDEX.md",
     )
 
@@ -90,9 +90,9 @@ def test_build_context_preserves_profile_built_context_and_adds_visible_tool_tok
     )
 
     assert built.messages == profile_messages
-    assert built.static_context_chars == 3
-    assert built.tool_context_chars == 5
-    assert built.project_instruction_chars == 7
+    assert built.static_context_tokens == 3
+    assert built.tool_context_tokens == 5
+    assert built.project_instruction_tokens == 7
     assert built.contextfs_index_path == "context/INDEX.md"
     assert built.token_estimate == 17 + estimate_tools_tokens([tool])
     assert state.context_token_estimate == built.token_estimate

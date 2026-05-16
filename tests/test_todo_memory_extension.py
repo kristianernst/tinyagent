@@ -9,10 +9,11 @@ from tinyagent.core.models import FakeModelProvider
 from tinyagent.core.policy import LocalPolicy
 from tinyagent.core.profiles import ApexCoderProfile
 from tinyagent.core.state import ModelResponse, RunBudgets, RunState, ToolCall, Workspace
+from tinyagent.core.token_utils import token_budget_to_text_limit
 from tinyagent.core.tools import default_tools
 from tinyagent.extensions.todo_memory import TodoMemoryExtension
 from tinyagent.extensions.todo_memory.context import WorkingMemorySource
-from tinyagent.extensions.todo_memory.store import MAX_TODO_ITEMS, MAX_TODO_NOTES_CHARS, MAX_TODO_TEXT_CHARS, TODO_MD
+from tinyagent.extensions.todo_memory.store import MAX_TODO_ITEMS, MAX_TODO_NOTES_TOKENS, MAX_TODO_TEXT_TOKENS, TODO_MD
 from tinyagent.extensions.todo_memory.tools import TodoReadTool, TodoWriteTool
 from tinyagent.runtime.server import RunController, RuntimeConfig
 
@@ -79,9 +80,9 @@ def test_todo_write_bounds_payload_and_generates_unique_ids(tmp_path) -> None:
                 "items": [
                     {"text": "generated"},
                     {"id": "todo_1", "text": "explicit", "source": "ignored"},
-                    *({"text": "x" * (MAX_TODO_TEXT_CHARS + 20)} for _ in range(MAX_TODO_ITEMS + 10)),
+                    *({"text": "x" * (token_budget_to_text_limit(MAX_TODO_TEXT_TOKENS) + 20)} for _ in range(MAX_TODO_ITEMS + 10)),
                 ],
-                "notes": "n" * (MAX_TODO_NOTES_CHARS + 20),
+                "notes": "n" * (token_budget_to_text_limit(MAX_TODO_NOTES_TOKENS) + 20),
             },
         ),
         state,
@@ -94,8 +95,8 @@ def test_todo_write_bounds_payload_and_generates_unique_ids(tmp_path) -> None:
     assert len(ids) == MAX_TODO_ITEMS
     assert len(ids) == len(set(ids))
     assert result.data["items"][1]["source"] == "model"
-    assert len(result.data["items"][-1]["text"]) == MAX_TODO_TEXT_CHARS
-    assert len(saved["notes"]) == MAX_TODO_NOTES_CHARS
+    assert len(result.data["items"][-1]["text"]) == token_budget_to_text_limit(MAX_TODO_TEXT_TOKENS)
+    assert len(saved["notes"]) == token_budget_to_text_limit(MAX_TODO_NOTES_TOKENS)
 
 
 def test_todo_context_source_search_and_read(tmp_path) -> None:
@@ -131,7 +132,7 @@ def test_todo_extension_visible_only_when_enabled(tmp_path) -> None:
         tools=default_tools(),
         policy=LocalPolicy(),
         extensions=[TodoMemoryExtension()],
-        budgets=RunBudgets(max_turns=1),
+        budgets=RunBudgets(max_model_calls=1),
     ).run("todo", workspace=tmp_path, run_id="run_todo_kernel")
 
     context_built = next(event for event in state.events if event.type == "context.built")

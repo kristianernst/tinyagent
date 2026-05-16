@@ -8,18 +8,19 @@ import re
 import shutil
 import subprocess
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from tinyagent.core.auto_review import AutoReviewApprovalHandler
 from tinyagent.core.config import RunConfig
 from tinyagent.core.contracts import ModelProvider, PolicyEngine, Profile, Tool
 from tinyagent.core.events import EventSink
 from tinyagent.core.kernel import Kernel
 from tinyagent.core.resources import LoadedResources
 from tinyagent.core.run_control import CancelToken
-from tinyagent.core.state import ApprovalMode
+from tinyagent.core.state import ApprovalMode, RunBudgets
 from tinyagent.core.workspace import SandboxModeInput, WorkspaceMode
 from tinyagent.evals.metrics import evaluate_thresholds, extract_run_metrics
 from tinyagent.evals.variants import VariantSpec, validate_supported_eval_compare
@@ -37,6 +38,7 @@ class EvalCase:
     validation_command: str = ""
     timeout_seconds: int = 60
     setup_git: bool = True
+    budget_overrides: dict[str, int] = field(default_factory=dict)
     case_dir: Path = Path()
 
 
@@ -44,6 +46,10 @@ class EvalCase:
 class EvalResult:
     case_id: str
     run_id: str
+    provider: str
+    model: str
+    protocol: str
+    adapter: str
     status: str
     success: bool
     validation_ok: bool
@@ -56,11 +62,17 @@ class EvalResult:
     tool_call_count: int
     command_count: int
     patch_count: int
-    final_diff_chars: int
+    final_diff_tokens: int
     context_token_estimate: int = 0
     static_prompt_tokens: int = 0
     tool_schema_tokens: int = 0
     model_call_token_estimates: list[int] | None = None
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+    total_tokens: int = 0
     profile_visible_tools: list[str] | None = None
     tool_error_count: int = 0
     tool_error_kinds: dict[str, int] | None = None
@@ -73,6 +85,8 @@ class EvalResult:
     hidden_artifact_fetch_failures: int = 0
     artifact_bytes_written: int = 0
     compaction_count: int = 0
+    parallel_batch_count: int = 0
+    batched_tool_call_count: int = 0
     repeated_tool_call_count: int = 0
     time_to_first_tool_seconds: float = 0.0
     time_to_first_edit_seconds: float = 0.0
@@ -82,7 +96,7 @@ class EvalResult:
     progress_guard_interventions: int = 0
     output_truncation_count: int = 0
     large_output_artifact_count: int = 0
-    recent_tool_context_chars: int = 0
+    recent_tool_context_tokens: int = 0
     context_search_count: int = 0
     context_read_count: int = 0
     search_code_count: int = 0
@@ -124,7 +138,9 @@ def run_eval_suite(
     cancel_token: CancelToken | None = None,
     workspace_mode: WorkspaceMode = "current",
     approval_mode: ApprovalMode = "yolo",
+    approvals_reviewer: str = "user",
     sandbox_mode: SandboxModeInput = "none",
+    budgets: RunBudgets | None = None,
     variant_name: str = "",
     variant_metadata: dict[str, Any] | None = None,
     run_id_prefix: str = "",
@@ -158,7 +174,9 @@ def run_eval_suite(
             cancel_token=cancel_token,
             workspace_mode=workspace_mode,
             approval_mode=approval_mode,
+            approvals_reviewer=approvals_reviewer,
             sandbox_mode=sandbox_mode,
+            budgets=budgets,
             run_id_prefix=run_id_prefix,
             resources=resources,
         )
@@ -197,6 +215,7 @@ def load_eval_cases(suite_path: Path) -> list[EvalCase]:
                 validation_command=str(spec.get("validation_command") or ""),
                 timeout_seconds=int(spec.get("timeout_seconds") or 60),
                 setup_git=bool(spec.get("setup_git", True)),
+                budget_overrides=_budget_overrides(spec.get("budgets") or {}),
                 case_dir=case_dir,
             )
         )
@@ -236,16 +255,17 @@ def render_eval_report(eval_run: EvalRun) -> str:
         )
     lines.extend(
         [
-            "| Case | Success | Status | Validation | Turns | Tools | Errors | Policy | Finish blocks | Diff chars |",
-            "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Case | Provider | Protocol | Success | Status | Validation | Model calls | Tools | Batches | Input tok | Cached tok | Output tok | Errors | Policy | Finish blocks | Diff tokens |",
+            "| --- | --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for result in eval_run.results:
         lines.append(
             "| "
-            f"{result.case_id} | {str(result.success).lower()} | {result.status} | "
-            f"{str(result.validation_ok).lower()} | {result.turn_count} | {result.tool_call_count} | "
-            f"{result.tool_error_count} | {result.policy_denials} | {result.finish_gate_blocks} | {result.final_diff_chars} |"
+            f"{result.case_id} | {result.provider} | {result.protocol} | {str(result.success).lower()} | {result.status} | "
+            f"{str(result.validation_ok).lower()} | {result.model_call_count} | {result.tool_call_count} | "
+            f"{result.parallel_batch_count} | {result.input_tokens} | {result.cached_input_tokens} | {result.output_tokens} | "
+            f"{result.tool_error_count} | {result.policy_denials} | {result.finish_gate_blocks} | {result.final_diff_tokens} |"
         )
     error_counts: dict[str, int] = {}
     for result in eval_run.results:
@@ -365,7 +385,9 @@ def run_eval_comparison(
             cancel_token=cancel_token,
             workspace_mode=config.workspace_mode,  # type: ignore[arg-type]
             approval_mode=config.approval_mode,  # type: ignore[arg-type]
+            approvals_reviewer=config.approvals_reviewer,
             sandbox_mode=config.sandbox_mode,  # type: ignore[arg-type]
+            budgets=RunBudgets.from_mapping(config.budgets),
             variant_name=variant.name,
             variant_metadata=metadata,
             run_id_prefix=variant.name,
@@ -388,16 +410,19 @@ def render_eval_comparison(comparison: EvalComparison) -> str:
         f"suite: {comparison.suite_path}",
         f"output_dir: {comparison.output_dir}",
         "",
-        "| Variant | Solve rate | Validation rate | Tools | Errors | Policy | Sandbox | Finish blocks | Compactions | Config | Git |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
+        "| Variant | Provider | Protocol | Solve rate | Validation rate | Model calls | Tools | Batches | Input tok | Cached tok | Output tok | Reason tok | Errors | Policy | Sandbox | Finish blocks | Compactions | Config | Git |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
     ]
     for run in comparison.variants:
         summary = _variant_summary(run)
         metadata = run.variant_metadata or {}
         lines.append(
             "| "
-            f"{run.variant_name} | {summary['solve_rate']:.3f} | {summary['validation_rate']:.3f} | "
-            f"{summary['tool_calls']} | {summary['tool_errors']} | {summary['policy_denials']} | "
+            f"{run.variant_name} | {summary['provider']} | {summary['protocol']} | "
+            f"{summary['solve_rate']:.3f} | {summary['validation_rate']:.3f} | "
+            f"{summary['model_calls']} | {summary['tool_calls']} | {summary['parallel_batches']} | "
+            f"{summary['input_tokens']} | {summary['cached_input_tokens']} | {summary['output_tokens']} | "
+            f"{summary['reasoning_tokens']} | {summary['tool_errors']} | {summary['policy_denials']} | "
             f"{summary['sandbox_blocks']} | {summary['finish_gate_blocks']} | {summary['compactions']} | "
             f"{metadata.get('config_hash', '')} | {str(metadata.get('git_sha', ''))[:12]} |"
         )
@@ -472,7 +497,11 @@ def render_eval_comparison(comparison: EvalComparison) -> str:
             [
                 f"### {run.variant_name}",
                 f"- provider: {config.get('provider', '')}",
+                f"- observed_provider: {_variant_summary(run)['provider']}",
                 f"- model: {config.get('model', '')}",
+                f"- observed_model: {_variant_summary(run)['model']}",
+                f"- protocol: {_variant_summary(run)['protocol']}",
+                f"- adapter: {_variant_summary(run)['adapter']}",
                 f"- profile: {config.get('profile', '')}",
                 f"- profile_variant: {config.get('profile_variant', '')}",
                 f"- context_policy: {config.get('context_policy', '')}",
@@ -510,17 +539,23 @@ def _run_case(
     cancel_token: CancelToken | None,
     workspace_mode: WorkspaceMode,
     approval_mode: ApprovalMode,
+    approvals_reviewer: str,
     sandbox_mode: SandboxModeInput,
+    budgets: RunBudgets | None,
     run_id_prefix: str,
     resources: LoadedResources | None,
 ) -> EvalResult:
     case_dir = case.case_dir or suite_path / case.id
     _prepare_workspace(case_dir, workspace_dir, setup_git=case.setup_git)
+    model = model_factory(case.task)
+    run_budgets = RunBudgets.from_mapping(case.budget_overrides, base=budgets)
     kernel = Kernel(
-        model=model_factory(case.task),
+        model=model,
         profile=profile,
         tools=tools,
         policy=policy,
+        budgets=run_budgets,
+        approval_handler=AutoReviewApprovalHandler(model) if approvals_reviewer == "auto_review" else None,
         stream=stream,
         event_sink=event_sink,
         workspace_mode=workspace_mode,
@@ -546,7 +581,7 @@ def _run_case(
     validation_attempted = False
     validation_output_path = ""
     validation_workspace = state.workspace.root
-    if case.validation_command and record.status == "completed":
+    if case.validation_command and record.status != "cancelled":
         validation_attempted = True
         validation_exit_code, validation_output_path = _run_validation(case, validation_workspace, validation_dir)
         validation_ok = validation_exit_code == 0
@@ -623,6 +658,10 @@ def _result_from_record(
     return EvalResult(
         case_id=case.id,
         run_id=record.run_id,
+        provider=metrics.provider,
+        model=metrics.model,
+        protocol=metrics.protocol,
+        adapter=metrics.adapter,
         status=record.status,
         success=success,
         validation_ok=validation_ok,
@@ -635,11 +674,17 @@ def _result_from_record(
         tool_call_count=record.tool_call_count,
         command_count=record.command_count,
         patch_count=record.patch_count,
-        final_diff_chars=record.final_diff_chars,
+        final_diff_tokens=record.final_diff_tokens,
         context_token_estimate=metrics.context_token_estimate,
         static_prompt_tokens=metrics.static_prompt_tokens,
         tool_schema_tokens=metrics.tool_schema_tokens,
         model_call_token_estimates=metrics.model_call_token_estimates,
+        input_tokens=metrics.input_tokens,
+        cached_input_tokens=metrics.cached_input_tokens,
+        cache_creation_input_tokens=metrics.cache_creation_input_tokens,
+        output_tokens=metrics.output_tokens,
+        reasoning_tokens=metrics.reasoning_tokens,
+        total_tokens=metrics.total_tokens,
         profile_visible_tools=metrics.profile_visible_tools,
         tool_error_count=metrics.tool_error_count,
         tool_error_kinds=metrics.tool_error_kinds,
@@ -652,6 +697,8 @@ def _result_from_record(
         hidden_artifact_fetch_failures=metrics.hidden_artifact_fetch_failures,
         artifact_bytes_written=metrics.artifact_bytes_written,
         compaction_count=metrics.compaction_count,
+        parallel_batch_count=metrics.parallel_batch_count,
+        batched_tool_call_count=metrics.batched_tool_call_count,
         repeated_tool_call_count=metrics.repeated_tool_call_count,
         time_to_first_tool_seconds=metrics.time_to_first_tool_seconds,
         time_to_first_edit_seconds=metrics.time_to_first_edit_seconds,
@@ -661,7 +708,7 @@ def _result_from_record(
         progress_guard_interventions=metrics.progress_guard_interventions,
         output_truncation_count=metrics.output_truncation_count,
         large_output_artifact_count=metrics.large_output_artifact_count,
-        recent_tool_context_chars=metrics.recent_tool_context_chars,
+        recent_tool_context_tokens=metrics.recent_tool_context_tokens,
         context_search_count=metrics.context_search_count,
         context_read_count=metrics.context_read_count,
         search_code_count=metrics.search_code_count,
@@ -731,8 +778,16 @@ def _variant_summary(run: EvalRun) -> dict[str, Any]:
     validation_attempts = sum(1 for result in run.results if result.validation_attempted)
     validations = sum(1 for result in run.results if result.validation_attempted and result.validation_ok)
     visible_tools = sorted({tool for result in run.results for tool in (result.profile_visible_tools or [])})
+    providers = sorted({result.provider for result in run.results if result.provider})
+    models = sorted({result.model for result in run.results if result.model})
+    protocols = sorted({result.protocol for result in run.results if result.protocol})
+    adapters = sorted({result.adapter for result in run.results if result.adapter})
     return {
         "cases": total,
+        "provider": ",".join(providers),
+        "model": ",".join(models),
+        "protocol": ",".join(protocols),
+        "adapter": ",".join(adapters),
         "successes": successes,
         "solve_rate": successes / total if total else 0.0,
         "validation_attempts": validation_attempts,
@@ -741,6 +796,14 @@ def _variant_summary(run: EvalRun) -> dict[str, Any]:
         "visible_tool_count": len(visible_tools),
         "model_calls": sum(result.model_call_count for result in run.results),
         "tool_calls": sum(result.tool_call_count for result in run.results),
+        "parallel_batches": sum(result.parallel_batch_count for result in run.results),
+        "batched_tool_calls": sum(result.batched_tool_call_count for result in run.results),
+        "input_tokens": sum(result.input_tokens for result in run.results),
+        "cached_input_tokens": sum(result.cached_input_tokens for result in run.results),
+        "cache_creation_input_tokens": sum(result.cache_creation_input_tokens for result in run.results),
+        "output_tokens": sum(result.output_tokens for result in run.results),
+        "reasoning_tokens": sum(result.reasoning_tokens for result in run.results),
+        "total_tokens": sum(result.total_tokens for result in run.results),
         "tool_errors": sum(result.tool_error_count for result in run.results),
         "unknown_tools": sum(result.unknown_tool_count for result in run.results),
         "invalid_tool_args": sum(result.invalid_tool_args_count for result in run.results),
@@ -795,6 +858,15 @@ def _combined_output(stdout: str, stderr: str) -> str:
     if stdout and stderr:
         return f"{stdout}\n{stderr}"
     return stdout or stderr
+
+
+def _budget_overrides(raw: object) -> dict[str, int]:
+    if not isinstance(raw, dict):
+        raise ValueError("budgets must be an object")
+    if not raw:
+        return {}
+    RunBudgets.from_mapping(raw)
+    return dict(raw)
 
 
 def _suite_hash(suite_path: Path) -> str:

@@ -20,6 +20,7 @@ RUN_CONFIG_KEYS = frozenset(
         "visible_tools",
         "workspace_mode",
         "approval_mode",
+        "approvals_reviewer",
         "sandbox_mode",
         "context",
         "policy",
@@ -40,6 +41,7 @@ class RunConfig:
     visible_tools: tuple[str, ...] = ()
     workspace_mode: str = "current"
     approval_mode: str = "yolo"
+    approvals_reviewer: str = "user"
     sandbox_mode: str = "none"
     context: dict[str, Any] = field(default_factory=dict)
     policy: dict[str, Any] = field(default_factory=dict)
@@ -68,6 +70,7 @@ class RunConfig:
             visible_tools=_string_tuple(data, "visible_tools"),
             workspace_mode=str(data.get("workspace_mode") or "current"),
             approval_mode=str(data.get("approval_mode") or "yolo"),
+            approvals_reviewer=str(data.get("approvals_reviewer") or "user"),
             sandbox_mode=str(data.get("sandbox_mode") or "none"),
             context=_dict_value(data, "context"),
             policy=_dict_value(data, "policy"),

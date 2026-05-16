@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from tinyagent.core.artifacts import tool_result_artifact_refs
-from tinyagent.core.context.checkpoint import is_test_command_text
+from tinyagent.core.context.checkpoint import is_test_command_text, is_verification_command_text
 from tinyagent.core.state import RunState, ToolCall, ToolResult
 
 
@@ -302,8 +302,7 @@ def _is_search_command(command: str) -> bool:
 
 
 def _is_verification_command(command: str) -> bool:
-    text = command.lower()
-    return any(token in text for token in ("ruff", "mypy", "-m unittest", "-m pytest"))
+    return is_verification_command_text(command)
 
 
 def _first_line(text: str) -> str:

@@ -69,7 +69,7 @@ def test_live_model_read_file_tool_call_protocol(tmp_path) -> None:
     )
 
     events = load_events_jsonl(state.output_dir / "events.jsonl")
-    _assert_successful_tool_protocol(events, tool="read_file")
+    _assert_successful_tool_use(events, tool="read_file")
     read_event = _event(events, "file.read")
     assert read_event.data["path"] == "hello.txt"
     assert "protocol read ok" in _tool_event(events, "tool.execution.completed", "read_file").data["output"]
@@ -93,7 +93,7 @@ def test_live_model_streamed_tool_call_protocol(tmp_path) -> None:
     )
 
     durable_events = load_events_jsonl(state.output_dir / "events.jsonl")
-    _assert_successful_tool_protocol(durable_events, tool="read_file")
+    _assert_successful_tool_use(durable_events, tool="read_file")
     assert LIVE_ONLY_EVENT_TYPES.isdisjoint(event.type for event in durable_events)
     assert any(event.type == "model.tool_call.args.delta" for event in sink.events)
     assert any(
@@ -115,7 +115,7 @@ def test_live_model_write_file_protocol_mutates_workspace(tmp_path) -> None:
     )
 
     events = load_events_jsonl(state.output_dir / "events.jsonl")
-    _assert_successful_tool_protocol(events, tool="write_file")
+    _assert_successful_tool_use(events, tool="write_file")
     assert (workspace / "created.txt").read_text() == "protocol write ok\n"
     delta = _tool_event(events, "workspace.delta.completed", "write_file")
     assert delta.data["mutated"] is True
@@ -147,7 +147,7 @@ def test_live_model_failed_tool_result_is_reported_as_protocol_event(tmp_path) -
 
 def test_live_model_eval_suite_captures_protocol_outputs(tmp_path) -> None:
     provider = _provider_or_skip()
-    suite = _write_tool_protocol_suite(tmp_path)
+    suite = _write_tool_use_suite(tmp_path)
 
     eval_run = run_eval_suite(
         suite,
@@ -197,7 +197,7 @@ def _run_protocol_task(
         profile=ToolProtocolProfile(tools),
         tools=default_tools(),
         policy=_allow_all_policy(),
-        budgets=RunBudgets(max_turns=4, max_tool_calls=3, max_run_seconds=90),
+        budgets=RunBudgets(max_model_calls=4, max_tool_calls=3, max_run_seconds=90),
         stream=stream,
         event_sink=event_sink,
     )
@@ -238,7 +238,7 @@ def _tool_history(steps: Sequence[ToolStep]) -> str:
     return "\n".join(rendered)
 
 
-def _assert_successful_tool_protocol(events, *, tool: str) -> None:
+def _assert_successful_tool_use(events, *, tool: str) -> None:
     requested = _tool_event(events, "model.tool_call.assembly.completed", tool)
     started = _tool_event(events, "tool.execution.started", tool)
     completed = _tool_event(events, "tool.execution.completed", tool)
@@ -258,7 +258,7 @@ def _tool_event(events, event_type: str, tool: str):
     return next(event for event in events if event.type == event_type and event.data.get("tool") == tool)
 
 
-def _write_tool_protocol_suite(tmp_path: Path) -> Path:
+def _write_tool_use_suite(tmp_path: Path) -> Path:
     suite = tmp_path / "suite"
     case = suite / "read-file-protocol"
     files = case / "files"

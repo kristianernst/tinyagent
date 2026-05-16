@@ -6,11 +6,12 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from tinyagent.core.state import Message
+from tinyagent.core.token_utils import estimate_tokens
 
 
 @dataclass(frozen=True)
 class ContextConfig:
-    project_instruction_max_chars: int = 32 * 1024
+    project_instruction_max_tokens: int = 8_192
     max_recent_tool_tokens: int = 12_000
     compact_after_tool_steps: int = 16
     model_context_window: int = 128_000
@@ -24,7 +25,7 @@ class ContextConfig:
 
     def with_model_budget(self, *, context_window: int, max_output_tokens: int) -> ContextConfig:
         return ContextConfig(
-            project_instruction_max_chars=self.project_instruction_max_chars,
+            project_instruction_max_tokens=self.project_instruction_max_tokens,
             max_recent_tool_tokens=self.max_recent_tool_tokens,
             compact_after_tool_steps=self.compact_after_tool_steps,
             model_context_window=context_window,
@@ -98,17 +99,17 @@ class ProjectInstructions:
     truncated: bool = False
 
     @property
-    def chars(self) -> int:
-        return len(self.content)
+    def token_estimate(self) -> int:
+        return estimate_tokens(self.content)
 
 
 @dataclass(frozen=True)
 class BuiltContext:
     messages: list[Message]
     token_estimate: int
-    static_context_chars: int
-    tool_context_chars: int
-    project_instruction_chars: int
+    static_context_tokens: int
+    tool_context_tokens: int
+    project_instruction_tokens: int
     artifacts: list[ArtifactRef] = field(default_factory=list)
     included: list[ContextItem] = field(default_factory=list)
     excluded: list[ContextExclusion] = field(default_factory=list)

@@ -16,7 +16,7 @@ class ExecutionEnvelope:
     cwd: Path
     env: dict[str, str] = field(repr=False, compare=False)
     timeout_seconds: int
-    output_cap_chars: int
+    output_cap_tokens: int
     read_roots: tuple[Path, ...]
     writable_roots: tuple[Path, ...]
     denied_paths: tuple[Path, ...] = ()
@@ -38,7 +38,7 @@ class ExecutionEnvelope:
             "cwd": str(self.cwd),
             "env": "sanitized",
             "timeout_seconds": self.timeout_seconds,
-            "output_cap_chars": self.output_cap_chars,
+            "output_cap_tokens": self.output_cap_tokens,
             "read_roots": [str(path) for path in self.read_roots],
             "writable_roots": [str(path) for path in self.writable_roots],
             "denied_paths": [str(path) for path in self.denied_paths],
@@ -67,7 +67,7 @@ def build_execution_envelope(state: RunState, *, timeout_seconds: int) -> Execut
         cwd=state.workspace.root,
         env=tool_env(state),
         timeout_seconds=timeout_seconds,
-        output_cap_chars=state.budgets.max_command_output_chars_visible,
+        output_cap_tokens=state.budgets.max_tool_output_tokens_visible,
         read_roots=(state.workspace.root,),
         writable_roots=writable_roots,
         denied_paths=(state.output_dir / "artifacts", state.output_dir / "context", state.output_dir / "events.jsonl"),

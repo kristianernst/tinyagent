@@ -10,7 +10,17 @@ import pytest
 from tinyagent.core.contracts import Tool
 from tinyagent.core.policy import LocalPolicy, PolicyConfig, PolicyRule
 from tinyagent.core.sdk import Agent, ApprovalContext
-from tinyagent.core.state import ApprovalRequest, ApprovalResolution, Message, ModelResponse, PolicyDecision, RunState, ToolCall, ToolResult
+from tinyagent.core.state import (
+    ApprovalRequest,
+    ApprovalResolution,
+    Message,
+    ModelRequestContext,
+    ModelResponse,
+    PolicyDecision,
+    RunState,
+    ToolCall,
+    ToolResult,
+)
 from tinyagent.core.tools import default_tools
 
 
@@ -39,8 +49,8 @@ class _StaticModel:
     def __init__(self, responses: Sequence[ModelResponse]) -> None:
         self.responses = list(responses)
 
-    def complete(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState) -> ModelResponse:
-        del messages, tools, state
+    def complete(self, messages: Sequence[Message], tools: Sequence[Tool], request: ModelRequestContext) -> ModelResponse:
+        del messages, tools, request
         if not self.responses:
             return ModelResponse(content="done", finish_reason="stop")
         return self.responses.pop(0)

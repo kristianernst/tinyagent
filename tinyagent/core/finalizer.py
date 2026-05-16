@@ -5,6 +5,7 @@ from __future__ import annotations
 from tinyagent.core.contextfs import refresh_contextfs
 from tinyagent.core.output import capture_final_diff, write_final_text
 from tinyagent.core.state import RunState
+from tinyagent.core.token_utils import estimate_tokens
 
 
 def finalize_artifacts(state: RunState, *, contextfs_enabled: bool) -> None:
@@ -38,7 +39,7 @@ def finalize_run(state: RunState, *, contextfs_enabled: bool) -> None:
         "turn_count": state.turn_count,
         "model_call_count": state.model_call_count,
         "tool_call_count": state.tool_call_count,
-        "final_output_chars": len(state.final_output),
+        "final_output_tokens": estimate_tokens(state.final_output),
         "duration_seconds": state.elapsed_seconds(),
         "workspace_mode": state.workspace_envelope.mode if state.workspace_envelope else None,
         "workspace_effective_mode": state.workspace_envelope.effective_mode if state.workspace_envelope else None,
@@ -79,7 +80,7 @@ def _finalize_message(state: RunState) -> None:
         "model.message.completed",
         {
             "role": "assistant",
-            "content_chars": len(state.final_output),
+            "content_tokens": estimate_tokens(state.final_output),
             "output_path": "final.md",
         },
         visibility="user",

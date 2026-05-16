@@ -12,6 +12,7 @@ from tinyagent.core.contextfs import model_readable_path, read_hints, write_cont
 from tinyagent.core.output import write_text_artifact
 from tinyagent.core.path_safety import is_env_file_name, resolved_relative_to, safe_artifact_name
 from tinyagent.core.state import RunState, ToolCall, ToolResult
+from tinyagent.core.token_utils import clip_text_to_token_budget, estimate_tokens
 
 SAFE_ENV_KEYS = frozenset(
     {
@@ -38,15 +39,19 @@ class ToolOutputCapture:
     context_artifact: str
     context_read_path: str
     preview: str
-    output_chars: int
+    output_tokens: int
 
     @property
     def data(self) -> dict[str, object]:
-        return {"output_artifact": self.output_artifact, "context_artifact": self.context_artifact, "output_chars": self.output_chars}
+        return {
+            "output_artifact": self.output_artifact,
+            "context_artifact": self.context_artifact,
+            "output_tokens": self.output_tokens,
+        }
 
     @property
     def truncated(self) -> bool:
-        return self.output_chars > len(self.preview)
+        return self.output_tokens > estimate_tokens(self.preview)
 
     def read_hints(self, *, failure: bool = False) -> list[str]:
         return read_hints(self.context_read_path, failure=failure)
@@ -125,18 +130,12 @@ def capture_tool_output(
         context_artifact=context_artifact,
         context_read_path=model_readable_path(state, context_artifact),
         preview=visible_output(output, state),
-        output_chars=len(output),
+        output_tokens=estimate_tokens(output),
     )
 
 
 def visible_output(output: str, state: RunState) -> str:
-    limit = state.budgets.max_command_output_chars_visible
-    if len(output) <= limit:
-        return output
-    marker = "\n[truncated]"
-    if limit <= len(marker):
-        return output[:limit]
-    return output[: limit - len(marker)] + marker
+    return clip_text_to_token_budget(output, state.budgets.max_tool_output_tokens_visible)
 
 
 def tool_env(state: RunState) -> dict[str, str]:

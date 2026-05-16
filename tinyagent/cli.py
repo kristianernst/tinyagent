@@ -15,6 +15,7 @@ from uuid import uuid4
 from tinyagent import __version__
 from tinyagent.app.product import ProductHome, WorkspaceStore, render_doctor
 from tinyagent.app.server import create_product_runtime_server
+from tinyagent.core.auto_review import AutoReviewApprovalHandler
 from tinyagent.core.events import ConsoleTextSink, JsonlStreamSink, debug_level_from_env
 from tinyagent.core.evolution import accept_candidate, create_prompt_experiment, create_skill_experiment, render_experiment_report
 from tinyagent.core.ids import validate_run_id
@@ -56,9 +57,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run", help="Run an agent task.")
     run_parser.add_argument("task", help="Task for the agent.")
     run_parser.add_argument("--provider", choices=DEFAULT_PROVIDER_REGISTRY.kinds(), default="fake")
+    run_parser.add_argument("--model")
     run_parser.add_argument("--workspace", default=".")
     run_parser.add_argument("--workspace-mode", choices=["auto", "worktree", "current"], default="auto")
     run_parser.add_argument("--approval-mode", choices=["never", "on-request", "yolo"], default="yolo")
+    run_parser.add_argument("--approvals-reviewer", choices=["user", "auto_review"], default="user")
     run_parser.add_argument("--sandbox-mode", choices=["none", "container", "native"], default="none")
     run_parser.add_argument("--profile", help="Profile to run, e.g. tiny-coder or tiny-pi.")
     run_parser.add_argument("--memory", action="store_true", help="Enable explicit file-backed memory context.")
@@ -135,6 +138,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve_parser.add_argument("--workspace-mode", choices=["auto", "worktree", "current"], default="current")
     serve_parser.add_argument("--approval-mode", choices=["never", "on-request", "yolo"], default="yolo")
+    serve_parser.add_argument("--approvals-reviewer", choices=["user", "auto_review"], default="user")
     serve_parser.add_argument("--sandbox-mode", choices=["none", "container", "native"], default="none")
     serve_parser.add_argument("--profile", default="tiny-coder", help="Default runtime profile.")
     serve_parser.add_argument("--memory", action="store_true", help="Enable explicit file-backed memory context.")
@@ -142,11 +146,13 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser = subparsers.add_parser("eval", help="Run a local eval suite.")
     eval_parser.add_argument("suite_path", type=Path, help="Directory containing eval cases.")
     eval_parser.add_argument("--provider", choices=DEFAULT_PROVIDER_REGISTRY.kinds(), default="fake")
+    eval_parser.add_argument("--model")
     eval_parser.add_argument("--reasoning-json", help="JSON object passed as the provider's top-level reasoning parameter.")
     eval_parser.add_argument("--output-dir", type=Path)
     eval_parser.add_argument("--thresholds", type=Path)
     eval_parser.add_argument("--workspace-mode", choices=["auto", "worktree", "current"], default="current")
     eval_parser.add_argument("--approval-mode", choices=["never", "on-request", "yolo"], default="yolo")
+    eval_parser.add_argument("--approvals-reviewer", choices=["user", "auto_review"], default="user")
     eval_parser.add_argument("--sandbox-mode", choices=["none", "container", "native"], default="none")
     eval_parser.add_argument("--profile", default="tiny-coder", help="Profile to run, e.g. tiny-coder or tiny-pi.")
     eval_parser.add_argument("--memory", action="store_true", help="Enable explicit file-backed memory context.")
@@ -363,7 +369,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"debug error: {exc}")
             return 2
         try:
-            model = _model_for(args.provider, args.task, reasoning_json=args.reasoning_json)
+            model = _model_for(args.provider, args.task, model_name=args.model, reasoning_json=args.reasoning_json)
         except ProviderError as exc:
             print(f"provider error: {exc}")
             return 1
@@ -381,7 +387,7 @@ def main(argv: list[str] | None = None) -> int:
                 Path(args.workspace),
                 runtime_capabilities=profile.runtime_capabilities,
             ),
-            approval_handler=_CliApprovalHandler() if args.approval_mode == "on-request" else None,
+            approval_handler=_approval_handler_for(args.approval_mode, args.approvals_reviewer, model),
             stream=args.stream != "off",
             event_sink=_stream_sink(args.stream, debug_level),
             workspace_mode=args.workspace_mode,
@@ -480,6 +486,7 @@ def main(argv: list[str] | None = None) -> int:
                 debug_level=debug_level,
                 workspace_mode=args.workspace_mode,
                 approval_mode=args.approval_mode,
+                approvals_reviewer=args.approvals_reviewer,
                 sandbox_mode=args.sandbox_mode,
                 profile=args.profile,
                 profile_override=_has_cli_option(argv, "--profile"),
@@ -515,7 +522,12 @@ def main(argv: list[str] | None = None) -> int:
                 eval_run = run_eval_suite(
                     args.suite_path,
                     output_dir=output_dir,
-                    model_factory=lambda task: _model_for(args.provider, task, reasoning_json=args.reasoning_json),
+                    model_factory=lambda task: _model_for(
+                        args.provider,
+                        task,
+                        model_name=args.model,
+                        reasoning_json=args.reasoning_json,
+                    ),
                     profile=profile,
                     tools=default_tools(),
                     policy=default_policy(),
@@ -528,6 +540,7 @@ def main(argv: list[str] | None = None) -> int:
                     cancel_token=cancel_token,
                     workspace_mode=args.workspace_mode,
                     approval_mode=args.approval_mode,
+                    approvals_reviewer=args.approvals_reviewer,
                     sandbox_mode=args.sandbox_mode,
                 )
         except RunCancelled:
@@ -707,6 +720,14 @@ def _model_for(provider: str, task: str, *, model_name: str | None = None, reaso
         task,
         env=os.environ,
     )  # type: ignore[arg-type]
+
+
+def _approval_handler_for(approval_mode: str, approvals_reviewer: str, model):
+    if approval_mode != "on-request":
+        return None
+    if approvals_reviewer == "auto_review":
+        return AutoReviewApprovalHandler(model)
+    return _CliApprovalHandler()
 
 
 def _parse_reasoning_json(raw: str | None) -> dict | None:

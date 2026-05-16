@@ -6,6 +6,7 @@ from tinyagent.core.artifacts import tool_result_artifact_refs
 from tinyagent.core.events import small_event_data
 from tinyagent.core.observations import extract_observations
 from tinyagent.core.state import RunState, ToolCall, ToolResult, ToolStep
+from tinyagent.core.token_utils import clip_text_to_token_budget, estimate_tokens
 
 
 def record_tool_result_event(state: RunState, call: ToolCall, result: ToolResult) -> None:
@@ -16,8 +17,8 @@ def record_tool_result_event(state: RunState, call: ToolCall, result: ToolResult
                 "tool_call_id": call.id,
                 "tool": call.name,
                 "reason": result.data.get("reason") or state.cancel_reason or "cancelled",
-                "output": result.output[: state.budgets.max_command_output_chars_visible],
-                "output_chars": _output_chars(result),
+                "output": clip_text_to_token_budget(result.output, state.budgets.max_tool_output_tokens_visible),
+                "output_tokens": _output_tokens(result),
                 "artifact_path": result.artifact_path,
                 "failure_kind": result.failure_kind or result.data.get("failure_kind"),
                 "data": small_event_data(result.data),
@@ -25,16 +26,15 @@ def record_tool_result_event(state: RunState, call: ToolCall, result: ToolResult
             visibility="user",
         )
         return
-    output_limit = state.budgets.max_command_output_chars_visible
-    output = result.output[:output_limit]
-    output_chars = _output_chars(result)
+    output = clip_text_to_token_budget(result.output, state.budgets.max_tool_output_tokens_visible)
+    output_tokens = _output_tokens(result)
     if tool_result_artifact_refs(result):
         state.emit(
             "tool.execution.output.snapshot",
             {
                 "tool_call_id": call.id,
                 "tool": call.name,
-                "output_chars": output_chars,
+                "output_tokens": output_tokens,
                 "artifact_path": result.artifact_path,
                 "output_artifact": result.data.get("output_artifact"),
                 "context_artifact": result.data.get("context_artifact"),
@@ -47,10 +47,13 @@ def record_tool_result_event(state: RunState, call: ToolCall, result: ToolResult
         "ok": result.ok,
         "blocked": bool(result.data.get("blocked")),
         "output": output,
-        "output_chars": output_chars,
-        "output_truncated": output_chars > len(output),
+        "output_tokens": output_tokens,
+        "output_truncated": output_tokens > estimate_tokens(output),
         "data": small_event_data(result.data),
     }
+    batch_id = result.metadata.get("batch_id")
+    if isinstance(batch_id, str) and batch_id:
+        payload["batch_id"] = batch_id
     if result.artifact_path:
         payload["artifact_path"] = result.artifact_path
     failure_kind = result.failure_kind or result.data.get("failure_kind")
@@ -109,6 +112,8 @@ def _first_line(text: str) -> str:
     return text.strip().splitlines()[0][:240] if text.strip() else ""
 
 
-def _output_chars(result: ToolResult) -> int:
-    value = result.data.get("output_chars")
-    return value if isinstance(value, int) else len(result.output)
+def _output_tokens(result: ToolResult) -> int:
+    value = result.data.get("output_tokens")
+    if isinstance(value, int):
+        return value
+    return estimate_tokens(result.output)
