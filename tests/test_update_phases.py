@@ -18,8 +18,10 @@ from tinyagent.core.observations import Observation
 from tinyagent.core.output import write_text_artifact
 from tinyagent.core.policy import LocalPolicy, PolicyConfig, PolicyRule
 from tinyagent.core.profiles import ApexCoderProfile
+from tinyagent.core.progress import ProgressGuard
 from tinyagent.core.sdk import Agent
 from tinyagent.core.state import Message, ModelResponse, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, ToolStep, Workspace
+from tinyagent.core.token_utils import estimate_tokens
 from tinyagent.core.tools import ShellTool, default_tools
 from tinyagent.core.workspace_delta import WorkspaceDeltaObserver
 from tinyagent.evals.metrics import evaluate_thresholds, extract_run_metrics
@@ -33,8 +35,8 @@ class RecordingModel:
         self.responses = list(responses)
         self.messages = []
 
-    def complete(self, messages, tools, state):
-        del tools, state
+    def complete(self, messages, tools, request):
+        del tools, request
         self.messages.append(list(messages))
         return self.responses.pop(0)
 
@@ -64,7 +66,7 @@ def test_toolresult_contextfs_and_context_report_contracts(tmp_path) -> None:
         profile=ApexCoderProfile(),
         tools=default_tools(),
         policy=workspace_shell_policy(),
-        budgets=RunBudgets(max_command_output_chars_visible=16),
+        budgets=RunBudgets(max_tool_output_tokens_visible=4),
         workspace_mode="current",
     )
 
@@ -78,7 +80,7 @@ def test_toolresult_contextfs_and_context_report_contracts(tmp_path) -> None:
     assert (state.output_dir / result.artifact_path).read_text() == ("x" * 80) + "\n"
     reread = ShellTool().run(ToolCall(name="shell", args={"cmd": result.read_hints[0]}), state)
     assert reread.ok is True
-    assert reread.data["output_chars"] >= 80
+    assert reread.data["output_tokens"] >= estimate_tokens("x" * 80)
     index = (state.output_dir / "context" / "INDEX.md").read_text()
     assert result.artifact_path in index
     report_event = next(event for event in state.events if event.type == "context.report.written")
@@ -127,6 +129,53 @@ def test_transcript_records_model_tool_result_and_finish_gate(tmp_path) -> None:
     assert state.transcript.to_json_dict()["pending_tool_call_ids"] == []
 
 
+def test_finish_gate_accepts_successful_inline_python_assertion_after_edit(tmp_path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    (tmp_path / "hello.py").write_text("VALUE = 1\n")
+    subprocess.run(["git", "add", "hello.py"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-c", "user.email=tinyagent@example.test", "-c", "user.name=tinyagent", "commit", "-m", "init"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    patch = "\n".join(
+        [
+            "*** Begin Patch",
+            "*** Update File: hello.py",
+            "@@",
+            "-VALUE = 1",
+            "+VALUE = 2",
+            "*** End Patch",
+        ]
+    )
+    verify_cmd = (
+        f"{sys.executable} -c \"from pathlib import Path; "
+        "assert Path('hello.py').read_text() == 'VALUE = 2\\\\n'; "
+        "print('inline verification passed')\""
+    )
+    state = Kernel(
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(name="read_file", args={"path": "hello.py"}),)),
+                ModelResponse(tool_calls=(ToolCall(name="apply_patch", args={"patch": patch}),)),
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "git diff -- hello.py"}),)),
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": verify_cmd}),)),
+                ModelResponse(content="Changed hello.py and verified with an inline assertion.", finish_reason="stop"),
+            ]
+        ),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=workspace_shell_policy(),
+        workspace_mode="current",
+    ).run("edit and verify with a focused inline assertion", workspace=tmp_path, run_id="run_inline_assert_verify")
+
+    assert state.failed is False
+    assert (tmp_path / "hello.py").read_text() == "VALUE = 2\n"
+    assert not any(event.type == "finish.blocked" for event in state.events)
+
+
 def test_observations_classify_patch_diff_verification_and_policy(tmp_path) -> None:
     (tmp_path / "hello.py").write_text("def test_ok():\n    assert True\n")
     patch = "\n".join(
@@ -156,6 +205,7 @@ def test_observations_classify_patch_diff_verification_and_policy(tmp_path) -> N
         tools=default_tools(),
         policy=workspace_shell_policy(),
         workspace_mode="current",
+        approval_mode="never",
     ).run("record observations", workspace=tmp_path, run_id="run_observations_contract")
 
     kinds = [observation.kind for observation in state.observations]
@@ -485,6 +535,46 @@ def test_progress_guard_blocks_repeated_failed_command_before_policy_retry(tmp_p
     assert blocked_event_types == ["tool.execution.failed", "tool.execution.blocked"]
     assert any(event.type == "contextfs.index.updated" and event.data.get("tool_call_id") == blocked_call_id for event in state.events)
     assert any(observation.kind == "policy_block" for observation in state.observations)
+
+
+def test_progress_guard_blocks_repeated_same_tool_input_without_mutation(tmp_path) -> None:
+    state = RunState.create("avoid read loop", Workspace(tmp_path), run_id="run_read_loop_guard")
+    call = ToolCall(name="lookup", args={"key": "hello"})
+    state.tool_steps.extend(
+        [
+            ToolStep(call=call, result=ToolResult(tool_name="lookup", output="hello", ok=True)),
+            ToolStep(
+                call=ToolCall(name="lookup", args={"key": "hello"}),
+                result=ToolResult(tool_name="lookup", output="hello", ok=True),
+            ),
+        ]
+    )
+
+    decision = ProgressGuard().before_tool_call(state, ToolCall(name="lookup", args={"key": "hello"}))
+
+    assert decision.allow is False
+    assert "already been returned" in decision.reason
+
+
+def test_progress_guard_allows_reread_after_context_checkpoint(tmp_path) -> None:
+    state = RunState.create("allow reread after compaction", Workspace(tmp_path), run_id="run_read_after_checkpoint")
+    state.tool_steps.extend(
+        [
+            ToolStep(
+                call=ToolCall(name="lookup", args={"key": "hello"}),
+                result=ToolResult(tool_name="lookup", output="hello", ok=True),
+            ),
+            ToolStep(
+                call=ToolCall(name="lookup", args={"key": "hello"}),
+                result=ToolResult(tool_name="lookup", output="hello", ok=True),
+            ),
+        ]
+    )
+    state.context_checkpoint_tool_step_count = len(state.tool_steps)
+
+    decision = ProgressGuard().before_tool_call(state, ToolCall(name="lookup", args={"key": "hello"}))
+
+    assert decision.allow is True
 
 
 def test_extension_host_injects_context_and_registers_visible_tool(tmp_path) -> None:
@@ -1432,6 +1522,7 @@ def test_eval_metrics_count_policy_denial_once(tmp_path) -> None:
         tools=default_tools(),
         policy=workspace_shell_policy(),
         workspace_mode="current",
+        approval_mode="never",
     ).run("deny network", workspace=tmp_path, run_id="run_policy_metric_once")
 
     metrics = extract_run_metrics(state.output_dir)
@@ -1484,7 +1575,7 @@ def test_eval_metrics_treat_structured_reads_as_pre_edit_inspection(tmp_path) ->
         tools=default_tools(),
         policy=workspace_shell_policy(),
         workspace_mode="current",
-        budgets=RunBudgets(max_turns=3),
+        budgets=RunBudgets(max_model_calls=3),
     ).run("read then edit", workspace=tmp_path, run_id="run_structured_inspection_metric")
 
     metrics = extract_run_metrics(state.output_dir)
@@ -1627,6 +1718,7 @@ def test_policy_and_sandbox_denials_have_distinct_failure_dimensions(tmp_path) -
         tools=default_tools(),
         policy=workspace_shell_policy(),
         workspace_mode="current",
+        approval_mode="never",
     ).run("deny network", workspace=tmp_path, run_id="run_policy_dimensions")
 
     policy_result = policy_state.tool_results[0]
@@ -1681,7 +1773,7 @@ def test_approval_denial_preserves_original_capability(tmp_path) -> None:
         profile=ApexCoderProfile(),
         tools=default_tools(),
         policy=workspace_shell_policy(),
-        approval_mode="yolo",
+        approval_mode="never",
         workspace_mode="current",
     ).run("deny workspace escape approval", workspace=tmp_path, run_id="run_approval_capability")
 
@@ -1774,6 +1866,7 @@ def test_hook_mutated_tool_call_is_rechecked_by_policy(tmp_path) -> None:
         policy=workspace_shell_policy(),
         hooks=[MutatingHook(), LaterHook()],
         workspace_mode="current",
+        approval_mode="never",
     ).run("mutate tool", workspace=tmp_path, run_id="run_hook_policy_recheck")
 
     assert state.failed is False

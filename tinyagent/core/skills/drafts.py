@@ -253,7 +253,7 @@ def _source_summary(
             "task": _sanitize_text(record.task),
         },
         "inputs": {
-            "final_output_chars": record.final_output_chars,
+            "final_output_tokens": record.final_output_tokens,
             "final_diff_sha256": _sha256_file(root / "final.diff"),
             "event_count": len(events),
             "hidden_artifacts_skipped": hidden_artifacts,
@@ -265,7 +265,7 @@ def _source_summary(
             "turn_count": record.turn_count,
             "model_call_count": record.model_call_count,
             "tool_call_count": record.tool_call_count,
-            "final_diff_chars": record.final_diff_chars,
+            "final_diff_tokens": record.final_diff_tokens,
         },
         "tools": sorted({call.tool for call in record.tool_calls if call.tool}),
         "commands": [_sanitize_text(command) for command in commands[:20]],
@@ -313,7 +313,7 @@ def _render_skill_markdown(record: RunRecord, skill_name: str, source: dict[str,
         "## Source trace\n\n"
         f"- run_id: `{record.run_id}`\n"
         f"- status: `{record.status}`\n"
-        f"- final_diff_chars: `{record.final_diff_chars}`\n"
+        f"- final_diff_tokens: `{record.final_diff_tokens}`\n"
     )
 
 
@@ -382,7 +382,7 @@ def _safe_slug(value: str) -> str:
 
 
 def _skill_id(source: str, name: str) -> str:
-    safe = "".join(char if char.isalnum() else "_" for char in f"{source}_{name}")
+    safe = "".join(ch if ch.isalnum() else "_" for ch in f"{source}_{name}")
     return f"skill_{safe.strip('_')}"
 
 

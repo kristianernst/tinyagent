@@ -11,7 +11,8 @@ from tinyagent.core.models import FakeModelProvider
 from tinyagent.core.observations import Observation
 from tinyagent.core.policy import LocalPolicy
 from tinyagent.core.profiles import ApexCoderProfile
-from tinyagent.core.state import Message, ModelResponse, PolicyDecision, RunState, ToolCall, ToolResult, ToolStep, Workspace
+from tinyagent.core.state import Message, ModelRequestContext, ModelResponse, PolicyDecision, RunState, ToolCall, ToolResult, ToolStep, Workspace
+from tinyagent.core.token_utils import estimate_tokens
 from tinyagent.core.tools import default_tools
 
 
@@ -30,8 +31,8 @@ class RecordingModel:
         self.responses = list(responses)
         self.messages: list[list[Message]] = []
 
-    def complete(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState) -> ModelResponse:
-        del tools, state
+    def complete(self, messages: Sequence[Message], tools: Sequence[Tool], request: ModelRequestContext) -> ModelResponse:
+        del tools, request
         self.messages.append(list(messages))
         return self.responses.pop(0)
 
@@ -50,7 +51,7 @@ def test_project_instructions_load_global_then_git_root_to_leaf(tmp_path, monkey
     (repo / "AGENTS.md").write_text("root instructions\n")
     (package / "AGENTS.md").write_text("leaf instructions\n")
 
-    instructions = load_project_instructions(package, ContextConfig(project_instruction_max_chars=10_000))
+    instructions = load_project_instructions(package, ContextConfig(project_instruction_max_tokens=10_000))
 
     assert instructions.files == (
         str(global_dir / "AGENTS.md"),
@@ -71,7 +72,7 @@ def test_project_instructions_cap_truncates_content(tmp_path, monkeypatch) -> No
 
     instructions = load_project_instructions(
         tmp_path,
-        ContextConfig(project_instruction_max_chars=len(header) + len("first")),
+        ContextConfig(project_instruction_max_tokens=estimate_tokens(header + "first")),
     )
 
     assert instructions.truncated is True
@@ -219,7 +220,7 @@ def test_recent_tool_context_hides_unreadable_artifacts_when_context_read_is_hid
                     "context_artifact": "context/fetch_url/0001-call_fetch.txt",
                     "output_artifact": "artifacts/fetch-url-output-call_fetch.txt",
                     "captured_output_artifact": "artifacts/fetch-url-output-call_fetch.txt",
-                    "output_chars": 4096,
+                    "output_tokens": 1024,
                     "workspace_delta": {
                         "diff_artifact": "artifacts/workspace-delta-0001.patch",
                         "paths": ["research/iphone-costs.md"],

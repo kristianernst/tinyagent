@@ -1,0 +1,9 @@
+{
+  "id": "build-refactor-planner",
+  "task": "This is a harder coding-agent harness stress task. Inspect the repo first with search_code/context_search/read_file, then read docs/IMPLEMENTATION_BRIEF.md. Implement the requested FlowForge milestone planner across the existing modules, keep the code dependency-free, update docs where the brief requires it, run python3 -m unittest discover -s tests, run python3 scripts/validate.py, inspect git diff, and finish with the files changed plus verification results.",
+  "validation_command": "python3 scripts/validate.py",
+  "budgets": {
+    "max_model_calls": 35
+  },
+  "timeout_seconds": 180
+}

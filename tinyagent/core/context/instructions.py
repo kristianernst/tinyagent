@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from tinyagent.core.context.types import ContextConfig, ProjectInstructions
+from tinyagent.core.token_utils import estimate_tokens, token_budget_to_text_limit
 
 PROJECT_INSTRUCTION_FILE = "AGENTS.md"
 
@@ -16,7 +17,7 @@ def load_project_instructions(workspace_root: Path, config: ContextConfig | None
     paths = _instruction_paths(workspace_root)
     chunks: list[str] = []
     files: list[str] = []
-    remaining = max(config.project_instruction_max_chars, 0)
+    remaining_tokens = max(config.project_instruction_max_tokens, 0)
     truncated = False
 
     for path in paths:
@@ -28,16 +29,17 @@ def load_project_instructions(workspace_root: Path, config: ContextConfig | None
             continue
         chunk = f"## {path}\n\n{text.strip()}\n"
         files.append(str(path))
-        if remaining <= 0:
+        if remaining_tokens <= 0:
             truncated = True
             continue
-        if len(chunk) > remaining:
-            chunks.append(chunk[:remaining].rstrip())
+        chunk_tokens = estimate_tokens(chunk)
+        if chunk_tokens > remaining_tokens:
+            chunks.append(chunk[: token_budget_to_text_limit(remaining_tokens)].rstrip())
             truncated = True
-            remaining = 0
+            remaining_tokens = 0
             continue
         chunks.append(chunk.rstrip())
-        remaining -= len(chunk)
+        remaining_tokens -= chunk_tokens
 
     return ProjectInstructions(content="\n\n".join(chunks), files=tuple(files), truncated=truncated)
 

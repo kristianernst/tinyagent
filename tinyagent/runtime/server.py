@@ -15,6 +15,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 from uuid import uuid4
 
+from tinyagent.core.auto_review import AutoReviewApprovalHandler
 from tinyagent.core.contracts import ApprovalHandler, ModelProvider
 from tinyagent.core.events import Event, EventSink, event_debug_level, load_events_jsonl
 from tinyagent.core.ids import validate_run_id
@@ -51,6 +52,8 @@ SURFACE_EVENT_TYPES = frozenset(
         "tool.execution.failed",
         "tool.execution.blocked",
         "tool.execution.cancelled",
+        "auto_review.started",
+        "auto_review.completed",
         "approval.requested",
         "approval.resolved",
         "artifact.created",
@@ -93,6 +96,7 @@ class RuntimeConfig:
     debug_level: int = 0
     workspace_mode: WorkspaceMode = "current"
     approval_mode: ApprovalMode = "yolo"
+    approvals_reviewer: str = "user"
     sandbox_mode: SandboxModeInput = "none"
     profile: str = "tiny-coder"
     conversation_store: ConversationStore | None = None
@@ -360,9 +364,16 @@ class RunController:
         *,
         run_id: str | None = None,
         approval_mode: str | None = None,
+        approvals_reviewer: str | None = None,
         profile: str | None = None,
     ) -> dict[str, Any]:
-        return self._start_run(task, run_id=run_id, approval_mode=approval_mode, profile=profile)
+        return self._start_run(
+            task,
+            run_id=run_id,
+            approval_mode=approval_mode,
+            approvals_reviewer=approvals_reviewer,
+            profile=profile,
+        )
 
     def start_conversation_turn(
         self,
@@ -373,6 +384,7 @@ class RunController:
         parent_turn_id: str | None = None,
         run_id: str | None = None,
         approval_mode: str | None = None,
+        approvals_reviewer: str | None = None,
         profile: str | None = None,
     ) -> dict[str, Any]:
         if self.config.conversation_store is None:
@@ -391,6 +403,7 @@ class RunController:
             task,
             run_id=run_id,
             approval_mode=approval_mode,
+            approvals_reviewer=approvals_reviewer,
             profile=profile,
             prior_messages=prior_messages,
             conversation_id=conversation_id,
@@ -424,6 +437,7 @@ class RunController:
         *,
         run_id: str | None = None,
         approval_mode: str | None = None,
+        approvals_reviewer: str | None = None,
         profile: str | None = None,
         prior_messages=(),
         conversation_id: str | None = None,
@@ -440,6 +454,7 @@ class RunController:
             self._reserved_run_ids.add(resolved_run_id)
             self._cancel_tokens[resolved_run_id] = token
         resolved_approval_mode = approval_mode or self.config.approval_mode
+        resolved_approvals_reviewer = approvals_reviewer or self.config.approvals_reviewer
         try:
             extensions = []
             if self.config.mcp_clients:
@@ -447,12 +462,13 @@ class RunController:
             if self.config.todo_memory_enabled:
                 extensions.append(TodoMemoryExtension())
             resolved_profile = profile_for(profile or self.config.profile)
+            model = self.config.provider_factory(task)
             kernel = Kernel(
-                model=self.config.provider_factory(task),
+                model=model,
                 profile=resolved_profile,
                 tools=default_tools(),
                 policy=default_policy(),
-                approval_handler=self.approvals,
+                approval_handler=self._approval_handler_for(model, resolved_approvals_reviewer),
                 event_sink=TeeEventSink(
                     self.bus,
                     SurfaceEventLogSink(output_dir, debug_level=self.config.debug_level),
@@ -526,6 +542,11 @@ class RunController:
         if turn_id:
             payload["turn_id"] = turn_id
         return payload
+
+    def _approval_handler_for(self, model: ModelProvider, approvals_reviewer: str) -> ApprovalHandler:
+        if approvals_reviewer == "auto_review":
+            return AutoReviewApprovalHandler(model)
+        return self.approvals
 
     def cancel(self, run_id: str, reason: str = "server_cancelled") -> bool:
         if any(event.type in TERMINAL_EVENT_TYPES for event in self.store.events(run_id)):
@@ -798,6 +819,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                         task,
                         run_id=body.get("run_id"),
                         approval_mode=str(body.get("approval_mode") or self.server.controller.config.approval_mode),
+                        approvals_reviewer=str(body.get("approvals_reviewer") or self.server.controller.config.approvals_reviewer),
                         profile=str(body.get("profile") or self.server.controller.config.profile),
                     ),
                 )
@@ -814,6 +836,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     turn_id=body.get("turn_id"),
                     parent_turn_id=body.get("parent_turn_id"),
                     approval_mode=str(body.get("approval_mode") or self.server.controller.config.approval_mode),
+                    approvals_reviewer=str(body.get("approvals_reviewer") or self.server.controller.config.approvals_reviewer),
                     profile=str(body.get("profile") or self.server.controller.config.profile),
                 )
                 payload["events_url"] = f"/api/runs/{payload['run_id']}/events"
@@ -915,6 +938,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                         turn_id=body.get("turn_id"),
                         parent_turn_id=body.get("parent_turn_id"),
                         approval_mode=str(body.get("approval_mode") or self.server.controller.config.approval_mode),
+                        approvals_reviewer=str(body.get("approvals_reviewer") or self.server.controller.config.approvals_reviewer),
                         profile=str(body.get("profile") or self.server.controller.config.profile),
                     )
                 else:
@@ -922,6 +946,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                         task,
                         run_id=body.get("run_id"),
                         approval_mode=str(body.get("approval_mode") or self.server.controller.config.approval_mode),
+                        approvals_reviewer=str(body.get("approvals_reviewer") or self.server.controller.config.approvals_reviewer),
                         profile=str(body.get("profile") or self.server.controller.config.profile),
                     )
                 self._json(
@@ -1189,6 +1214,7 @@ def create_runtime_server(
     debug_level: int = 0,
     workspace_mode: WorkspaceMode = "current",
     approval_mode: ApprovalMode = "yolo",
+    approvals_reviewer: str = "user",
     sandbox_mode: SandboxModeInput = "none",
     conversation_root: Path | None = None,
     mcp_clients: Mapping[str, McpClient] | None = None,
@@ -1214,6 +1240,7 @@ def create_runtime_server(
             debug_level=debug_level,
             workspace_mode=workspace_mode,
             approval_mode=approval_mode,
+            approvals_reviewer=approvals_reviewer,
             sandbox_mode=sandbox_mode,
             profile=profile,
             conversation_store=ConversationStore(resolved_conversation_root),

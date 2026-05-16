@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from tinyagent.core.contracts import ToolRuntime
 from tinyagent.core.state import RunState, ToolCall, ToolResult
 from tinyagent.core.tools.core import visible_output
 from tinyagent.extensions.todo_memory.store import TODO_MD, TodoStore, render_todo_markdown
@@ -9,6 +10,7 @@ from tinyagent.extensions.todo_memory.store import TODO_MD, TodoStore, render_to
 
 class TodoReadTool:
     name = "todo_read"
+    runtime = ToolRuntime(parallel_safe=True, lock_key="todo_memory")
     schema = {
         "name": "todo_read",
         "description": "Read the current run-scoped working todo list.",
@@ -33,6 +35,7 @@ class TodoReadTool:
 
 class TodoWriteTool:
     name = "todo_write"
+    runtime = ToolRuntime(lock_key="todo_memory")
     schema = {
         "name": "todo_write",
         "description": "Replace the current run-scoped working todo list.",

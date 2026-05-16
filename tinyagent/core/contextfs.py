@@ -154,6 +154,8 @@ def allowed_context_read_paths(state: "RunState") -> set[str]:
             paths.add(optional)
     for tool_name in TOOL_CONTEXT_DESCRIPTIONS:
         paths.add(f"context/tools/{safe_artifact_name(tool_name)}.md")
+    for step in state.tool_steps:
+        paths.add(f"context/tools/{safe_artifact_name(step.call.name)}.md")
     for event in state.events:
         if event.type == "contextfs.artifact.written":
             path = event.data.get("path")

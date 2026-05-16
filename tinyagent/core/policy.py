@@ -264,6 +264,12 @@ class LocalPolicy:
                 risk="high",
                 command=cmd,
             )
+        if _safe_find_listing(cmd, state):
+            return PolicyDecision.allow(
+                "read-only find listing is inside workspace",
+                matched_rule="bash.find.safe_listing",
+                permission="bash",
+            )
         return self._decision(
             call,
             state,
@@ -315,6 +321,7 @@ _REDIRECT_PATTERN = re.compile(r"(?:^|[\s;&|])(?:>|>>|<)\s*(?P<path>[^()\s;&|]+)
 _WRITE_REDIRECT_PATTERN = re.compile(r"(?:^|[\s;&|])(?:>|>>)\s*(?P<path>[^()\s;&|]+)")
 _FILE_MUTATION_COMMANDS = frozenset({"tee", "mkdir", "touch", "rm", "mv", "cp"})
 _SIMPLE_READ_COMMANDS = frozenset({"cat", "head", "tail", "wc", "ls"})
+_FIND_MUTATING_TOKENS = frozenset({"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fls"})
 _RG_VALUE_FLAGS = frozenset(
     {
         "-A",
@@ -470,6 +477,64 @@ def _read_targets(cmd: str) -> list[str]:
     if command == "git" and len(words) > 2 and words[1] == "diff" and "--no-index" in words[2:]:
         return _plain_path_operands(word for word in words[2:] if word != "--no-index")
     return []
+
+
+def _safe_find_listing(cmd: str, state: RunState) -> bool:
+    words = _shell_words(cmd)
+    if not words or Path(words[0]).name != "find":
+        return False
+    if "&&" in words or "||" in words or ";" in cmd:
+        return False
+    pipe_indexes = [index for index, word in enumerate(words) if word == "|"]
+    if len(pipe_indexes) > 1:
+        return False
+    pipe_index = pipe_indexes[0] if pipe_indexes else len(words)
+    find_words = words[1:pipe_index]
+    if not find_words:
+        find_words = ["."]
+    if any(word in _FIND_MUTATING_TOKENS or word.startswith(("-exec", "-ok")) for word in find_words):
+        return False
+    if pipe_indexes and not _safe_find_pipe_tail(words[pipe_index + 1 :]):
+        return False
+    path_operands = _find_path_operands(find_words)
+    for raw in path_operands or ["."]:
+        resolved = _resolve_shell_path(raw, state.workspace.root)
+        envelope = state.workspace_envelope
+        if envelope is not None:
+            if not envelope.contains(resolved):
+                return False
+        elif not state.workspace.contains(resolved):
+            return False
+    return True
+
+
+def _safe_find_pipe_tail(words: list[str]) -> bool:
+    if not words:
+        return False
+    command = Path(words[0]).name
+    if command == "head":
+        return all(word.startswith("-") or word.isdigit() for word in words[1:])
+    if command == "sort":
+        return not any(word == "-o" or word.startswith("--output") for word in words[1:])
+    return False
+
+
+def _find_path_operands(words: list[str]) -> list[str]:
+    paths: list[str] = []
+    expression_started = False
+    for word in words:
+        if word == "--":
+            expression_started = False
+            continue
+        if word in {"!", "(", ")"} or word.startswith("-"):
+            expression_started = True
+            continue
+        if not expression_started:
+            paths.append(word)
+            continue
+        if not paths:
+            paths.append(".")
+    return paths
 
 
 def _plain_path_operands(words: Iterable[str]) -> list[str]:
@@ -781,6 +846,16 @@ def default_policy_config() -> PolicyConfig:
             PolicyRule("bash", "wc *", "allow"),
             PolicyRule("bash", "pytest", "allow"),
             PolicyRule("bash", "pytest *", "allow"),
+            PolicyRule("bash", "python3 -m unittest*", "allow"),
+            PolicyRule("bash", "python -m unittest*", "allow"),
+            PolicyRule("bash", "python3 scripts/validate.py", "allow"),
+            PolicyRule("bash", "python3 scripts/validate.py *", "allow"),
+            PolicyRule("bash", "python3 ./scripts/validate.py", "allow"),
+            PolicyRule("bash", "python3 ./scripts/validate.py *", "allow"),
+            PolicyRule("bash", "python scripts/validate.py", "allow"),
+            PolicyRule("bash", "python scripts/validate.py *", "allow"),
+            PolicyRule("bash", "python ./scripts/validate.py", "allow"),
+            PolicyRule("bash", "python ./scripts/validate.py *", "allow"),
             PolicyRule("bash", "uv run pytest", "allow"),
             PolicyRule("bash", "uv run pytest*", "allow"),
             PolicyRule("bash", "npm test", "allow"),

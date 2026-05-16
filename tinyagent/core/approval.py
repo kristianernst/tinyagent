@@ -109,15 +109,9 @@ def resolve_approval(
 
 
 def _yolo_resolution(approval: ApprovalRequest) -> ApprovalResolution:
-    if approval.action_kind in {"network", "workspace_escape", "shell"}:
-        return ApprovalResolution(
-            approval_id=approval.approval_id,
-            decision="denied",
-            reason=f"approval-mode=yolo does not allow {approval.action_kind}",
-        )
     return ApprovalResolution(
         approval_id=approval.approval_id,
         decision="approved",
         scope="once",
-        reason="approval_mode_yolo_in_workspace",
+        reason="approval_mode_yolo",
     )

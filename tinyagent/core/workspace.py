@@ -186,8 +186,8 @@ def inspect_dirty_state(root: Path) -> DirtyState:
 
 
 def _worktree_path(root: Path, run_id: str) -> Path:
-    safe_repo = "".join(char if char.isalnum() or char in "._-" else "-" for char in root.name)
-    safe_run = "".join(char if char.isalnum() or char in "._-" else "-" for char in run_id)
+    safe_repo = "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in root.name)
+    safe_run = "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in run_id)
     return Path(tempfile.gettempdir()) / "tinyagent-worktrees" / f"{safe_repo}-{safe_run}"
 
 

@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+import threading
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
-from tinyagent.core.events import Event, EventDurability, EventSink, EventVisibility, utc_now
+from tinyagent.core.events import Event, EventDurability, EventSink, EventVisibility, small_event_data, utc_now
 from tinyagent.core.run_control import CancelToken, RunCancelled
 from tinyagent.core.workspace import Workspace, WorkspaceEnvelope
 
@@ -34,16 +35,32 @@ def _default_transcript() -> Transcript:
 
 @dataclass(frozen=True)
 class RunBudgets:
-    max_turns: int = 30
+    max_model_calls: int = 30
     max_tool_calls: int = 100
     max_shell_timeout_seconds: int = 60
     max_model_timeout_seconds: int = 180
     max_model_idle_timeout_seconds: int = 60
     max_run_seconds: int = 600
-    max_command_output_chars_visible: int = 12_000
+    max_tool_output_tokens_visible: int = 3_000
 
     def to_json_dict(self) -> dict[str, int]:
         return asdict(self)
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None = None, *, base: RunBudgets | None = None) -> RunBudgets:
+        values = asdict(base or cls())
+        if not data:
+            return cls(**values)
+        unknown = sorted(set(data) - set(values))
+        if unknown:
+            raise ValueError(f"Unknown run budget fields: {', '.join(unknown)}")
+        for key, value in data.items():
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"Run budget {key} must be an integer")
+            if value < 0:
+                raise ValueError(f"Run budget {key} must be non-negative")
+            values[key] = value
+        return cls(**values)
 
 
 @dataclass(frozen=True)
@@ -58,6 +75,7 @@ class ToolCall:
     name: str
     args: dict[str, Any] = field(default_factory=dict)
     id: str = field(default_factory=lambda: f"call_{uuid4().hex}")
+    metadata: dict[str, Any] = field(default_factory=dict, compare=False)
 
 
 @dataclass(frozen=True)
@@ -86,12 +104,66 @@ class ToolStep:
     result: ToolResult
 
 
+@dataclass(frozen=True)
+class ModelRequestContext:
+    """Normalized provider-facing run context.
+
+    Providers should use this instead of the full RunState. It contains only the
+    small state needed to shape model requests and provider-native tool history.
+    """
+
+    run_id: str
+    tool_steps: tuple[ToolStep, ...] = ()
+    context_checkpoint_tool_step_count: int = 0
+    conversation_state: ModelConversationState | None = None
+
+    @classmethod
+    def from_run_state(cls, state: RunState) -> ModelRequestContext:
+        return cls(
+            run_id=state.run_id,
+            tool_steps=tuple(state.tool_steps),
+            context_checkpoint_tool_step_count=state.context_checkpoint_tool_step_count,
+            conversation_state=state.model_conversation_state,
+        )
+
+    def tool_steps_since_checkpoint(self) -> tuple[ToolStep, ...]:
+        return self.tool_steps[self.context_checkpoint_tool_step_count :]
+
+
+@dataclass
+class ModelConversationState:
+    provider: str
+    adapter: str
+    mode: str = "stateless_replay"
+    response_id: str | None = None
+    conversation_id: str | None = None
+    prompt_cache_key: str | None = None
+    opaque: dict[str, Any] = field(default_factory=dict)
+
+    def to_json_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "provider": self.provider,
+            "adapter": self.adapter,
+            "mode": self.mode,
+        }
+        if self.response_id:
+            data["response_id"] = self.response_id
+        if self.conversation_id:
+            data["conversation_id"] = self.conversation_id
+        if self.prompt_cache_key:
+            data["prompt_cache_key"] = self.prompt_cache_key
+        if self.opaque:
+            data["opaque"] = small_event_data(self.opaque)
+        return data
+
+
 @dataclass
 class ModelResponse:
     content: str = ""
     tool_calls: tuple[ToolCall, ...] = ()
     finish_reason: str | None = None
     raw: dict[str, Any] = field(default_factory=dict)
+    conversation_state: ModelConversationState | None = None
 
     def __post_init__(self) -> None:
         self.tool_calls = tuple(self.tool_calls)
@@ -238,6 +310,7 @@ class RunState:
     final_diff: str = ""
     workspace_envelope: WorkspaceEnvelope | None = None
     model_spec: dict[str, Any] = field(default_factory=dict)
+    model_conversation_state: ModelConversationState | None = None
     approval_mode: ApprovalMode = "yolo"
     pending_approvals: dict[str, ApprovalRequest] = field(default_factory=dict)
     approval_grants: dict[str, ApprovalGrant] = field(default_factory=dict)
@@ -263,6 +336,7 @@ class RunState:
     parent_run_id: str | None = None
     parent_event_id: str | None = None
     branch_name: str | None = None
+    _event_lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
 
     @property
     def tool_results(self) -> list[ToolResult]:
@@ -317,28 +391,29 @@ class RunState:
     ) -> Event:
         # Single event boundary: durable events go to events.jsonl and sinks,
         # ephemeral events go to sinks only, and large payloads go to artifacts.
-        event = Event(
-            run_id=self.run_id,
-            type=event_type,
-            data=data or {},
-            visibility=visibility,
-            durability=durability,
-            artifact_refs=artifact_refs or [],
-            turn_id=turn_id if turn_id is not None else self.current_turn_id,
-            item_id=item_id,
-            parent_item_id=parent_item_id,
-            seq=self.seq + 1,
-        )
-        self.seq = event.seq
-        if event.durability == "event_log":
-            self.events.append(event)
-        if event.durability == "event_log" and self.persist_events:
-            self.output_dir.mkdir(parents=True, exist_ok=True)
-            with (self.output_dir / "events.jsonl").open("a") as file:
-                file.write(json.dumps(event.to_json_dict(), sort_keys=True) + "\n")
-        if self.stream_sink is not None:
-            self.stream_sink.emit(event)
-        return event
+        with self._event_lock:
+            event = Event(
+                run_id=self.run_id,
+                type=event_type,
+                data=data or {},
+                visibility=visibility,
+                durability=durability,
+                artifact_refs=artifact_refs or [],
+                turn_id=turn_id if turn_id is not None else self.current_turn_id,
+                item_id=item_id,
+                parent_item_id=parent_item_id,
+                seq=self.seq + 1,
+            )
+            self.seq = event.seq
+            if event.durability == "event_log":
+                self.events.append(event)
+            if event.durability == "event_log" and self.persist_events:
+                self.output_dir.mkdir(parents=True, exist_ok=True)
+                with (self.output_dir / "events.jsonl").open("a") as file:
+                    file.write(json.dumps(event.to_json_dict(), sort_keys=True) + "\n")
+            if self.stream_sink is not None:
+                self.stream_sink.emit(event)
+            return event
 
     def elapsed_seconds(self) -> float:
         return (utc_now() - self.started_at).total_seconds()

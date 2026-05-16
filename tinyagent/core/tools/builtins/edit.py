@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from tinyagent.core.contracts import ToolRuntime
 from tinyagent.core.state import RunState, ToolCall, ToolResult
 from tinyagent.core.tools.core import capture_tool_output, duration_ms, error_result, relative_workspace_path, resolve_workspace_path
 
@@ -22,6 +23,7 @@ class _FileSnapshot:
 
 class StrReplaceEditTool:
     name = "str_replace_edit"
+    runtime = ToolRuntime(parallel_safe=False, mutates_workspace=True, lock_key="workspace")
     schema = {
         "name": "str_replace_edit",
         "description": "Edit one workspace file by replacing a unique old_str with new_str.",
@@ -58,6 +60,7 @@ class StrReplaceEditTool:
 
 class WriteFileTool:
     name = "write_file"
+    runtime = ToolRuntime(parallel_safe=False, mutates_workspace=True, lock_key="workspace")
     schema = {
         "name": "write_file",
         "description": "Overwrite one small workspace file with full content.",

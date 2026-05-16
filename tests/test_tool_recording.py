@@ -12,7 +12,7 @@ def test_record_tool_result_event_emits_snapshot_before_terminal_and_bounds_data
         call_id="call_1",
         output="abcdef",
         ok=False,
-        data={"captured_output_artifact": "artifacts/captured.txt", "large": "x" * 5_000, "output_chars": 12},
+        data={"captured_output_artifact": "artifacts/captured.txt", "large": "x" * 5_000, "output_tokens": 3},
         failure_kind="command_failed",
         read_hints=["artifacts/captured.txt"],
     )
@@ -21,11 +21,11 @@ def test_record_tool_result_event_emits_snapshot_before_terminal_and_bounds_data
 
     snapshot, terminal = state.events
     assert snapshot.type == "tool.execution.output.snapshot"
-    assert snapshot.data["output_chars"] == 12
+    assert snapshot.data["output_tokens"] == 3
     assert snapshot.data["captured_output_artifact"] == "artifacts/captured.txt"
     assert terminal.type == "tool.execution.failed"
     assert terminal.data["output"] == "abcdef"
-    assert terminal.data["output_chars"] == 12
+    assert terminal.data["output_tokens"] == 3
     assert terminal.data["output_truncated"] is True
     assert terminal.data["failure_kind"] == "command_failed"
     assert terminal.data["read_hints"] == ["artifacts/captured.txt"]

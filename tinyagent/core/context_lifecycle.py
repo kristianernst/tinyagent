@@ -11,6 +11,7 @@ from tinyagent.core.context import BuiltContext, estimate_messages_tokens, estim
 from tinyagent.core.contextfs import refresh_contextfs
 from tinyagent.core.contracts import Profile, Tool
 from tinyagent.core.state import RunState
+from tinyagent.core.token_utils import estimate_tokens
 
 
 def refresh_contextfs_if_enabled(
@@ -41,9 +42,9 @@ def build_context(
         built_context = BuiltContext(
             messages=messages,
             token_estimate=estimate_messages_tokens(messages),
-            static_context_chars=sum(len(message_text(message)) for message in messages),
-            tool_context_chars=0,
-            project_instruction_chars=0,
+            static_context_tokens=sum(estimate_tokens(message_text(message)) for message in messages),
+            tool_context_tokens=0,
+            project_instruction_tokens=0,
         )
     token_estimate = built_context.token_estimate + estimate_tools_tokens(visible_tools)
     state.context_token_estimate = token_estimate

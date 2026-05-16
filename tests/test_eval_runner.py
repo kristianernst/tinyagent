@@ -68,6 +68,8 @@ def test_eval_suite_runs_cases_and_writes_report(tmp_path) -> None:
     assert (output_dir / "report.md").exists()
     result = json.loads((output_dir / "results.jsonl").read_text().splitlines()[0])
     assert result["case_id"] == "read-file"
+    assert result["provider"] == "fake"
+    assert result["protocol"] == "openai_chat_completions"
     assert result["model_call_count"] == 2
     assert result["tool_schema_tokens"] > 0
     assert result["model_call_token_estimates"]
@@ -102,6 +104,54 @@ def test_eval_suite_stops_after_cancelled_case_and_skips_validation(tmp_path) ->
     assert result.validation_output_path == ""
     assert not (output_dir / "validation" / "cancel-first.txt").exists()
     assert not (output_dir / "workspaces" / "run-second").exists()
+
+
+def test_eval_validation_runs_for_failed_non_cancelled_case(tmp_path) -> None:
+    suite = tmp_path / "suite"
+    case = suite / "edit-file"
+    files = case / "files"
+    files.mkdir(parents=True)
+    (files / "hello.txt").write_text("hello\n")
+    validation = f"{sys.executable} -c \"from pathlib import Path; assert Path('hello.txt').read_text() == 'updated\\\\n'\""
+    (case / "task.json").write_text(
+        json.dumps(
+            {
+                "id": "edit-file",
+                "task": "Edit hello.txt to say updated.",
+                "validation_command": validation,
+                "budgets": {"max_model_calls": 1},
+            }
+        )
+    )
+    patch = "\n".join(
+        [
+            "*** Begin Patch",
+            "*** Update File: hello.txt",
+            "@@",
+            "-hello",
+            "+updated",
+            "*** End Patch",
+        ]
+    )
+    output_dir = tmp_path / "eval-failed-but-valid"
+
+    eval_run = run_eval_suite(
+        suite,
+        output_dir=output_dir,
+        model_factory=lambda _task: FakeModelProvider([ModelResponse(tool_calls=(ToolCall(name="apply_patch", args={"patch": patch}),))]),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=default_policy(),
+    )
+
+    assert load_eval_cases(suite)[0].budget_overrides == {"max_model_calls": 1}
+    result = eval_run.results[0]
+    assert result.status == "failed"
+    assert result.success is False
+    assert result.validation_attempted is True
+    assert result.validation_ok is True
+    assert result.validation_exit_code == 0
+    assert (output_dir / "validation" / "edit-file.txt").exists()
 
 
 def test_eval_validation_runs_against_effective_worktree_workspace(tmp_path) -> None:
@@ -158,6 +208,29 @@ def test_eval_validation_runs_against_effective_worktree_workspace(tmp_path) -> 
     assert "## Harness Findings" in (output_dir / "report.md").read_text()
 
 
+def test_eval_comparison_config_budgets_apply(tmp_path) -> None:
+    suite = _write_suite(tmp_path)
+    config = tmp_path / "variant.toml"
+    config.write_text('provider = "fake"\n[budgets]\nmax_model_calls = 1\n')
+
+    comparison = run_eval_comparison(
+        suite,
+        output_dir=tmp_path / "compare-budget",
+        variants=[VariantSpec.parse(f"budgeted={config}")],
+        model_factory=lambda _config, task: FakeModelProvider(_fake_eval_responses(task)),
+        profile_factory=lambda config: profile_for(config.profile, visible_tool_names=config.visible_tools or None),
+        tools_factory=lambda _config: default_tools(),
+        policy_factory=lambda _config: default_policy(),
+    )
+
+    result = comparison.variants[0].results[0]
+    assert result.status == "failed"
+    assert result.validation_attempted is True
+    assert result.validation_ok is True
+    assert result.success is False
+    assert result.failure_reason == "Run exceeded max_model_calls budget."
+
+
 def test_eval_comparison_runs_fake_variants_and_writes_metadata(tmp_path) -> None:
     suite = _write_suite(tmp_path)
     baseline = tmp_path / "baseline.toml"
@@ -198,6 +271,8 @@ def test_eval_comparison_runs_fake_variants_and_writes_metadata(tmp_path) -> Non
     assert "git_untracked_hash" in variant_metadata
     comparison_json = json.loads((output_dir / "comparison.json").read_text())
     summaries = {variant["name"]: variant["summary"] for variant in comparison_json["variants"]}
+    assert summaries["baseline"]["provider"] == "fake"
+    assert summaries["baseline"]["protocol"] == "openai_chat_completions"
     assert summaries["contextfs"]["tool_schema_tokens"] > summaries["baseline"]["tool_schema_tokens"]
     assert summaries["contextfs"]["visible_tool_count"] > summaries["baseline"]["visible_tool_count"]
 
@@ -387,6 +462,72 @@ def test_eval_metrics_time_to_first_tool_uses_model_tool_selection(tmp_path) -> 
     metrics = extract_run_metrics(run)
 
     assert metrics.time_to_first_tool_seconds == 1.0
+
+
+def test_eval_metrics_extract_provider_usage_and_parallel_batches(tmp_path) -> None:
+    run = tmp_path / "run"
+    run.mkdir()
+    events = [
+        Event(
+            type="run.started",
+            run_id="run_metrics",
+            seq=1,
+            data={
+                "provider": "openai-responses",
+                "model": "gpt-test",
+                "protocol": "openai_responses",
+                "adapter": "tinyagent.openai_responses.v1",
+            },
+        ),
+        Event(
+            type="model.usage",
+            run_id="run_metrics",
+            seq=2,
+            data={
+                "input_tokens": 10,
+                "cached_input_tokens": 4,
+                "cache_creation_input_tokens": 2,
+                "output_tokens": 3,
+                "reasoning_tokens": 1,
+                "total_tokens": 14,
+            },
+        ),
+        Event(
+            type="model.usage",
+            run_id="run_metrics",
+            seq=3,
+            data={"input_tokens": 5, "cached_input_tokens": 1, "output_tokens": 2, "total_tokens": 7},
+        ),
+        Event(
+            type="tool.execution.started",
+            run_id="run_metrics",
+            seq=4,
+            data={"tool_call_id": "call_a", "tool": "read_file", "batch_id": "batch_1"},
+        ),
+        Event(
+            type="tool.execution.started",
+            run_id="run_metrics",
+            seq=5,
+            data={"tool_call_id": "call_b", "tool": "read_file", "batch_id": "batch_1"},
+        ),
+        Event(type="run.completed", run_id="run_metrics", seq=6),
+    ]
+    (run / "events.jsonl").write_text("".join(json.dumps(event.to_json_dict(), sort_keys=True) + "\n" for event in events))
+
+    metrics = extract_run_metrics(run)
+
+    assert metrics.provider == "openai-responses"
+    assert metrics.model == "gpt-test"
+    assert metrics.protocol == "openai_responses"
+    assert metrics.adapter == "tinyagent.openai_responses.v1"
+    assert metrics.input_tokens == 15
+    assert metrics.cached_input_tokens == 5
+    assert metrics.cache_creation_input_tokens == 2
+    assert metrics.output_tokens == 5
+    assert metrics.reasoning_tokens == 1
+    assert metrics.total_tokens == 21
+    assert metrics.parallel_batch_count == 1
+    assert metrics.batched_tool_call_count == 2
 
 
 def test_eval_comparison_passes_model_config_to_variant_factory(tmp_path) -> None:

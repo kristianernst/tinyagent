@@ -5,10 +5,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from tinyagent.core.contextfs import model_readable_path, read_hints, write_context_tool_output
-from tinyagent.core.contracts import Tool
+from tinyagent.core.contracts import Tool, ToolRuntime
 from tinyagent.core.index.safety import EXCLUDED_INDEX_DIRS, MAX_INDEX_FILE_BYTES, is_excluded_index_path
 from tinyagent.core.path_safety import resolved_relative_to
 from tinyagent.core.state import RunState, ToolCall, ToolResult
+from tinyagent.core.token_utils import estimate_tokens, fits_token_budget
 from tinyagent.core.tools.core import (
     error_result,
     relative_workspace_path,
@@ -22,6 +23,7 @@ MAX_READ_FILE_BYTES = MAX_INDEX_FILE_BYTES
 
 class ReadFileTool:
     name = "read_file"
+    runtime = ToolRuntime(parallel_safe=True)
     schema = {
         "name": "read_file",
         "description": "Read a UTF-8 text file inside the workspace.",
@@ -61,11 +63,13 @@ class ReadFileTool:
         selected = lines[start_line - 1 : start_line - 1 + max_lines]
         numbered = "\n".join(f"{index}: {line}" for index, line in enumerate(selected, start=start_line))
         rel_path = relative_workspace_path(state, path)
+        complete_file = start_line == 1 and len(selected) == len(lines)
+        shown_line_end = start_line + max(len(selected) - 1, 0)
         output = f"{rel_path}\n{numbered}" if numbered else f"{rel_path}\n"
-        output_chars = len(output)
+        output_tokens = estimate_tokens(output)
         artifact_path = None
         hints: list[str] = []
-        if output_chars > state.budgets.max_command_output_chars_visible:
+        if not fits_token_budget(output, state.budgets.max_tool_output_tokens_visible):
             artifact_path = write_context_tool_output(state, call, output, kind="read_file_output")
             hints = read_hints(model_readable_path(state, artifact_path))
             output = visible_output(output, state)
@@ -77,8 +81,11 @@ class ReadFileTool:
                 "line_count": len(selected),
                 "total_lines": len(lines),
                 "bytes": len(text.encode()),
-                "output_chars": output_chars,
+                "output_tokens": output_tokens,
                 "context_artifact": artifact_path,
+                "complete_file": complete_file and artifact_path is None,
+                "shown_line_start": start_line,
+                "shown_line_end": shown_line_end,
             },
         )
         return ToolResult(
@@ -92,7 +99,10 @@ class ReadFileTool:
                 "total_lines": len(lines),
                 "bytes": len(text.encode()),
                 "context_artifact": artifact_path,
-                "output_chars": output_chars,
+                "output_tokens": output_tokens,
+                "complete_file": complete_file and artifact_path is None,
+                "shown_line_start": start_line,
+                "shown_line_end": shown_line_end,
             },
             artifact_path=artifact_path,
             truncated=artifact_path is not None,
@@ -102,6 +112,7 @@ class ReadFileTool:
 
 class ListFilesTool:
     name = "list_files"
+    runtime = ToolRuntime(parallel_safe=True)
     schema = {
         "name": "list_files",
         "description": "List files inside the workspace, excluding trace and git directories.",

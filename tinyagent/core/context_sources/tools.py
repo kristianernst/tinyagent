@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import time
 
+from tinyagent.core.contracts import ToolRuntime
 from tinyagent.core.context_sources.registry import ContextRegistry, context_registry_for_state
 from tinyagent.core.output import write_text_artifact
 from tinyagent.core.path_safety import safe_artifact_name
 from tinyagent.core.state import RunState, ToolCall, ToolResult
+from tinyagent.core.token_utils import estimate_tokens, fits_token_budget
 from tinyagent.core.tools.core import error_result, visible_output
 
 
 class ContextSearchTool:
     name = "context_search"
+    runtime = ToolRuntime(parallel_safe=True, lock_key="context_registry")
     schema = {
         "name": "context_search",
         "description": (
@@ -68,7 +71,8 @@ class ContextSearchTool:
         sources_used = sorted({ref.source for ref in refs})
         result_refs = [_ref_data(ref) for ref in refs]
         artifact = None
-        if len(output) > state.budgets.max_command_output_chars_visible:
+        output_tokens = estimate_tokens(output)
+        if not fits_token_budget(output, state.budgets.max_tool_output_tokens_visible):
             artifact = write_text_artifact(state, f"context-search-{safe_artifact_name(call.id)}.txt", output, kind="context_search_output")
         state.emit(
             "context.search.completed",
@@ -81,6 +85,7 @@ class ContextSearchTool:
                 "refs": [ref.ref for ref in refs],
                 "duration_ms": duration_ms,
                 "output_artifact": artifact,
+                "output_tokens": output_tokens,
             },
             artifact_refs=[artifact] if artifact else None,
         )
@@ -98,14 +103,16 @@ class ContextSearchTool:
                 "results": result_refs,
                 "duration_ms": duration_ms,
                 "output_artifact": artifact,
+                "output_tokens": output_tokens,
             },
-            truncated=len(output) > state.budgets.max_command_output_chars_visible,
+            truncated=artifact is not None,
             summary=f"Context search returned {len(refs)} result(s).",
         )
 
 
 class ContextReadTool:
     name = "context_read"
+    runtime = ToolRuntime(parallel_safe=True, lock_key="context_registry")
     schema = {
         "name": "context_read",
         "description": "Read a specific dynamic context ref returned by context_search. Supports bounded line ranges.",
@@ -153,7 +160,8 @@ class ContextReadTool:
         ]
         output = "\n".join(lines)
         artifact = None
-        if len(output) > state.budgets.max_command_output_chars_visible:
+        output_tokens = estimate_tokens(output)
+        if not fits_token_budget(output, state.budgets.max_tool_output_tokens_visible):
             artifact = write_text_artifact(state, f"context-read-{safe_artifact_name(call.id)}.txt", output, kind="context_read_output")
         if chunk.source == "skills":
             state.emit(
@@ -163,7 +171,7 @@ class ContextReadTool:
                     "name": chunk.title,
                     "source": chunk.metadata.get("source"),
                     "path": chunk.metadata.get("path"),
-                    "instruction_chars": len(chunk.content),
+                    "instruction_tokens": estimate_tokens(chunk.content),
                     "files": chunk.metadata.get("files") or [],
                     "truncated": chunk.truncated,
                 },
@@ -176,6 +184,7 @@ class ContextReadTool:
                 "line_count": len(chunk.content.splitlines()),
                 "truncated": chunk.truncated,
                 "output_artifact": artifact,
+                "output_tokens": output_tokens,
             },
             artifact_refs=[artifact] if artifact else None,
         )
@@ -190,6 +199,7 @@ class ContextReadTool:
                 "line_count": len(chunk.content.splitlines()),
                 "truncated": chunk.truncated,
                 "output_artifact": artifact,
+                "output_tokens": output_tokens,
             },
             truncated=chunk.truncated or artifact is not None,
             summary=f"Read context ref {chunk.ref}.",

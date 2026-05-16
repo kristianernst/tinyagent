@@ -6,8 +6,10 @@ import json
 import time
 from collections.abc import Mapping
 
+from tinyagent.core.contracts import ToolRuntime
 from tinyagent.core.contextfs import write_context_tool_output
 from tinyagent.core.state import RunState, ToolCall, ToolResult
+from tinyagent.core.token_utils import estimate_tokens, fits_token_budget
 from tinyagent.core.tools.core import error_result, visible_output
 from tinyagent.extensions.mcp.client import McpClient
 from tinyagent.extensions.mcp.types import McpResourceInfo, McpResult, McpToolInfo
@@ -15,6 +17,7 @@ from tinyagent.extensions.mcp.types import McpResourceInfo, McpResult, McpToolIn
 
 class McpSearchToolsTool:
     name = "mcp_search_tools"
+    runtime = ToolRuntime(requires_network=True, lock_key="mcp")
     schema = {
         "name": "mcp_search_tools",
         "description": "Search available MCP tools without loading all schemas into context.",
@@ -65,6 +68,7 @@ class McpSearchToolsTool:
 
 class McpLoadToolTool:
     name = "mcp_load_tool"
+    runtime = ToolRuntime(requires_network=True, lock_key="mcp")
     schema = {
         "name": "mcp_load_tool",
         "description": "Load the full schema for one MCP tool without calling it.",
@@ -101,11 +105,12 @@ class McpLoadToolTool:
         _emit_extension_event(
             state,
             "mcp.tool.loaded",
-            {"server": server, "tool": tool.name, "schema_chars": len(json.dumps(tool.input_schema))},
+            {"server": server, "tool": tool.name, "schema_tokens": estimate_tokens(json.dumps(tool.input_schema))},
         )
         artifact = None
         read_hints: list[str] = []
-        if len(output) > state.budgets.max_command_output_chars_visible:
+        output_tokens = estimate_tokens(output)
+        if not fits_token_budget(output, state.budgets.max_tool_output_tokens_visible):
             artifact = write_context_tool_output(state, call, output, kind="mcp_tool_schema")
             read_hints = [f"context_read({{'ref':'contextfs:{artifact}'}})"]
         return ToolResult(
@@ -115,7 +120,8 @@ class McpLoadToolTool:
             data={
                 "server": server,
                 "tool": tool.name,
-                "schema_chars": len(json.dumps(tool.input_schema)),
+                "schema_tokens": estimate_tokens(json.dumps(tool.input_schema)),
+                "output_tokens": output_tokens,
                 "context_ref": f"contextfs:{artifact}" if artifact else "",
             },
             artifact_path=artifact,
@@ -127,6 +133,7 @@ class McpLoadToolTool:
 
 class McpCallTool:
     name = "mcp_call"
+    runtime = ToolRuntime(requires_network=True, lock_key="mcp")
     schema = {
         "name": "mcp_call",
         "description": "Call one MCP tool after discovering and loading it.",
@@ -163,12 +170,13 @@ class McpCallTool:
             result,
             event_type="mcp.tool.called",
             event_data={"server": server, "tool": tool_name, "argument_keys": sorted(arguments)},
-            summary=f"MCP {server}.{tool_name} returned {len(result.content)} chars.",
+            summary=f"MCP {server}.{tool_name} returned {estimate_tokens(result.content)} tokens.",
         )
 
 
 class McpReadResourceTool:
     name = "mcp_read_resource"
+    runtime = ToolRuntime(requires_network=True, lock_key="mcp")
     schema = {
         "name": "mcp_read_resource",
         "description": "Read one MCP resource by URI.",
@@ -196,7 +204,7 @@ class McpReadResourceTool:
             result,
             event_type="mcp.resource.read",
             event_data={"server": server, "uri": uri},
-            summary=f"MCP resource {server}:{uri} returned {len(result.content)} chars.",
+            summary=f"MCP resource {server}:{uri} returned {estimate_tokens(result.content)} tokens.",
         )
 
 
@@ -279,7 +287,8 @@ def _result_tool_result(
 ) -> ToolResult:
     content = _result_content(result)
     artifact = None
-    if len(content) > state.budgets.max_command_output_chars_visible:
+    output_tokens = estimate_tokens(content)
+    if not fits_token_budget(content, state.budgets.max_tool_output_tokens_visible):
         artifact = write_context_tool_output(state, call, content, kind="mcp_result")
         output = f"{summary}\nFull result: contextfs:{artifact}"
         truncated = True
@@ -289,13 +298,21 @@ def _result_tool_result(
     _emit_extension_event(
         state,
         event_type,
-        {**event_data, "output_chars": len(content), "context_ref": f"contextfs:{artifact}" if artifact else ""},
+        {
+            **event_data,
+            "output_tokens": output_tokens,
+            "context_ref": f"contextfs:{artifact}" if artifact else "",
+        },
     )
     return ToolResult(
         tool_name=tool_name,
         call_id=call.id,
         output=visible_output(output, state),
-        data={**event_data, "output_chars": len(content), "context_ref": f"contextfs:{artifact}" if artifact else ""},
+        data={
+            **event_data,
+            "output_tokens": output_tokens,
+            "context_ref": f"contextfs:{artifact}" if artifact else "",
+        },
         artifact_path=artifact,
         truncated=truncated,
         summary=summary,

@@ -12,9 +12,11 @@ from pathlib import Path
 from typing import Any
 
 from tinyagent.core.container_sandbox import ContainerSandboxConfig, build_container_command
+from tinyagent.core.contracts import ToolRuntime
 from tinyagent.core.execution import build_execution_envelope
 from tinyagent.core.run_control import RunCancelled
 from tinyagent.core.state import RunState, ToolCall, ToolResult
+from tinyagent.core.token_utils import estimate_tokens
 from tinyagent.core.tools.core import ToolOutputCapture, capture_tool_output, combined_output, duration_ms, error_result
 
 SHELL_PREFLIGHT_COMMANDS = ("rg", "git", "python3", "python", "sed")
@@ -30,6 +32,7 @@ class _ProcessLaunch:
 
 class ShellTool:
     name = "shell"
+    runtime = ToolRuntime(parallel_safe=False, mutates_workspace=True, requires_shell=True, lock_key="shell")
     schema = {
         "name": "shell",
         "description": (
@@ -153,10 +156,10 @@ class ShellTool:
                 "ok": ok,
                 "timeout": False,
                 "returncode": process.returncode,
-                "stdout_chars": len(stdout),
-                "stderr_chars": len(stderr),
+                "stdout_tokens": estimate_tokens(stdout),
+                "stderr_tokens": estimate_tokens(stderr),
             },
-            metadata_extra={"stdout_chars": len(stdout), "stderr_chars": len(stderr)},
+            metadata_extra={"stdout_tokens": estimate_tokens(stdout), "stderr_tokens": estimate_tokens(stderr)},
         )
 
 
@@ -303,7 +306,7 @@ def _terminate_container(launch: _ProcessLaunch) -> None:
 
 
 def _safe_name(value: str) -> str:
-    return "".join(char if char.isalnum() or char in "._-" else "-" for char in value) or "shell"
+    return "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in value) or "shell"
 
 
 def _terminate_process_group(process: subprocess.Popen[str]) -> tuple[str, str]:

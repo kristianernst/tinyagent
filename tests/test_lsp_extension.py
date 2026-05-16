@@ -130,7 +130,7 @@ def test_lsp_extension_tools_are_visible_only_when_extension_is_enabled(tmp_path
         tools=default_tools(),
         policy=LocalPolicy(),
         extensions=[LspExtension(manager)],
-        budgets=RunBudgets(max_turns=1),
+        budgets=RunBudgets(max_model_calls=1),
     ).run("lsp", workspace=tmp_path, run_id="run_lsp_kernel")
 
     context_built = next(event for event in state.events if event.type == "context.built")
@@ -145,7 +145,7 @@ def test_disabled_lsp_extension_registers_no_surface(tmp_path) -> None:
         tools=default_tools(),
         policy=LocalPolicy(),
         extensions=[LspExtension(LspManager(config=LspConfig(enabled=False)))],
-        budgets=RunBudgets(max_turns=1),
+        budgets=RunBudgets(max_model_calls=1),
     ).run("lsp", workspace=tmp_path, run_id="run_lsp_disabled")
 
     context_built = next(event for event in state.events if event.type == "context.built")

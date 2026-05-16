@@ -11,13 +11,14 @@ from tinyagent.core.artifacts import tool_result_artifact_refs
 from tinyagent.core.context.checkpoint import artifact_refs_from_tool_steps, is_test_command_text
 from tinyagent.core.context.instructions import load_project_instructions
 from tinyagent.core.context.types import BuiltContext, ContextConfig, ContextExclusion, ContextItem, ContextPlan, ProjectInstructions
-from tinyagent.core.contracts import Tool
+from tinyagent.core.contracts import Tool, tool_runtime
 from tinyagent.core.events import json_safe
 from tinyagent.core.state import Message, RunState, ToolStep
+from tinyagent.core.token_utils import clip_text_to_token_budget, estimate_tokens
 
 DEFAULT_SHELL_PREFLIGHT_COMMANDS = ("rg", "git", "python3", "python", "sed")
 CRITICAL_CONTEXT_PRIORITY = 900
-RECENT_TOOL_PREVIEW_CHARS = 1_200
+RECENT_TOOL_PREVIEW_TOKENS = 300
 SMALL_STABLE_CONTEXT_TOKENS = 64
 
 
@@ -79,28 +80,24 @@ class ContextBuilder:
             Message(role=item.role, content=item.text, meta={"context_layer": item.source, "context_item_id": item.id})
             for item in included
         ]
-        static_context_chars = sum(
-            len(message_text(message))
+        static_context_tokens = sum(
+            estimate_tokens(message_text(message))
             for message in messages
             if message.meta.get("context_layer") != "recent_tool_steps"
         )
-        tool_context_chars = len(recent_tools)
+        tool_context_tokens = estimate_tokens(recent_tools)
         return BuiltContext(
             messages=messages,
             token_estimate=estimate_messages_tokens(messages),
-            static_context_chars=static_context_chars,
-            tool_context_chars=tool_context_chars,
-            project_instruction_chars=project_instructions.chars,
+            static_context_tokens=static_context_tokens,
+            tool_context_tokens=tool_context_tokens,
+            project_instruction_tokens=project_instructions.token_estimate,
             artifacts=artifact_refs_from_tool_steps(_tool_steps_since_checkpoint(state)),
             included=included,
             excluded=excluded,
             contextfs_index_path=contextfs_index_path,
             context_plan=plan,
         )
-
-
-def estimate_tokens(text: str) -> int:
-    return max(1, len(text) // 4)
 
 
 def estimate_messages_tokens(messages: Sequence[Message]) -> int:
@@ -152,7 +149,7 @@ def render_project_instructions(instructions: ProjectInstructions) -> str:
     if not instructions.content:
         return "Project instructions:\nNo AGENTS.md instructions discovered."
     files = "\n".join(f"- {path}" for path in instructions.files)
-    truncated = "\n\n[project instructions truncated at configured character cap]" if instructions.truncated else ""
+    truncated = "\n\n[project instructions truncated at configured token cap]" if instructions.truncated else ""
     return "\n".join(
         [
             "Project instructions (AGENTS.md, root-to-leaf):",
@@ -246,7 +243,7 @@ def render_contextfs_index(state: RunState) -> tuple[str | None, str]:
     if not path.exists():
         return None, ""
     index = path.read_text()
-    return relative, "\n".join(["ContextFS index (bounded; use context_search for details):", "", _bounded_text(index, 4_000)])
+    return relative, "\n".join(["ContextFS index (bounded; use context_search for details):", "", _bounded_text(index, 1_000)])
 
 
 def render_dynamic_context_sources(state: RunState) -> str:
@@ -258,7 +255,7 @@ def render_dynamic_context_sources(state: RunState) -> str:
         "Use context_search to discover refs and context_read to read them.",
     ]
     for source in registry.list_sources():
-        lines.append(f"- {source.name}: {_bounded_text(source.description, 220)}")
+        lines.append(f"- {source.name}: {_bounded_text(source.description, 55)}")
     return "\n".join(lines)
 
 
@@ -357,13 +354,12 @@ def _render_tool_step(step: ToolStep, state: RunState, *, visible_tool_names: fr
     call = step.call
     result = step.result
     preview_source = result.content_preview or result.output
-    limit = min(state.budgets.max_command_output_chars_visible, RECENT_TOOL_PREVIEW_CHARS)
-    output = preview_source[:limit]
-    suffix = "\n[truncated]" if len(preview_source) > limit else ""
+    limit = min(state.budgets.max_tool_output_tokens_visible, RECENT_TOOL_PREVIEW_TOKENS)
+    output = clip_text_to_token_budget(preview_source, limit)
     lines = [
         f"Tool: {call.name}",
         f"Call ID: {call.id}",
-        f"Args: {_small_json(call.args, max_chars=500)}",
+        f"Args: {_small_json(call.args, max_tokens=125)}",
         f"OK: {result.ok}",
     ]
     if result.summary:
@@ -381,11 +377,11 @@ def _render_tool_step(step: ToolStep, state: RunState, *, visible_tool_names: fr
         lines.extend(f"- {hint}" for hint in read_hints)
     small_data = _small_tool_data(result.data, visible_tool_names=visible_tool_names)
     if small_data:
-        lines.append(f"Data: {_small_json(small_data, max_chars=500)}")
+        lines.append(f"Data: {_small_json(small_data, max_tokens=125)}")
     lines.extend(
         [
             "Output:",
-            f"{output}{suffix}",
+            output,
         ]
     )
     return "\n".join(lines)
@@ -461,17 +457,24 @@ def _is_test_step(step: ToolStep) -> bool:
     return step.call.name == "shell" and is_test_command_text(str(step.call.args.get("cmd", "")))
 
 
-def _small_json(value: object, *, max_chars: int = 2_000) -> str:
+def _small_json(value: object, *, max_tokens: int = 500) -> str:
     encoded = json.dumps(json_safe(value), sort_keys=True)
-    if len(encoded) <= max_chars:
+    if estimate_tokens(encoded) <= max_tokens:
         return encoded
-    return json.dumps({"_truncated": True, "json_chars": len(encoded), "preview": encoded[:max_chars]}, sort_keys=True)
+    return json.dumps(
+        {
+            "_truncated": True,
+            "json_tokens": estimate_tokens(encoded),
+            "preview": clip_text_to_token_budget(encoded, max_tokens),
+        },
+        sort_keys=True,
+    )
 
 
-def _bounded_text(value: str, max_chars: int) -> str:
-    if len(value) <= max_chars:
+def _bounded_text(value: str, max_tokens: int) -> str:
+    if estimate_tokens(value) <= max_tokens:
         return value
-    return value[: max(0, max_chars - 3)] + "..."
+    return clip_text_to_token_budget(value, max_tokens)
 
 
 def _small_tool_data(data: dict[str, Any], *, visible_tool_names: frozenset[str] | None = None) -> dict[str, Any]:
@@ -483,9 +486,9 @@ def _small_tool_data(data: dict[str, Any], *, visible_tool_names: frozenset[str]
         "checkpoint_artifact",
         "context_report_artifact",
         "diff_artifact",
-        "output_chars",
-        "stdout_chars",
-        "stderr_chars",
+        "output_tokens",
+        "stdout_tokens",
+        "stderr_tokens",
         "duration_ms",
         "failure_kind",
     }
@@ -564,4 +567,4 @@ def _pack_items(items: Sequence[ContextItem], config: ContextConfig) -> tuple[li
 
 
 def _tool_dict(tool: Tool) -> dict[str, Any]:
-    return {"name": tool.name, "schema": dict(tool.schema)}
+    return {"name": tool.name, "schema": dict(tool.schema), "runtime": tool_runtime(tool).to_json_dict()}

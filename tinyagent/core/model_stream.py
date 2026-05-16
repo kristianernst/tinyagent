@@ -8,7 +8,8 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 from tinyagent.core.events import small_event_data, utc_now
-from tinyagent.core.state import Message, ModelResponse, RunState, ToolCall
+from tinyagent.core.state import Message, ModelRequestContext, ModelResponse, RunState, ToolCall
+from tinyagent.core.token_utils import estimate_tokens
 
 ModelDeltaKind = Literal[
     "text_delta",
@@ -135,19 +136,20 @@ def complete_model_call(
     call_index: int,
 ) -> ModelResponse:
     state.raise_if_cancelled()
+    request = ModelRequestContext.from_run_state(state)
     if not stream:
-        response = model.complete(messages, tools, state)
+        response = model.complete(messages, tools, request)
         state.raise_if_cancelled()
         return response
     stream_method = getattr(model, "stream", None)
     if not callable(stream_method):
-        response = model.complete(messages, tools, state)
+        response = model.complete(messages, tools, request)
         state.raise_if_cancelled()
         return response
 
     assembler = ModelResponseAssembler(provider=model.name)
     trace = _StreamTraceState()
-    for delta in stream_method(messages, tools, state):
+    for delta in stream_method(messages, tools, request):
         state.raise_if_cancelled()
         normalized = trace.normalize(delta)
         _record_model_delta(state, model.name, normalized)
@@ -274,7 +276,7 @@ def parse_chat_completion_chunk(raw: dict[str, Any]) -> Iterator[ModelDelta]:
 def _record_model_delta(state: RunState, provider: str, delta: ModelDelta) -> None:
     match delta.kind:
         case "text_delta":
-            data = {"delta": delta.delta, "chars": len(delta.delta), "item_id": delta.item_id}
+            data = {"delta": delta.delta, "tokens": estimate_tokens(delta.delta), "item_id": delta.item_id}
             if state.current_model_call_id:
                 data["model_call_id"] = state.current_model_call_id
             state.emit(
@@ -286,7 +288,7 @@ def _record_model_delta(state: RunState, provider: str, delta: ModelDelta) -> No
             )
         case "reasoning_summary_delta":
             data = {
-                "chars": len(delta.delta),
+                "tokens": estimate_tokens(delta.delta),
                 "item_id": delta.item_id,
             }
             if state.current_model_call_id:
@@ -305,7 +307,7 @@ def _record_model_delta(state: RunState, provider: str, delta: ModelDelta) -> No
                 item_id=delta.item_id,
             )
         case "reasoning_visible_delta":
-            data = {"delta": delta.delta, "chars": len(delta.delta), "item_id": delta.item_id}
+            data = {"delta": delta.delta, "tokens": estimate_tokens(delta.delta), "item_id": delta.item_id}
             if state.current_model_call_id:
                 data["model_call_id"] = state.current_model_call_id
             provider_field = delta.data.get("provider_field")
@@ -321,7 +323,7 @@ def _record_model_delta(state: RunState, provider: str, delta: ModelDelta) -> No
         case "reasoning_encrypted":
             state.emit(
                 "reasoning.encrypted",
-                {"chars": len(delta.delta)},
+                {"tokens": estimate_tokens(delta.delta)},
                 visibility="internal",
                 durability="ephemeral",
                 item_id=delta.item_id,
@@ -342,14 +344,14 @@ def _record_model_delta(state: RunState, provider: str, delta: ModelDelta) -> No
                 "model_call_id": state.current_model_call_id,
                 "tool_call_id": delta.tool_call_id,
                 "tool": delta.data.get("name"),
-                "chars": len(delta.delta),
+                "tokens": estimate_tokens(delta.delta),
             }
             bounded = small_event_data({"delta": delta.delta})
             if bounded.get("_truncated"):
                 data.update(
                     {
                         "delta_truncated": True,
-                        "delta_json_chars": bounded["json_chars"],
+                        "delta_json_tokens": bounded["json_tokens"],
                     }
                 )
             else:

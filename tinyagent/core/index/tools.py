@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import time
 
+from tinyagent.core.contracts import ToolRuntime
 from tinyagent.core.index.manager import WorkspaceIndexManager
 from tinyagent.core.index.types import IndexHit
 from tinyagent.core.state import RunState, ToolCall, ToolResult
+from tinyagent.core.token_utils import estimate_tokens, fits_token_budget
 from tinyagent.core.tools.core import error_result, resolve_workspace_path, tool_env, visible_output
 
 SUPPORTED_SEARCH_MODES = frozenset({"auto", "exact", "semantic", "hybrid", "fast"})
@@ -14,6 +16,7 @@ SUPPORTED_SEARCH_MODES = frozenset({"auto", "exact", "semantic", "hybrid", "fast
 
 class SearchCodeTool:
     name = "search_code"
+    runtime = ToolRuntime(parallel_safe=True, lock_key="workspace_index")
     schema = {
         "name": "search_code",
         "description": "Search workspace code and docs. Uses local index when available and rg fallback when needed.",
@@ -116,10 +119,12 @@ class SearchCodeTool:
                 "refs": [hit.ref for hit in hits],
             },
         )
+        output_tokens = estimate_tokens(output)
         return ToolResult(
             tool_name=self.name,
             call_id=call.id,
-            output=visible_output(output, state),
+            output=output,
+            content_preview=visible_output(output, state),
             data={
                 "query": query,
                 "mode": mode,
@@ -127,9 +132,10 @@ class SearchCodeTool:
                 "kind": kind,
                 "backend": backend,
                 "result_count": len(hits),
+                "output_tokens": output_tokens,
                 "results": [_hit_data(hit) for hit in hits],
             },
-            truncated=len(output) > state.budgets.max_command_output_chars_visible,
+            truncated=not fits_token_budget(output, state.budgets.max_tool_output_tokens_visible),
             summary=f"Code search returned {len(hits)} result(s).",
         )
 

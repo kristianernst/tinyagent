@@ -104,10 +104,26 @@ def artifact_refs_from_tool_steps(steps: Sequence[ToolStep]) -> list[ArtifactRef
 def is_test_command_text(command: str) -> bool:
     return bool(
         re.search(
-            r"(^|[;&|]\s*)((uv\s+run\s+)?pytest|python\s+-m\s+pytest|python\s+-m\s+unittest|npm\s+test|pnpm\s+test|yarn\s+test|cargo\s+test|go\s+test)\b",
+            r"(^|[;&|]\s*)((uv\s+run\s+)?pytest|python3?\s+-m\s+pytest|python3?\s+-m\s+unittest|npm\s+test|pnpm\s+test|yarn\s+test|cargo\s+test|go\s+test)\b",
             command,
         )
     )
+
+
+def is_verification_command_text(command: str) -> bool:
+    text = command.lower()
+    return (
+        is_test_command_text(command)
+        or any(
+            token in text
+            for token in ("-m pytest", "-m unittest", "ruff", "mypy", "cargo check", "npm run lint", "pnpm lint", "yarn lint")
+        )
+        or _is_python_assertion_command(text)
+    )
+
+
+def _is_python_assertion_command(text: str) -> bool:
+    return "python" in text and "assert " in text
 
 
 def _collect_event_context(state: RunState, context_state: ContextState) -> None:

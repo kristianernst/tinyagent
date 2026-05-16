@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -131,6 +132,32 @@ def test_web_research_profile_direct_context_uses_configured_tool_surface(tmp_pa
     assert "context/" not in text
     assert "artifacts/" not in text
     assert "tail -120" not in text
+
+
+def test_coding_stress_suite_has_hard_prompt_and_seed_repo_fails_target_validation(tmp_path: Path) -> None:
+    suite = ROOT / "examples" / "coding_stress" / "build-refactor-planner"
+    task = json.loads((suite / "task.json").read_text(encoding="utf-8"))
+
+    assert "docs/IMPLEMENTATION_BRIEF.md" in task["task"]
+    assert "python3 scripts/validate.py" in task["task"]
+    assert "git diff" in task["task"]
+    assert task["budgets"]["max_model_calls"] == 35
+    assert (suite / "files" / "docs" / "IMPLEMENTATION_BRIEF.md").exists()
+    assert (suite / "files" / "tests" / "test_target_behavior.py").exists()
+
+    workspace = tmp_path / "coding-stress-seed"
+    shutil.copytree(suite / "files", workspace)
+    result = subprocess.run(
+        [sys.executable, "scripts/validate.py"],
+        cwd=workspace,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "plan_milestone" in result.stderr + result.stdout
+    assert not (workspace / "dist").exists()
 
 
 def _events(workspace: Path, run_id: str) -> list[dict]:

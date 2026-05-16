@@ -7,7 +7,44 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from tinyagent.core.model_stream import ModelDelta
-from tinyagent.core.state import ApprovalRequest, ApprovalResolution, FinishDecision, Message, ModelResponse, PolicyDecision, RunState, ToolCall, ToolResult
+from tinyagent.core.state import (
+    ApprovalRequest,
+    ApprovalResolution,
+    FinishDecision,
+    Message,
+    ModelRequestContext,
+    ModelResponse,
+    PolicyDecision,
+    RunState,
+    ToolCall,
+    ToolResult,
+)
+
+
+@dataclass(frozen=True)
+class ToolRuntime:
+    parallel_safe: bool = False
+    mutates_workspace: bool = False
+    requires_shell: bool = False
+    requires_network: bool = False
+    lock_key: str | None = None
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return {
+            "parallel_safe": self.parallel_safe,
+            "mutates_workspace": self.mutates_workspace,
+            "requires_shell": self.requires_shell,
+            "requires_network": self.requires_network,
+            "lock_key": self.lock_key,
+        }
+
+
+DEFAULT_TOOL_RUNTIME = ToolRuntime()
+
+
+def tool_runtime(tool: Tool) -> ToolRuntime:
+    runtime = getattr(tool, "runtime", None)
+    return runtime if isinstance(runtime, ToolRuntime) else DEFAULT_TOOL_RUNTIME
 
 
 class Tool(Protocol):
@@ -15,6 +52,7 @@ class Tool(Protocol):
 
     name: str
     schema: Mapping[str, Any]
+    runtime: ToolRuntime
 
     def run(self, call: ToolCall, state: RunState) -> ToolResult: ...
 
@@ -22,11 +60,11 @@ class Tool(Protocol):
 class ModelProvider(Protocol):
     name: str
 
-    def complete(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState) -> ModelResponse: ...
+    def complete(self, messages: Sequence[Message], tools: Sequence[Tool], request: ModelRequestContext) -> ModelResponse: ...
 
 
 class StreamingModelProvider(ModelProvider, Protocol):
-    def stream(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState) -> Iterable[ModelDelta]: ...
+    def stream(self, messages: Sequence[Message], tools: Sequence[Tool], request: ModelRequestContext) -> Iterable[ModelDelta]: ...
 
 
 @dataclass(frozen=True)

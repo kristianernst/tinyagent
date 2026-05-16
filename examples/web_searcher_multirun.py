@@ -12,6 +12,11 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from tinyagent.core.token_utils import estimate_tokens, token_budget_to_text_limit
+
 SCRIPT = ROOT / "examples" / "web_searcher.py"
 REPORT_PATH = "research_report.md"
 
@@ -82,7 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--extra-body-json")
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--web-timeout-seconds", type=int, default=20)
-    parser.add_argument("--max-turns", type=int, default=14)
+    parser.add_argument("--max-model-calls", type=int, default=14)
     parser.add_argument("--max-tool-calls", type=int, default=30)
     parser.add_argument("--max-run-seconds", type=int, default=300)
     parser.add_argument("--compact-after-tool-steps", type=int, default=4)
@@ -121,8 +126,8 @@ def _web_searcher_command(args: argparse.Namespace, *, task: str, workspace: Pat
         str(args.temperature),
         "--web-timeout-seconds",
         str(args.web_timeout_seconds),
-        "--max-turns",
-        str(args.max_turns),
+        "--max-model-calls",
+        str(args.max_model_calls),
         "--max-tool-calls",
         str(args.max_tool_calls),
         "--max-run-seconds",
@@ -163,7 +168,7 @@ def _summarize_run(workspace: Path, run_id: str, result: subprocess.CompletedPro
         "workspace": str(workspace),
         "output_dir": str(output_dir),
         "report": str(report) if report.exists() else None,
-        "report_chars": len(report.read_text(encoding="utf-8")) if report.exists() else 0,
+        "report_tokens": estimate_tokens(report.read_text(encoding="utf-8")) if report.exists() else 0,
         "model_calls": int(metrics.get("model_call_count") or 0),
         "tool_calls": int(metrics.get("tool_call_count") or 0),
         "compactions": int(metrics.get("compaction_count") or 0),
@@ -194,7 +199,7 @@ def _format_run_line(index: int, run: dict[str, Any]) -> str:
         f"run {index:03d}: status={run['status']} rc={run['returncode']} "
         f"searches={run['web_search_calls']} fetches={run['fetch_url_calls']} "
         f"checkpoints={run['checkpoints']} compactions={run['compactions']} "
-        f"max_context_tokens={run['max_context_tokens']} report_chars={run['report_chars']}"
+        f"max_context_tokens={run['max_context_tokens']} report_tokens={run['report_tokens']}"
     )
 
 
@@ -231,11 +236,11 @@ def _max_context_tokens(events: list[dict[str, Any]]) -> int:
     return max(values, default=0)
 
 
-def _tail(value: str, *, max_chars: int = 1_500) -> str:
+def _tail(value: str, *, max_tokens: int = 375) -> str:
     value = value.strip()
-    if len(value) <= max_chars:
+    if estimate_tokens(value) <= max_tokens:
         return value
-    return value[-max_chars:]
+    return value[-token_budget_to_text_limit(max_tokens) :]
 
 
 if __name__ == "__main__":

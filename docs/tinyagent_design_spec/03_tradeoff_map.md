@@ -82,9 +82,11 @@ Cursor’s harness writing shows that different models need different tool style
 Tinyagent should have a small `ModelSpec` and profile variants:
 
 - `edit_style`: patch, str_replace, whole_file;
-- `tool_protocol`: chat_completions, responses, anthropic, gemini, none;
+- `protocol`: openai_chat_completions, openai_responses, open_responses,
+  anthropic_messages, gemini_generate_content, none;
 - `context_window` and output reserve;
-- `supports_parallel_tools`;
+- `supports_parallel_tool_calls`;
+- `tool_result_mode`;
 - `supports_reasoning`;
 - `prompt_variant`.
 

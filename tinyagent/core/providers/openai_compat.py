@@ -13,7 +13,7 @@ from typing import Any
 from tinyagent.core.contracts import Tool
 from tinyagent.core.model_stream import ModelDelta, ProviderStreamEvent, parse_chat_completion, parse_chat_completion_chunk
 from tinyagent.core.models import ModelCapabilities, ModelSpec, ProviderError
-from tinyagent.core.state import Message, ModelResponse, RunState
+from tinyagent.core.state import Message, ModelRequestContext, ModelResponse
 
 
 @dataclass(frozen=True)
@@ -71,13 +71,14 @@ class OpenAICompatibleProvider:
             context_window=config.context_window,
             max_output_tokens=config.max_output_tokens,
             supports_tools=True,
-            supports_parallel_tools=False,
-            tool_protocol="chat_completions",
+            supports_parallel_tool_calls=False,
+            protocol="openai_chat_completions",
+            tool_result_mode="chat_tool_messages",
         )
         self.model_spec = ModelSpec(
             provider=self.name,
             model=config.model,
-            protocol="chat_completions",
+            protocol=self.capabilities.protocol,
             adapter=self.adapter,
             capabilities=self.capabilities,
         )
@@ -86,26 +87,27 @@ class OpenAICompatibleProvider:
     def from_env(cls, env: Mapping[str, str] | None = None) -> OpenAICompatibleProvider:
         return cls(OpenAICompatibleConfig.from_env(env))
 
-    def complete(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState) -> ModelResponse:
-        payload = self.build_payload(messages, tools, state)
+    def complete(self, messages: Sequence[Message], tools: Sequence[Tool], request: ModelRequestContext) -> ModelResponse:
+        payload = self.build_payload(messages, tools, request)
         raw = self._post(payload)
         return parse_chat_completion(raw)
 
-    def stream(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState) -> Iterator[ModelDelta]:
-        for event in self.stream_provider_events(messages, tools, state):
+    def stream(self, messages: Sequence[Message], tools: Sequence[Tool], request: ModelRequestContext) -> Iterator[ModelDelta]:
+        for event in self.stream_provider_events(messages, tools, request):
             yield from parse_chat_completion_chunk(event.raw)
 
     def stream_provider_events(
         self,
         messages: Sequence[Message],
         tools: Sequence[Tool],
-        state: RunState,
+        request: ModelRequestContext,
     ) -> Iterator[ProviderStreamEvent]:
-        payload = self.build_stream_payload(messages, tools, state)
+        payload = self.build_stream_payload(messages, tools, request)
         for raw in self._post_stream(payload):
             yield ProviderStreamEvent(provider=self.name, type=str(raw.get("object") or "chat.completion.chunk"), raw=raw)
 
-    def build_payload(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState) -> dict[str, Any]:
+    def build_payload(self, messages: Sequence[Message], tools: Sequence[Tool], request: ModelRequestContext) -> dict[str, Any]:
+        del request
         payload: dict[str, Any] = {
             "model": self.config.model,
             "messages": [_message_payload(message) for message in messages],
@@ -118,8 +120,8 @@ class OpenAICompatibleProvider:
             payload.update(_provider_compat_reasoning_body(self.config.reasoning, existing=payload))
         return payload
 
-    def build_stream_payload(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState) -> dict[str, Any]:
-        payload = self.build_payload(messages, tools, state)
+    def build_stream_payload(self, messages: Sequence[Message], tools: Sequence[Tool], request: ModelRequestContext) -> dict[str, Any]:
+        payload = self.build_payload(messages, tools, request)
         payload["stream"] = True
         stream_options = payload.get("stream_options")
         if not isinstance(stream_options, dict):

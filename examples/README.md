@@ -131,10 +131,32 @@ uv run python examples/web_searcher_multirun.py \
   --target-fetches 24 \
   --max-fetches 32 \
   --compact-after-tool-steps 2 \
-  --max-turns 80 \
+  --max-model-calls 80 \
   --max-tool-calls 120 \
   --max-run-seconds 1800 \
   --continue-on-fail
 ```
 
 The long-browse summary is `<workspace-root>/multirun_summary.json`; inspect each run's `metrics.json`, `events.jsonl`, context checkpoints, and report from the paths printed by the command. Use `--web-backend fixture` for deterministic protocol stress without external network access; it will repeat fixture-backed sources, so it is less meaningful as a web-quality test.
+
+## Coding Harness Stress
+
+`coding_stress/` is a local eval suite with an artificial multi-file Python repo.
+It asks the agent to build a dependency-aware milestone planner across parser,
+model, planner, reporting, CLI, tests, and docs. This is the heavier fixture to
+use when testing dynamic context, code search/read behavior, edit reliability,
+container shell execution, validation, and final diff discipline.
+
+```bash
+uv run tinyagent eval examples/coding_stress \
+  --provider openai-compatible \
+  --workspace-mode current \
+  --sandbox-mode container \
+  --profile tiny-coder \
+  --stream text \
+  --debug 1 \
+  --output-dir /tmp/tinyagent-coding-stress
+```
+
+See `examples/coding_stress/README.md` for provider env vars, container image
+notes, and artifact paths.

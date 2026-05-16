@@ -33,6 +33,7 @@ from tinyagent.core.providers.openai_compat import OpenAICompatibleConfig, OpenA
 from tinyagent.core.providers.openai_responses import OpenAIResponsesConfig, OpenAIResponsesProvider
 from tinyagent.core.sdk import Agent
 from tinyagent.core.state import FinishDecision, Message, ModelResponse, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult
+from tinyagent.core.token_utils import clip_text_to_token_budget, estimate_tokens, token_budget_to_text_limit
 from tinyagent.core.tools.core import capture_tool_output, duration_ms, error_result, resolve_workspace_path
 
 USER_AGENT = "tinyagent-web-searcher/0.1 (+https://github.com/tinyagent/examples)"
@@ -72,11 +73,12 @@ class FixtureWebBackend:
             results = STOCK_RESULTS
         return results[:max_results]
 
-    def fetch(self, url: str, *, max_chars: int) -> FetchedDocument:
+    def fetch(self, url: str, *, max_tokens: int) -> FetchedDocument:
         document = FIXTURE_DOCUMENTS.get(url)
         if document is None:
             raise ValueError(f"fixture URL not found: {url}")
-        return FetchedDocument(url=url, title=document["title"], text=document["text"][:max_chars])
+        text_limit = token_budget_to_text_limit(max_tokens)
+        return FetchedDocument(url=url, title=document["title"], text=document["text"][:text_limit])
 
 
 class DuckDuckGoWebBackend:
@@ -94,12 +96,13 @@ class DuckDuckGoWebBackend:
             raise ValueError("DuckDuckGo returned no parseable results.")
         return results
 
-    def fetch(self, url: str, *, max_chars: int) -> FetchedDocument:
-        raw = _read_url(url, timeout_seconds=self.timeout_seconds, max_bytes=max(max_chars * 6, 200_000))
+    def fetch(self, url: str, *, max_tokens: int) -> FetchedDocument:
+        text_limit = token_budget_to_text_limit(max_tokens)
+        raw = _read_url(url, timeout_seconds=self.timeout_seconds, max_bytes=max(text_limit * 6, 200_000))
         title, text = _html_to_text(raw)
         if not text.strip():
             text = raw
-        return FetchedDocument(url=url, title=title or url, text=text[:max_chars])
+        return FetchedDocument(url=url, title=title or url, text=text[:text_limit])
 
 
 class WebSearchTool:
@@ -171,7 +174,7 @@ class FetchUrlTool:
             "properties": {
                 "result_number": {"type": "integer", "minimum": 1, "maximum": 8, "description": "Search result number to fetch."},
                 "url": {"type": "string", "description": "Exact URL from a prior web_search result."},
-                "max_chars": {"type": "integer", "minimum": 500, "maximum": 20000},
+                "max_tokens": {"type": "integer", "minimum": 125, "maximum": 5000},
             },
         },
     }
@@ -191,8 +194,8 @@ class FetchUrlTool:
             )
             if not url:
                 raise ValueError("url or result_number is required")
-            max_chars = min(max(int(call.args.get("max_chars", 6000)), 500), 20_000)
-            document = self.backend.fetch(url, max_chars=max_chars)
+            max_tokens = min(max(int(call.args.get("max_tokens", 1500)), 125), 5_000)
+            document = self.backend.fetch(url, max_tokens=max_tokens)
             remap_note = f"Requested URL was remapped from {requested_url}.\n" if requested_url and requested_url != url else ""
             output = "\n".join(
                 [
@@ -215,7 +218,7 @@ class FetchUrlTool:
                     "url": document.url,
                     "requested_url": requested_url,
                     "title": document.title,
-                    "text_chars": len(document.text),
+                    "text_tokens": estimate_tokens(document.text),
                     **captured.data,
                     "duration_ms": duration_ms(started),
                 },
@@ -340,7 +343,7 @@ class WebResearchProfile:
         self.target_fetches = max(target_fetches, 1)
         self.fetches_per_search = max(1, ceil(self.target_fetches / self.max_searches))
         self.context_config = ContextConfig(
-            project_instruction_max_chars=8_000,
+            project_instruction_max_tokens=2_000,
             max_recent_tool_tokens=3_000,
             compact_after_tool_steps=compact_after_tool_steps,
             compact_at_tokens=24_000,
@@ -541,7 +544,7 @@ async def run_example(args: argparse.Namespace) -> int:
             max_fetches=args.max_fetches or args.target_fetches,
             min_fetches=args.target_fetches,
         ),
-        budgets=RunBudgets(max_turns=args.max_turns, max_tool_calls=args.max_tool_calls, max_run_seconds=args.max_run_seconds),
+        budgets=RunBudgets(max_model_calls=args.max_model_calls, max_tool_calls=args.max_tool_calls, max_run_seconds=args.max_run_seconds),
         workspace_mode="current",
         approval_mode="yolo",
     )
@@ -584,7 +587,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--extra-body-json")
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--web-timeout-seconds", type=int, default=20)
-    parser.add_argument("--max-turns", type=int, default=14)
+    parser.add_argument("--max-model-calls", type=int, default=14)
     parser.add_argument("--max-tool-calls", type=int, default=30)
     parser.add_argument("--max-run-seconds", type=int, default=300)
     parser.add_argument("--compact-after-tool-steps", type=int, default=4)
@@ -604,8 +607,8 @@ def _fake_web_responses(task: str) -> list[ModelResponse]:
                     ToolCall(name="web_search", args={"query": "Copenhagen to Tokyo August 2026 flight fare trend", "max_results": 4}),
                 )
             ),
-            ModelResponse(tool_calls=(ToolCall(name="fetch_url", args={"url": "fixture://flights/cph-tyo-fares", "max_chars": 5000}),)),
-            ModelResponse(tool_calls=(ToolCall(name="fetch_url", args={"url": "fixture://flights/booking-patterns", "max_chars": 5000}),)),
+            ModelResponse(tool_calls=(ToolCall(name="fetch_url", args={"url": "fixture://flights/cph-tyo-fares", "max_tokens": 1250}),)),
+            ModelResponse(tool_calls=(ToolCall(name="fetch_url", args={"url": "fixture://flights/booking-patterns", "max_tokens": 1250}),)),
             ModelResponse(tool_calls=(ToolCall(name="write_report", args={"content": FLIGHT_REPORT}),)),
             ModelResponse(
                 content=f"Flight research complete. I wrote {REPORT_PATH} with fare ranges, caveats, and next checks.",
@@ -616,8 +619,8 @@ def _fake_web_responses(task: str) -> list[ModelResponse]:
         ModelResponse(
             tool_calls=(ToolCall(name="web_search", args={"query": "NVIDIA stock recent earnings AI data center risks", "max_results": 4}),)
         ),
-        ModelResponse(tool_calls=(ToolCall(name="fetch_url", args={"url": "fixture://stocks/nvda-earnings", "max_chars": 5000}),)),
-        ModelResponse(tool_calls=(ToolCall(name="fetch_url", args={"url": "fixture://stocks/nvda-risks", "max_chars": 5000}),)),
+        ModelResponse(tool_calls=(ToolCall(name="fetch_url", args={"url": "fixture://stocks/nvda-earnings", "max_tokens": 1250}),)),
+        ModelResponse(tool_calls=(ToolCall(name="fetch_url", args={"url": "fixture://stocks/nvda-risks", "max_tokens": 1250}),)),
         ModelResponse(tool_calls=(ToolCall(name="write_report", args={"content": STOCK_REPORT}),)),
         ModelResponse(
             content=f"Stock research complete. I wrote {REPORT_PATH} with sourced bullets and open questions.",
@@ -717,7 +720,7 @@ def _fetched_urls(state: RunState) -> list[str]:
     return urls
 
 
-def _source_digest(state: RunState, *, max_chars: int = 2_000) -> str:
+def _source_digest(state: RunState, *, max_tokens: int = 500) -> str:
     docs: list[tuple[str, str, str]] = []
     for step in state.tool_steps:
         if step.call.name != "fetch_url" or not step.result.ok:
@@ -730,13 +733,13 @@ def _source_digest(state: RunState, *, max_chars: int = 2_000) -> str:
             docs.append((url, title, excerpt))
     if not docs:
         return ""
-    per_doc = max(260, max_chars // max(len(docs), 1) - 120)
+    per_doc_tokens = max(65, max_tokens // max(len(docs), 1) - 30)
     lines = [
         "Fetched source digest for the report:",
         "Use these exact fetched URLs in Source Notes.",
     ]
     for url, title, excerpt in docs[:4]:
-        lines.append(f"- {url} ({title}): {_clip_text(excerpt, per_doc)}")
+        lines.append(f"- {url} ({title}): {clip_text_to_token_budget(excerpt, per_doc_tokens)}")
     return "\n".join(lines)
 
 

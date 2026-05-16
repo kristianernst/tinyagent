@@ -18,13 +18,30 @@ from tinyagent.core.models import (
 from tinyagent.core.policy import default_policy
 from tinyagent.core.profiles import ApexCoderProfile
 from tinyagent.core.providers.factory import ProviderRegistry, ProviderSpec, provider_for
+from tinyagent.core.providers.anthropic import AnthropicMessagesConfig, AnthropicMessagesProvider, parse_message
+from tinyagent.core.providers.gemini import (
+    GeminiGenerateContentConfig,
+    GeminiGenerateContentProvider,
+    parse_generate_content,
+)
 from tinyagent.core.providers.openai_compat import OpenAICompatibleConfig, OpenAICompatibleProvider
 from tinyagent.core.providers.openai_responses import (
     OpenAIResponsesConfig,
     OpenAIResponsesProvider,
     parse_response_stream_event,
 )
-from tinyagent.core.state import Message, ModelResponse, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, Workspace
+from tinyagent.core.state import (
+    Message,
+    ModelRequestContext,
+    ModelResponse,
+    PolicyDecision,
+    RunBudgets,
+    RunState,
+    ToolCall,
+    ToolResult,
+    ToolStep,
+    Workspace,
+)
 from tinyagent.core.tools import default_tools
 
 
@@ -106,9 +123,10 @@ class StreamingOpenAIProvider(OpenAICompatibleProvider):
 
 
 class RecordingResponsesProvider(OpenAIResponsesProvider):
-    def __init__(self, raw_response: dict) -> None:
+    def __init__(self, raw_response: dict, config: OpenAIResponsesConfig | None = None) -> None:
         super().__init__(
-            OpenAIResponsesConfig(
+            config
+            or OpenAIResponsesConfig(
                 base_url="https://models.example.test/v1",
                 api_key="test-key",
                 model="test-model",
@@ -137,6 +155,67 @@ class StreamingResponsesProvider(OpenAIResponsesProvider):
     def _post_stream(self, payload: dict):
         self.payloads.append(payload)
         yield from self.raw_events
+
+
+class RecordingOpenResponsesProvider(OpenAIResponsesProvider):
+    def __init__(self, raw_response: dict, config: OpenAIResponsesConfig | None = None) -> None:
+        super().__init__(
+            config
+            or OpenAIResponsesConfig(
+                base_url="http://127.0.0.1:11434/v1",
+                api_key="",
+                model="test-model",
+                protocol="open_responses",
+                send_store=False,
+                send_prompt_cache_key=False,
+                supports_prompt_cache_key=False,
+                supports_reasoning=False,
+            ),
+            name="open-responses",
+            adapter="tinyagent.open_responses.v1",
+        )
+        self.payloads: list[dict] = []
+        self.raw_response = raw_response
+
+    def _post(self, payload: dict) -> dict:
+        self.payloads.append(payload)
+        return self.raw_response
+
+
+class RecordingAnthropicProvider(AnthropicMessagesProvider):
+    def __init__(self, raw_response: dict, config: AnthropicMessagesConfig | None = None) -> None:
+        super().__init__(
+            config
+            or AnthropicMessagesConfig(
+                base_url="https://api.anthropic.test/v1",
+                api_key="test-key",
+                model="claude-test",
+            )
+        )
+        self.payloads: list[dict] = []
+        self.raw_response = raw_response
+
+    def _post(self, payload: dict) -> dict:
+        self.payloads.append(payload)
+        return self.raw_response
+
+
+class RecordingGeminiProvider(GeminiGenerateContentProvider):
+    def __init__(self, raw_response: dict, config: GeminiGenerateContentConfig | None = None) -> None:
+        super().__init__(
+            config
+            or GeminiGenerateContentConfig(
+                base_url="https://generativelanguage.googleapis.com/v1beta",
+                api_key="test-key",
+                model="gemini-test",
+            )
+        )
+        self.payloads: list[dict] = []
+        self.raw_response = raw_response
+
+    def _post(self, payload: dict) -> dict:
+        self.payloads.append(payload)
+        return self.raw_response
 
 
 def test_fake_provider_returns_responses_in_order() -> None:
@@ -280,7 +359,7 @@ def test_openai_compatible_provider_merges_extra_body_without_overriding_stream_
         )
     )
 
-    payload = provider.build_stream_payload([Message(role="user", content="hello")], [SampleTool()], _state_stub())
+    payload = provider.build_stream_payload([Message(role="user", content="hello")], [SampleTool()], _request_stub())
 
     assert payload["model"] == "test-model"
     assert payload["messages"] == [{"role": "user", "content": "hello"}]
@@ -291,7 +370,8 @@ def test_openai_compatible_provider_merges_extra_body_without_overriding_stream_
     assert payload["thinking_budget_tokens"] == 1024
     assert payload["stream"] is True
     assert payload["stream_options"] == {"debug": True, "include_usage": True}
-    assert provider.capabilities.tool_protocol == "chat_completions"
+    assert provider.capabilities.protocol == "openai_chat_completions"
+    assert provider.capabilities.tool_result_mode == "chat_tool_messages"
     assert provider.capabilities.input_budget_tokens == 120_000
     assert provider.model_spec.to_json_dict()["adapter"] == "tinyagent.openai_compat.v1"
 
@@ -307,18 +387,346 @@ def test_openai_compatible_provider_preserves_explicit_thinking_budget_tokens() 
         )
     )
 
-    payload = provider.build_payload([Message(role="user", content="hello")], [], _state_stub())
+    payload = provider.build_payload([Message(role="user", content="hello")], [], _request_stub())
 
     assert payload["reasoning"] == {"budget_tokens": 1024}
     assert payload["thinking_budget_tokens"] == 256
 
 
+def test_anthropic_messages_config_reads_environment() -> None:
+    config = AnthropicMessagesConfig.from_env(
+        {
+            "TINYAGENT_MODEL_BASE_URL": "https://api.anthropic.test/v1",
+            "TINYAGENT_MODEL_API_KEY": "key",
+            "TINYAGENT_MODEL_NAME": "claude-test",
+            "TINYAGENT_MODEL_TIMEOUT_SECONDS": "12",
+            "TINYAGENT_MODEL_CONTEXT_WINDOW": "200000",
+            "TINYAGENT_MODEL_MAX_OUTPUT_TOKENS": "4096",
+            "TINYAGENT_ANTHROPIC_VERSION": "2023-06-01",
+            "TINYAGENT_MODEL_EXTRA_BODY_JSON": '{"temperature":0}',
+        }
+    )
+
+    assert config.base_url == "https://api.anthropic.test/v1"
+    assert config.api_key == "key"
+    assert config.model == "claude-test"
+    assert config.timeout_seconds == 12
+    assert config.context_window == 200_000
+    assert config.max_output_tokens == 4_096
+    assert config.anthropic_version == "2023-06-01"
+    assert config.extra_body == {"temperature": 0}
+
+
+def test_anthropic_messages_provider_sends_native_payload_and_parses_tool_use() -> None:
+    provider = RecordingAnthropicProvider(
+        {
+            "id": "msg_123",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Working."},
+                {"type": "tool_use", "id": "toolu_1", "name": "sample_tool", "input": {"value": "done"}},
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 3, "cache_read_input_tokens": 2, "output_tokens": 4},
+        }
+    )
+
+    response = provider.complete(
+        [
+            Message(role="system", content="system instructions"),
+            Message(role="user", content="use the sample tool"),
+        ],
+        [SampleTool()],
+        _request_stub(),
+    )
+
+    assert provider.payloads == [
+        {
+            "model": "claude-test",
+            "max_tokens": 8000,
+            "messages": [{"role": "user", "content": "use the sample tool"}],
+            "system": "system instructions",
+            "tools": [
+                {
+                    "name": "sample_tool",
+                    "description": "Sample tool.",
+                    "input_schema": SampleTool.schema["parameters"],
+                }
+            ],
+        }
+    ]
+    assert response.content == "Working."
+    assert response.finish_reason == "tool_calls"
+    assert response.tool_calls == (ToolCall(id="toolu_1", name="sample_tool", args={"value": "done"}),)
+    assert response.raw["usage"] == {
+        "input_tokens": 3,
+        "cached_input_tokens": 2,
+        "output_tokens": 4,
+        "total_tokens": 7,
+    }
+    assert provider.capabilities.protocol == "anthropic_messages"
+    assert provider.capabilities.tool_result_mode == "anthropic_blocks"
+    assert provider.model_spec.to_json_dict()["adapter"] == "tinyagent.anthropic_messages.v1"
+    assert provider.model_spec.edit_style == "str_replace"
+
+
+def test_anthropic_messages_provider_sends_native_tool_result_history() -> None:
+    provider = AnthropicMessagesProvider(
+        AnthropicMessagesConfig(
+            base_url="https://api.anthropic.test/v1",
+            api_key="test-key",
+            model="claude-test",
+        )
+    )
+    state = _state_stub()
+    state.tool_steps.append(
+        ToolStep(
+            call=ToolCall(id="toolu_read", name="read_file", args={"path": "hello.txt"}),
+            result=ToolResult(tool_name="read_file", call_id="toolu_read", output="hello.txt\n1: hello", ok=True),
+        )
+    )
+
+    payload = provider.build_payload([Message(role="user", content="continue")], [SampleTool()], _request_stub(state))
+
+    assert payload["messages"] == [
+        {"role": "user", "content": "continue"},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "toolu_read", "name": "read_file", "input": {"path": "hello.txt"}}],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_read",
+                    "content": "hello.txt\n1: hello",
+                    "is_error": False,
+                }
+            ],
+        },
+    ]
+
+
+def test_anthropic_provider_factory_uses_shared_model_env() -> None:
+    provider = provider_for(
+        ProviderSpec(kind="anthropic", model="claude-test"),
+        "task",
+        env={"TINYAGENT_MODEL_API_KEY": "key"},
+    )
+
+    assert isinstance(provider, AnthropicMessagesProvider)
+    assert provider.model == "claude-test"
+    assert provider.model_spec.protocol == "anthropic_messages"
+
+
+def test_anthropic_message_parser_rejects_malformed_tool_use() -> None:
+    with pytest.raises(ProviderError, match="missing id"):
+        parse_message({"content": [{"type": "tool_use", "name": "sample_tool", "input": {}}]})
+
+
+def test_gemini_generate_content_config_reads_environment() -> None:
+    config = GeminiGenerateContentConfig.from_env(
+        {
+            "TINYAGENT_MODEL_BASE_URL": "https://generativelanguage.googleapis.com/v1",
+            "TINYAGENT_MODEL_API_KEY": "key",
+            "TINYAGENT_MODEL_NAME": "gemini-3-flash-preview",
+            "TINYAGENT_MODEL_TIMEOUT_SECONDS": "13",
+            "TINYAGENT_MODEL_CONTEXT_WINDOW": "1048576",
+            "TINYAGENT_MODEL_MAX_OUTPUT_TOKENS": "4096",
+            "TINYAGENT_GEMINI_GENERATION_CONFIG_JSON": '{"temperature":0}',
+            "TINYAGENT_MODEL_EXTRA_BODY_JSON": '{"safetySettings":[]}',
+        }
+    )
+
+    assert config.base_url == "https://generativelanguage.googleapis.com/v1"
+    assert config.api_key == "key"
+    assert config.model == "gemini-3-flash-preview"
+    assert config.timeout_seconds == 13
+    assert config.context_window == 1_048_576
+    assert config.max_output_tokens == 4_096
+    assert config.generation_config == {"temperature": 0}
+    assert config.extra_body == {"safetySettings": []}
+
+
+def test_gemini_provider_sends_native_payload_and_parses_function_call() -> None:
+    provider = RecordingGeminiProvider(
+        {
+            "responseId": "gemini-response-1",
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [
+                            {"text": "Working."},
+                            {
+                                "functionCall": {
+                                    "id": "call_gemini",
+                                    "name": "sample_tool",
+                                    "args": {"value": "done"},
+                                },
+                                "thoughtSignature": "sig-123",
+                            },
+                        ],
+                    },
+                    "finishReason": "STOP",
+                    "index": 0,
+                }
+            ],
+            "usageMetadata": {
+                "promptTokenCount": 3,
+                "candidatesTokenCount": 4,
+                "thoughtsTokenCount": 2,
+                "totalTokenCount": 9,
+            },
+        },
+        config=GeminiGenerateContentConfig(
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+            api_key="test-key",
+            model="gemini-test",
+            generation_config={"temperature": 0},
+        ),
+    )
+
+    response = provider.complete(
+        [
+            Message(role="system", content="system instructions"),
+            Message(role="user", content="use the sample tool"),
+        ],
+        [SampleTool()],
+        _request_stub(),
+    )
+
+    assert provider.payloads == [
+        {
+            "contents": [{"role": "user", "parts": [{"text": "use the sample tool"}]}],
+            "generationConfig": {"temperature": 0, "maxOutputTokens": 8000},
+            "systemInstruction": {"parts": [{"text": "system instructions"}]},
+            "tools": [
+                {
+                    "functionDeclarations": [
+                        {
+                            "name": "sample_tool",
+                            "description": "Sample tool.",
+                            "parameters": SampleTool.schema["parameters"],
+                        }
+                    ]
+                }
+            ],
+        }
+    ]
+    assert response.content == "Working."
+    assert response.finish_reason == "tool_calls"
+    assert response.tool_calls == (ToolCall(id="call_gemini", name="sample_tool", args={"value": "done"}),)
+    assert response.tool_calls[0].metadata == {"gemini": {"thoughtSignature": "sig-123"}}
+    assert response.raw["usage"] == {
+        "input_tokens": 3,
+        "output_tokens": 4,
+        "reasoning_tokens": 2,
+        "total_tokens": 9,
+    }
+    assert provider.capabilities.protocol == "gemini_generate_content"
+    assert provider.capabilities.tool_result_mode == "gemini_parts"
+    assert provider.model_spec.to_json_dict()["adapter"] == "tinyagent.gemini_generate_content.v1"
+
+
+def test_gemini_provider_sends_function_response_history_with_thought_signature() -> None:
+    provider = GeminiGenerateContentProvider(
+        GeminiGenerateContentConfig(
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+            api_key="test-key",
+            model="gemini-test",
+        )
+    )
+    state = _state_stub()
+    state.tool_steps.append(
+        ToolStep(
+            call=ToolCall(
+                id="call_gemini",
+                name="sample_tool",
+                args={"value": "input"},
+                metadata={"gemini": {"thoughtSignature": "sig-123"}},
+            ),
+            result=ToolResult(
+                tool_name="sample_tool",
+                call_id="call_gemini",
+                output="tool output",
+                ok=True,
+                summary="sample ok",
+                data={"output_tokens": 2},
+            ),
+        )
+    )
+
+    payload = provider.build_payload([Message(role="user", content="continue")], [SampleTool()], _request_stub(state))
+
+    assert payload["contents"][-2] == {
+        "role": "model",
+        "parts": [
+            {
+                "functionCall": {
+                    "id": "call_gemini",
+                    "name": "sample_tool",
+                    "args": {"value": "input"},
+                },
+                "thoughtSignature": "sig-123",
+            }
+        ],
+    }
+    assert payload["contents"][-1] == {
+        "role": "user",
+        "parts": [
+            {
+                "functionResponse": {
+                    "id": "call_gemini",
+                    "name": "sample_tool",
+                    "response": {
+                        "ok": True,
+                        "output": "tool output",
+                        "summary": "sample ok",
+                        "data": {"output_tokens": 2},
+                    },
+                }
+            }
+        ],
+    }
+
+
+def test_gemini_provider_factory_uses_shared_model_env() -> None:
+    provider = provider_for(
+        ProviderSpec(kind="gemini", model="gemini-test"),
+        "task",
+        env={"TINYAGENT_MODEL_API_KEY": "key"},
+    )
+
+    assert isinstance(provider, GeminiGenerateContentProvider)
+    assert provider.name == "gemini"
+    assert provider.model == "gemini-test"
+    assert provider.model_spec.protocol == "gemini_generate_content"
+
+
+def test_gemini_parser_rejects_malformed_function_call() -> None:
+    with pytest.raises(ProviderError, match="must be a JSON object"):
+        parse_generate_content(
+            {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [{"functionCall": {"id": "call_1", "name": "sample_tool", "args": "bad"}}],
+                        }
+                    }
+                ]
+            }
+        )
+
+
 def test_kernel_fails_clearly_when_provider_does_not_support_tools(tmp_path) -> None:
     class TextOnlyProvider:
         name = "text-only"
-        capabilities = ModelCapabilities(supports_tools=False, tool_protocol="none")
+        capabilities = ModelCapabilities(supports_tools=False, protocol="none", tool_result_mode="none")
 
-        def complete(self, messages, tools, state):
+        def complete(self, messages, tools, request):
             raise AssertionError("kernel should reject visible tools before calling provider")
 
     state = Kernel(
@@ -341,7 +749,7 @@ def test_model_spec_drives_context_budget_and_visible_tools(tmp_path) -> None:
         model_spec = ModelSpec(
             provider="anthropic",
             model="claude-test",
-            protocol="anthropic",
+            protocol="anthropic_messages",
             edit_style="str_replace",
             capabilities=ModelCapabilities(context_window=20_000, max_output_tokens=2_000),
         )
@@ -349,8 +757,8 @@ def test_model_spec_drives_context_budget_and_visible_tools(tmp_path) -> None:
         def __init__(self) -> None:
             self.tools = []
 
-        def complete(self, messages, tools, state):
-            del messages, state
+        def complete(self, messages, tools, request):
+            del messages, request
             self.tools = [tool.name for tool in tools]
             return ModelResponse(content="done", finish_reason="stop")
 
@@ -378,7 +786,7 @@ def test_model_spec_drives_context_budget_and_visible_tools(tmp_path) -> None:
     started = next(event for event in state.events if event.type == "run.started")
     assert started.data["provider"] == "anthropic"
     assert started.data["model"] == "claude-test"
-    assert started.data["protocol"] == "anthropic"
+    assert started.data["protocol"] == "anthropic_messages"
     assert started.data["capabilities"]["context_window"] == 20_000
     assert started.data["adapter"] == "unknown"
     report_event = next(event for event in state.events if event.type == "context.report.written")
@@ -390,10 +798,10 @@ def test_model_spec_drives_context_budget_and_visible_tools(tmp_path) -> None:
 def test_model_spec_hidden_edit_tool_is_blocked(tmp_path) -> None:
     class ClaudeLikeProvider:
         name = "claude-like"
-        model_spec = ModelSpec(provider="anthropic", model="claude-test", protocol="anthropic", edit_style="str_replace")
+        model_spec = ModelSpec(provider="anthropic", model="claude-test", protocol="anthropic_messages", edit_style="str_replace")
 
-        def complete(self, messages, tools, state):
-            del messages, tools, state
+        def complete(self, messages, tools, request):
+            del messages, tools, request
             return ModelResponse(tool_calls=(ToolCall(name="apply_patch", args={"patch": "*** Begin Patch\n*** End Patch"}),))
 
     state = Kernel(
@@ -402,7 +810,7 @@ def test_model_spec_hidden_edit_tool_is_blocked(tmp_path) -> None:
         tools=default_tools(),
         policy=AllowAllPolicy(),
         workspace_mode="current",
-        budgets=RunBudgets(max_turns=1),
+        budgets=RunBudgets(max_model_calls=1),
     ).run("try hidden apply_patch", workspace=tmp_path, run_id="run_hidden_edit_spec")
 
     result = state.tool_results[0]
@@ -439,7 +847,7 @@ def test_openai_compatible_provider_sends_messages_tools_and_parses_tool_calls()
     response = provider.complete(
         [Message(role="user", content="use the sample tool")],
         [SampleTool()],
-        _state_stub(),
+        _request_stub(),
     )
 
     assert provider.payloads == [
@@ -503,7 +911,7 @@ def test_openai_compatible_provider_streams_text_tool_args_and_usage() -> None:
 
     response = assemble_model_deltas(
         provider.name,
-        provider.stream([Message(role="user", content="use tool")], [SampleTool()], _state_stub()),
+        provider.stream([Message(role="user", content="use tool")], [SampleTool()], _request_stub()),
     )
 
     assert provider.payloads == [
@@ -572,7 +980,7 @@ def test_openai_compatible_provider_does_not_send_message_meta() -> None:
     provider.complete(
         [Message(role="user", content="hello", meta={"context_layer": "task", "name": "ignored"})],
         [],
-        _state_stub(),
+        _request_stub(),
     )
 
     assert provider.payloads[0]["messages"] == [{"role": "user", "content": "hello"}]
@@ -627,7 +1035,7 @@ def test_openai_compatible_provider_generates_tool_call_id_when_provider_omits_i
         }
     )
 
-    response = provider.complete([], [], _state_stub())
+    response = provider.complete([], [], _request_stub())
 
     assert response.tool_calls[0].name == "sample_tool"
     assert response.tool_calls[0].args == {}
@@ -656,7 +1064,7 @@ def test_openai_compatible_provider_rejects_invalid_tool_arguments() -> None:
     )
 
     with pytest.raises(ProviderError, match="must be a JSON object"):
-        provider.complete([], [], _state_stub())
+        provider.complete([], [], _request_stub())
 
 
 def test_openai_compatible_provider_requires_tool_call_name() -> None:
@@ -678,7 +1086,7 @@ def test_openai_compatible_provider_requires_tool_call_name() -> None:
     )
 
     with pytest.raises(ProviderError, match="function.name"):
-        provider.complete([], [], _state_stub())
+        provider.complete([], [], _request_stub())
 
 
 def test_openai_responses_config_reads_environment() -> None:
@@ -690,6 +1098,8 @@ def test_openai_responses_config_reads_environment() -> None:
             "TINYAGENT_MODEL_TIMEOUT_SECONDS": "12",
             "TINYAGENT_MODEL_CONTEXT_WINDOW": "64000",
             "TINYAGENT_MODEL_MAX_OUTPUT_TOKENS": "4000",
+            "TINYAGENT_MODEL_PARALLEL_TOOL_CALLS": "true",
+            "TINYAGENT_MODEL_PROMPT_CACHE_KEY": "thread-123",
             "TINYAGENT_MODEL_REASONING_JSON": '{"effort":"medium"}',
             "TINYAGENT_MODEL_EXTRA_BODY_JSON": '{"temperature":0}',
         }
@@ -701,6 +1111,8 @@ def test_openai_responses_config_reads_environment() -> None:
     assert config.timeout_seconds == 12
     assert config.context_window == 64_000
     assert config.max_output_tokens == 4_000
+    assert config.parallel_tool_calls is True
+    assert config.prompt_cache_key == "thread-123"
     assert config.reasoning == {"effort": "medium"}
     assert config.extra_body == {"temperature": 0}
 
@@ -708,6 +1120,8 @@ def test_openai_responses_config_reads_environment() -> None:
 def test_openai_responses_provider_sends_responses_payload_and_parses_tool_calls() -> None:
     provider = RecordingResponsesProvider(
         {
+            "id": "resp_123",
+            "conversation": {"id": "conv_123"},
             "status": "completed",
             "output": [
                 {
@@ -731,7 +1145,7 @@ def test_openai_responses_provider_sends_responses_payload_and_parses_tool_calls
             Message(role="user", content="use the sample tool"),
         ],
         [SampleTool()],
-        _state_stub(),
+        _request_stub(),
     )
 
     assert provider.payloads == [
@@ -740,6 +1154,7 @@ def test_openai_responses_provider_sends_responses_payload_and_parses_tool_calls
             "instructions": "system instructions",
             "input": [{"role": "user", "content": "use the sample tool"}],
             "store": False,
+            "prompt_cache_key": "run_test",
             "max_output_tokens": 8000,
             "tools": [
                 {
@@ -750,14 +1165,148 @@ def test_openai_responses_provider_sends_responses_payload_and_parses_tool_calls
                     "strict": False,
                 }
             ],
-            "parallel_tool_calls": False,
+            "parallel_tool_calls": True,
         }
     ]
     assert response.content == "Working."
     assert response.finish_reason == "tool_calls"
     assert response.tool_calls == (ToolCall(id="call_1", name="sample_tool", args={"value": "done"}),)
-    assert provider.capabilities.tool_protocol == "responses"
+    assert provider.capabilities.protocol == "openai_responses"
+    assert provider.capabilities.tool_result_mode == "responses_items"
     assert provider.model_spec.to_json_dict()["adapter"] == "tinyagent.openai_responses.v1"
+
+
+def test_openai_responses_provider_sends_cache_key_and_configured_parallel_tool_calls() -> None:
+    provider = RecordingResponsesProvider(
+        {
+            "id": "resp_123",
+            "conversation": {"id": "conv_123"},
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Done."}],
+                }
+            ],
+        },
+        config=OpenAIResponsesConfig(
+            base_url="https://models.example.test/v1",
+            api_key="test-key",
+            model="test-model",
+            parallel_tool_calls=True,
+            prompt_cache_key="thread-abc",
+        ),
+    )
+
+    response = provider.complete([Message(role="user", content="use the sample tool")], [SampleTool()], _request_stub())
+
+    assert response.content == "Done."
+    assert provider.capabilities.supports_parallel_tool_calls is True
+    assert provider.capabilities.supports_prompt_cache_key is True
+    assert provider.payloads[0]["prompt_cache_key"] == "thread-abc"
+    assert provider.payloads[0]["parallel_tool_calls"] is True
+    assert response.conversation_state is not None
+    assert response.conversation_state.to_json_dict() == {
+        "adapter": "tinyagent.openai_responses.v1",
+        "conversation_id": "conv_123",
+        "mode": "stateless_replay",
+        "prompt_cache_key": "thread-abc",
+        "provider": "openai-responses",
+        "response_id": "resp_123",
+    }
+
+
+def test_openai_responses_provider_sends_native_tool_history_without_duplicate_recent_text() -> None:
+    provider = OpenAIResponsesProvider(
+        OpenAIResponsesConfig(
+            base_url="https://models.example.test/v1",
+            api_key="test-key",
+            model="test-model",
+        )
+    )
+    state = _state_stub()
+    state.tool_steps.append(
+        ToolStep(
+            call=ToolCall(id="call_read", name="read_file", args={"path": "hello.txt"}),
+            result=ToolResult(
+                tool_name="read_file",
+                call_id="call_read",
+                output="hello.txt\n1: hello",
+                ok=True,
+                summary="Read hello.txt",
+                data={
+                    "path": "hello.txt",
+                    "start_line": 1,
+                    "line_count": 1,
+                    "total_lines": 1,
+                    "complete_file": True,
+                    "shown_line_start": 1,
+                    "shown_line_end": 1,
+                    "output_tokens": 5,
+                },
+            ),
+        )
+    )
+
+    payload = provider.build_payload(
+        [
+            Message(role="system", content="system instructions"),
+            Message(role="user", content="task"),
+            Message(
+                role="user",
+                content="Recent tool results:\nSHOULD_NOT_BE_SENT",
+                meta={"context_layer": "recent_tool_steps"},
+            ),
+        ],
+        [SampleTool()],
+        _request_stub(state),
+    )
+
+    assert payload["instructions"] == "system instructions"
+    assert {"role": "user", "content": "Recent tool results:\nSHOULD_NOT_BE_SENT"} not in payload["input"]
+    assert payload["input"][-2] == {
+        "type": "function_call",
+        "id": "call_read",
+        "call_id": "call_read",
+        "name": "read_file",
+        "arguments": '{"path": "hello.txt"}',
+        "status": "completed",
+    }
+    assert payload["input"][-1]["type"] == "function_call_output"
+    assert payload["input"][-1]["call_id"] == "call_read"
+    assert '"complete_file": true' in payload["input"][-1]["output"]
+    assert "hello.txt\n1: hello" in payload["input"][-1]["output"]
+
+
+def test_openai_responses_provider_marks_failed_native_tool_outputs_incomplete() -> None:
+    provider = OpenAIResponsesProvider(
+        OpenAIResponsesConfig(
+            base_url="https://models.example.test/v1",
+            api_key="test-key",
+            model="test-model",
+        )
+    )
+    state = _state_stub()
+    state.tool_steps.append(
+        ToolStep(
+            call=ToolCall(id="call_shell", name="shell", args={"cmd": "false"}),
+            result=ToolResult(
+                tool_name="shell",
+                call_id="call_shell",
+                output="exit 1",
+                ok=False,
+                summary="command failed",
+                failure_kind="command_failed",
+            ),
+        )
+    )
+
+    payload = provider.build_payload([Message(role="user", content="continue")], [SampleTool()], _request_stub(state))
+
+    assert payload["input"][-1]["type"] == "function_call_output"
+    assert payload["input"][-1]["status"] == "incomplete"
+    assert "Failure kind: command_failed" in payload["input"][-1]["output"]
 
 
 def test_openai_responses_provider_streams_text_tool_args_and_usage() -> None:
@@ -816,7 +1365,7 @@ def test_openai_responses_provider_streams_text_tool_args_and_usage() -> None:
 
     response = assemble_model_deltas(
         provider.name,
-        provider.stream([Message(role="user", content="use tool")], [SampleTool()], _state_stub()),
+        provider.stream([Message(role="user", content="use tool")], [SampleTool()], _request_stub()),
     )
 
     assert provider.payloads == [
@@ -825,6 +1374,7 @@ def test_openai_responses_provider_streams_text_tool_args_and_usage() -> None:
             "instructions": "",
             "input": [{"role": "user", "content": "use tool"}],
             "store": False,
+            "prompt_cache_key": "run_test",
             "max_output_tokens": 8000,
             "tools": [
                 {
@@ -835,7 +1385,7 @@ def test_openai_responses_provider_streams_text_tool_args_and_usage() -> None:
                     "strict": False,
                 }
             ],
-            "parallel_tool_calls": False,
+            "parallel_tool_calls": True,
             "stream": True,
         }
     ]
@@ -866,6 +1416,87 @@ def test_openai_responses_stream_parser_maps_reasoning_summary_delta() -> None:
     ]
 
 
+def test_open_responses_provider_sends_partial_stateless_payload() -> None:
+    provider = RecordingOpenResponsesProvider(
+        {
+            "id": "resp_open_123",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_open",
+                    "name": "sample_tool",
+                    "arguments": json.dumps({"value": "done"}),
+                }
+            ],
+        }
+    )
+
+    response = provider.complete(
+        [Message(role="system", content="system instructions"), Message(role="user", content="use the tool")],
+        [SampleTool()],
+        _request_stub(),
+    )
+
+    assert provider.payloads == [
+        {
+            "model": "test-model",
+            "instructions": "system instructions",
+            "input": [{"role": "user", "content": "use the tool"}],
+            "max_output_tokens": 8000,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "sample_tool",
+                    "description": "Sample tool.",
+                    "parameters": SampleTool.schema["parameters"],
+                    "strict": False,
+                }
+            ],
+            "parallel_tool_calls": True,
+        }
+    ]
+    assert "store" not in provider.payloads[0]
+    assert "prompt_cache_key" not in provider.payloads[0]
+    assert "reasoning" not in provider.payloads[0]
+    assert response.tool_calls == (ToolCall(id="call_open", name="sample_tool", args={"value": "done"}),)
+    assert response.conversation_state is not None
+    assert response.conversation_state.to_json_dict() == {
+        "adapter": "tinyagent.open_responses.v1",
+        "mode": "stateless_replay",
+        "provider": "open-responses",
+        "response_id": "resp_open_123",
+    }
+    assert provider.capabilities.protocol == "open_responses"
+    assert provider.capabilities.tool_result_mode == "responses_items"
+    assert provider.capabilities.supports_prompt_cache_key is False
+    assert provider.capabilities.supports_stateful_responses is False
+    assert provider.capabilities.supports_reasoning is False
+
+
+def test_open_responses_config_requires_base_url_and_rejects_stateful_fields() -> None:
+    with pytest.raises(ProviderError, match="TINYAGENT_MODEL_BASE_URL is required"):
+        OpenAIResponsesConfig.open_responses_from_env({"TINYAGENT_MODEL_NAME": "model"})
+
+    with pytest.raises(ProviderError, match="stateless by default"):
+        OpenAIResponsesConfig.open_responses_from_env(
+            {
+                "TINYAGENT_MODEL_BASE_URL": "http://127.0.0.1:11434/v1",
+                "TINYAGENT_MODEL_NAME": "model",
+                "TINYAGENT_MODEL_EXTRA_BODY_JSON": '{"previous_response_id":"resp_1"}',
+            }
+        )
+
+    with pytest.raises(ProviderError, match="REASONING_JSON is not supported"):
+        OpenAIResponsesConfig.open_responses_from_env(
+            {
+                "TINYAGENT_MODEL_BASE_URL": "http://127.0.0.1:11434/v1",
+                "TINYAGENT_MODEL_NAME": "model",
+                "TINYAGENT_MODEL_REASONING_JSON": '{"effort":"low"}',
+            }
+        )
+
+
 def test_openai_codex_provider_uses_responses_transport_with_codex_auth() -> None:
     provider = OpenAIResponsesProvider.codex_from_env(
         {
@@ -879,16 +1510,17 @@ def test_openai_codex_provider_uses_responses_transport_with_codex_auth() -> Non
     assert provider.config.base_url == "https://chatgpt.com/backend-api/codex"
     assert provider.config.api_key == "codex-token"
     assert provider.config.send_max_output_tokens is False
-    assert provider.model_spec.protocol == "responses"
-    assert provider.build_payload([Message(role="user", content="hello")], [], _state_stub()) == {
+    assert provider.model_spec.protocol == "openai_responses"
+    assert provider.build_payload([Message(role="user", content="hello")], [], _request_stub()) == {
         "model": "gpt-5.5-codex",
         "instructions": "",
         "input": [{"role": "user", "content": "hello"}],
         "store": False,
+        "prompt_cache_key": "run_test",
     }
 
 
-def test_provider_registry_creates_responses_and_codex_providers() -> None:
+def test_provider_registry_creates_responses_codex_open_responses_and_gemini_providers() -> None:
     responses = provider_for(
         ProviderSpec(kind="openai-responses", model="gpt-test"),
         "task",
@@ -899,9 +1531,23 @@ def test_provider_registry_creates_responses_and_codex_providers() -> None:
         "task",
         env={"TINYAGENT_CODEX_BEARER_TOKEN": "token"},
     )
+    open_responses = provider_for(
+        ProviderSpec(kind="open-responses", model="local-responses-test"),
+        "task",
+        env={"TINYAGENT_MODEL_BASE_URL": "http://127.0.0.1:11434/v1"},
+    )
+    gemini = provider_for(
+        ProviderSpec(kind="gemini", model="gemini-test"),
+        "task",
+        env={"TINYAGENT_MODEL_API_KEY": "key"},
+    )
 
     assert responses.name == "openai-responses"
     assert codex.name == "openai-codex"
+    assert open_responses.name == "open-responses"
+    assert open_responses.model_spec.protocol == "open_responses"
+    assert gemini.name == "gemini"
+    assert gemini.model_spec.protocol == "gemini_generate_content"
 
 
 def test_kernel_surfaces_provider_errors_as_run_failures(tmp_path) -> None:
@@ -919,5 +1565,9 @@ def test_kernel_surfaces_provider_errors_as_run_failures(tmp_path) -> None:
     assert [event.type for event in state.events][-1] == "run.failed"
 
 
-def _state_stub() -> RunState:
-    return RunState.create("test", workspace=Workspace(Path(".")))
+def _state_stub(run_id: str = "run_test") -> RunState:
+    return RunState.create("test", workspace=Workspace(Path(".")), run_id=run_id)
+
+
+def _request_stub(state: RunState | None = None, run_id: str = "run_test") -> ModelRequestContext:
+    return ModelRequestContext.from_run_state(state or _state_stub(run_id))

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from tinyagent.core.contracts import ToolRuntime
 from tinyagent.core.state import RunState, ToolCall, ToolResult
 from tinyagent.core.tools.core import ToolError, error_result, resolve_workspace_path, visible_output
 from tinyagent.extensions.lsp.manager import LspManager
@@ -10,6 +11,7 @@ from tinyagent.extensions.lsp.types import LspDiagnostic, LspLocation, LspSymbol
 
 class LspSymbolsTool:
     name = "lsp_symbols"
+    runtime = ToolRuntime(lock_key="lsp")
     schema = {
         "name": "lsp_symbols",
         "description": "List symbols from a file or workspace using an optional language server.",
@@ -57,6 +59,7 @@ class LspSymbolsTool:
 
 class LspDefinitionTool:
     name = "lsp_definition"
+    runtime = ToolRuntime(lock_key="lsp")
     schema = {
         "name": "lsp_definition",
         "description": "Find definition at path, line, and column using an optional language server.",
@@ -80,6 +83,7 @@ class LspDefinitionTool:
 
 class LspReferencesTool:
     name = "lsp_references"
+    runtime = ToolRuntime(lock_key="lsp")
     schema = {
         "name": "lsp_references",
         "description": "Find references at path, line, and column using an optional language server.",
@@ -104,6 +108,7 @@ class LspReferencesTool:
 
 class LspDiagnosticsTool:
     name = "lsp_diagnostics"
+    runtime = ToolRuntime(lock_key="lsp")
     schema = {
         "name": "lsp_diagnostics",
         "description": "Return current diagnostics for a file or workspace using an optional language server.",

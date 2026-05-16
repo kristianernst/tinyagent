@@ -15,13 +15,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from tinyagent.core.artifacts import tool_result_artifact_refs
 from tinyagent.core.contracts import Tool
+from tinyagent.core.events import small_event_data
 from tinyagent.core.model_stream import ModelDelta, ProviderStreamEvent
-from tinyagent.core.models import ModelCapabilities, ModelSpec, ProviderError
-from tinyagent.core.state import Message, ModelResponse, RunState, ToolCall
+from tinyagent.core.models import ModelCapabilities, ModelProtocol, ModelSpec, ProviderError
+from tinyagent.core.state import Message, ModelConversationState, ModelRequestContext, ModelResponse, ToolCall, ToolResult, ToolStep
 
 DEFAULT_OPENAI_RESPONSES_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_CODEX_RESPONSES_BASE_URL = "https://chatgpt.com/backend-api/codex"
+MAX_NATIVE_TOOL_HISTORY_ITEMS = 24
 
 
 @dataclass(frozen=True)
@@ -33,8 +36,18 @@ class OpenAIResponsesConfig:
     context_window: int = 128_000
     max_output_tokens: int = 8_000
     send_max_output_tokens: bool = True
+    parallel_tool_calls: bool = True
+    prompt_cache_key: str | None = None
     reasoning: dict[str, Any] | None = None
     extra_body: dict[str, Any] = field(default_factory=dict)
+    protocol: ModelProtocol = "openai_responses"
+    send_store: bool = True
+    send_prompt_cache_key: bool = True
+    supports_prompt_cache_key: bool = True
+    supports_reasoning: bool = True
+    supports_stateful_responses: bool = False
+    supports_conversation_resource: bool = False
+    supports_reasoning_replay: bool = False
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> OpenAIResponsesConfig:
@@ -72,6 +85,38 @@ class OpenAIResponsesConfig:
             send_max_output_tokens=False,
         )
 
+    @classmethod
+    def open_responses_from_env(cls, env: Mapping[str, str] | None = None) -> OpenAIResponsesConfig:
+        values = os.environ if env is None else env
+        base_url = values.get("TINYAGENT_MODEL_BASE_URL")
+        model = values.get("TINYAGENT_MODEL_NAME")
+        if not base_url:
+            raise ProviderError("TINYAGENT_MODEL_BASE_URL is required for open-responses provider.")
+        if not model:
+            raise ProviderError("TINYAGENT_MODEL_NAME is required for open-responses provider.")
+        shared = _shared_config_from_env(values)
+        if shared["reasoning"] is not None:
+            raise ProviderError("TINYAGENT_MODEL_REASONING_JSON is not supported by open-responses provider.")
+        unsupported_keys = sorted(
+            key for key in shared["extra_body"] if key in {"conversation", "previous_response_id", "reasoning"}
+        )
+        if unsupported_keys:
+            raise ProviderError(
+                "open-responses provider is stateless by default and cannot use unsupported fields: "
+                + ", ".join(unsupported_keys)
+            )
+        return cls(
+            base_url=base_url,
+            api_key=values.get("TINYAGENT_MODEL_API_KEY", ""),
+            model=model,
+            **shared,
+            protocol="open_responses",
+            send_store=False,
+            send_prompt_cache_key=False,
+            supports_prompt_cache_key=False,
+            supports_reasoning=False,
+        )
+
 
 class OpenAIResponsesProvider:
     name = "openai-responses"
@@ -92,14 +137,19 @@ class OpenAIResponsesProvider:
             context_window=config.context_window,
             max_output_tokens=config.max_output_tokens,
             supports_tools=True,
-            supports_parallel_tools=False,
-            supports_reasoning=True,
-            tool_protocol="responses",
+            supports_parallel_tool_calls=config.parallel_tool_calls,
+            supports_reasoning=config.supports_reasoning,
+            supports_prompt_cache_key=config.supports_prompt_cache_key,
+            supports_stateful_responses=config.supports_stateful_responses,
+            supports_conversation_resource=config.supports_conversation_resource,
+            supports_reasoning_replay=config.supports_reasoning_replay,
+            protocol=config.protocol,
+            tool_result_mode="responses_items",
         )
         self.model_spec = ModelSpec(
             provider=self.name,
             model=config.model,
-            protocol="responses",
+            protocol=self.capabilities.protocol,
             adapter=self.adapter,
             capabilities=self.capabilities,
         )
@@ -116,22 +166,30 @@ class OpenAIResponsesProvider:
             adapter="tinyagent.openai_codex_responses.v1",
         )
 
-    def complete(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState) -> ModelResponse:
-        payload = self.build_payload(messages, tools, state)
-        raw = self._post(payload)
-        return parse_response(raw)
+    @classmethod
+    def open_responses_from_env(cls, env: Mapping[str, str] | None = None) -> OpenAIResponsesProvider:
+        return cls(
+            OpenAIResponsesConfig.open_responses_from_env(env),
+            name="open-responses",
+            adapter="tinyagent.open_responses.v1",
+        )
 
-    def stream(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState) -> Iterator[ModelDelta]:
-        for event in self.stream_provider_events(messages, tools, state):
+    def complete(self, messages: Sequence[Message], tools: Sequence[Tool], request: ModelRequestContext) -> ModelResponse:
+        payload = self.build_payload(messages, tools, request)
+        raw = self._post(payload)
+        return parse_response(raw, conversation_state=self._conversation_state(raw, request))
+
+    def stream(self, messages: Sequence[Message], tools: Sequence[Tool], request: ModelRequestContext) -> Iterator[ModelDelta]:
+        for event in self.stream_provider_events(messages, tools, request):
             yield from parse_response_stream_event(event.raw)
 
     def stream_provider_events(
         self,
         messages: Sequence[Message],
         tools: Sequence[Tool],
-        state: RunState,
+        request: ModelRequestContext,
     ) -> Iterator[ProviderStreamEvent]:
-        payload = self.build_stream_payload(messages, tools, state)
+        payload = self.build_stream_payload(messages, tools, request)
         for raw in self._post_stream(payload):
             yield ProviderStreamEvent(
                 provider=self.name,
@@ -139,39 +197,45 @@ class OpenAIResponsesProvider:
                 raw=raw,
             )
 
-    def build_payload(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState) -> dict[str, Any]:
-        del state
-        instructions, input_items = _responses_input(messages)
+    def build_payload(self, messages: Sequence[Message], tools: Sequence[Tool], request: ModelRequestContext) -> dict[str, Any]:
+        native_tool_history = _responses_native_tool_history(request)
+        instructions, input_items = _responses_input(messages, include_recent_tool_text=not bool(native_tool_history))
+        input_items.extend(native_tool_history)
         payload: dict[str, Any] = {
             "model": self.config.model,
             "instructions": instructions,
             "input": input_items,
-            "store": False,
         }
+        if self.config.send_store:
+            payload["store"] = False
+        if self.config.send_prompt_cache_key:
+            payload["prompt_cache_key"] = self._prompt_cache_key(request)
         if self.config.send_max_output_tokens:
             payload["max_output_tokens"] = self.config.max_output_tokens
         if tools:
             payload["tools"] = [_responses_tool_payload(tool) for tool in tools]
-            payload["parallel_tool_calls"] = False
-        if self.config.reasoning is not None:
+            payload["parallel_tool_calls"] = self.config.parallel_tool_calls
+        if self.config.supports_reasoning and self.config.reasoning is not None:
             payload["reasoning"] = self.config.reasoning
         payload.update(self.config.extra_body)
         return payload
 
-    def build_stream_payload(self, messages: Sequence[Message], tools: Sequence[Tool], state: RunState) -> dict[str, Any]:
-        payload = self.build_payload(messages, tools, state)
+    def build_stream_payload(self, messages: Sequence[Message], tools: Sequence[Tool], request: ModelRequestContext) -> dict[str, Any]:
+        payload = self.build_payload(messages, tools, request)
         payload["stream"] = True
         return payload
 
     def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
         body = json.dumps(payload).encode()
+        headers = {
+            "Content-Type": "application/json",
+        }
+        if self.config.api_key:
+            headers["Authorization"] = f"Bearer {self.config.api_key}"
         request = urllib.request.Request(
             _responses_url(self.config.base_url),
             data=body,
-            headers={
-                "Authorization": f"Bearer {self.config.api_key}",
-                "Content-Type": "application/json",
-            },
+            headers=headers,
             method="POST",
         )
         try:
@@ -189,14 +253,16 @@ class OpenAIResponsesProvider:
 
     def _post_stream(self, payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
         body = json.dumps(payload).encode()
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+        if self.config.api_key:
+            headers["Authorization"] = f"Bearer {self.config.api_key}"
         request = urllib.request.Request(
             _responses_url(self.config.base_url),
             data=body,
-            headers={
-                "Authorization": f"Bearer {self.config.api_key}",
-                "Content-Type": "application/json",
-                "Accept": "text/event-stream",
-            },
+            headers=headers,
             method="POST",
         )
         try:
@@ -220,8 +286,21 @@ class OpenAIResponsesProvider:
         except TimeoutError as exc:
             raise ProviderError(f"Model provider stream idle timeout: {exc}") from exc
 
+    def _prompt_cache_key(self, request: ModelRequestContext) -> str:
+        return self.config.prompt_cache_key or request.run_id
 
-def parse_response(raw: dict[str, Any]) -> ModelResponse:
+    def _conversation_state(self, raw: Mapping[str, Any], request: ModelRequestContext) -> ModelConversationState:
+        return ModelConversationState(
+            provider=self.name,
+            adapter=self.adapter,
+            mode="stateless_replay",
+            response_id=_string_or_none(raw.get("id")),
+            conversation_id=_conversation_id(raw.get("conversation")),
+            prompt_cache_key=self._prompt_cache_key(request) if self.config.send_prompt_cache_key else None,
+        )
+
+
+def parse_response(raw: dict[str, Any], *, conversation_state: ModelConversationState | None = None) -> ModelResponse:
     output = raw.get("output")
     if not isinstance(output, list):
         raise _provider_error("Model provider response did not include an output list.")
@@ -247,6 +326,7 @@ def parse_response(raw: dict[str, Any]) -> ModelResponse:
         tool_calls=tuple(tool_calls),
         finish_reason="tool_calls" if tool_calls else _response_finish_reason(raw),
         raw=raw,
+        conversation_state=conversation_state,
     )
 
 
@@ -327,10 +407,12 @@ def _responses_url(base_url: str) -> str:
     return f"{base}/responses"
 
 
-def _responses_input(messages: Sequence[Message]) -> tuple[str, list[dict[str, Any]]]:
+def _responses_input(messages: Sequence[Message], *, include_recent_tool_text: bool = True) -> tuple[str, list[dict[str, Any]]]:
     instructions: list[str] = []
     input_items: list[dict[str, Any]] = []
     for message in messages:
+        if not include_recent_tool_text and message.meta.get("context_layer") == "recent_tool_steps":
+            continue
         content = _string_content(message.content)
         if message.role == "system":
             if content:
@@ -339,6 +421,66 @@ def _responses_input(messages: Sequence[Message]) -> tuple[str, list[dict[str, A
         role = message.role if message.role in {"developer", "user", "assistant"} else "user"
         input_items.append({"role": role, "content": content})
     return "\n\n".join(instructions), input_items
+
+
+def _responses_native_tool_history(request: ModelRequestContext) -> list[dict[str, Any]]:
+    steps = request.tool_steps_since_checkpoint()
+    if not steps:
+        return []
+    items: list[dict[str, Any]] = []
+    for step in steps[-MAX_NATIVE_TOOL_HISTORY_ITEMS:]:
+        args = json.dumps(step.call.args, sort_keys=True, ensure_ascii=False)
+        items.append(
+            {
+                "type": "function_call",
+                "id": step.call.id,
+                "call_id": step.call.id,
+                "name": step.call.name,
+                "arguments": args,
+                "status": "completed",
+            }
+        )
+        items.append(
+            {
+                "type": "function_call_output",
+                "call_id": step.call.id,
+                "output": _responses_tool_output_text(step),
+                "status": "completed" if step.result.ok else "incomplete",
+            }
+        )
+    return items
+
+
+def _responses_tool_output_text(step: ToolStep) -> str:
+    result = step.result
+    lines = [
+        f"Tool: {step.call.name}",
+        f"Call ID: {step.call.id}",
+        f"Args: {json.dumps(step.call.args, sort_keys=True, ensure_ascii=False)}",
+        f"OK: {str(result.ok).lower()}",
+    ]
+    if result.summary:
+        lines.append(f"Summary: {result.summary}")
+    if result.failure_kind or result.data.get("failure_kind"):
+        lines.append(f"Failure kind: {result.failure_kind or result.data.get('failure_kind')}")
+    artifacts = [ref for ref in tool_result_artifact_refs(result) if ref.startswith("context/")]
+    if artifacts:
+        lines.append("Artifacts:")
+        lines.extend(f"- contextfs:{artifact}" for artifact in artifacts)
+        lines.append("Suggested read:")
+        lines.extend(f'- context_read({{"ref":"contextfs:{artifact}"}})' for artifact in artifacts)
+    data = _responses_tool_data(result)
+    if data:
+        lines.append(f"Data: {json.dumps(data, sort_keys=True, ensure_ascii=False)}")
+    lines.extend(["Output:", result.content_preview or result.output])
+    return "\n".join(lines)
+
+
+def _responses_tool_data(result: ToolResult) -> dict[str, Any]:
+    data = dict(result.data)
+    if result.truncated:
+        data["truncated"] = True
+    return small_event_data(data)
 
 
 def _responses_tool_payload(tool: Tool) -> dict[str, Any]:
@@ -451,9 +593,31 @@ def _shared_config_from_env(values: Mapping[str, str]) -> dict[str, Any]:
         "timeout_seconds": timeout_seconds,
         "context_window": context_window,
         "max_output_tokens": max_output_tokens,
+        "parallel_tool_calls": _bool_from_env(values, "TINYAGENT_MODEL_PARALLEL_TOOL_CALLS", default=True),
+        "prompt_cache_key": _optional_str_from_env(values, "TINYAGENT_MODEL_PROMPT_CACHE_KEY"),
         "reasoning": _reasoning_from_env(values),
         "extra_body": _extra_body_from_env(values),
     }
+
+
+def _bool_from_env(values: Mapping[str, str], name: str, *, default: bool) -> bool:
+    raw = values.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ProviderError(f"{name} must be true or false.")
+
+
+def _optional_str_from_env(values: Mapping[str, str], name: str) -> str | None:
+    raw = values.get(name)
+    if raw is None:
+        return None
+    stripped = raw.strip()
+    return stripped or None
 
 
 def _extra_body_from_env(values: Mapping[str, str]) -> dict[str, Any]:
@@ -466,7 +630,19 @@ def _extra_body_from_env(values: Mapping[str, str]) -> dict[str, Any]:
         raise ProviderError(f"TINYAGENT_MODEL_EXTRA_BODY_JSON must be valid JSON: {exc}") from exc
     if not isinstance(parsed, dict):
         raise ProviderError("TINYAGENT_MODEL_EXTRA_BODY_JSON must be a JSON object.")
-    protected = {"input", "instructions", "messages", "model", "stream", "store", "tools"}
+    protected = {
+        "input",
+        "instructions",
+        "max_output_tokens",
+        "messages",
+        "model",
+        "parallel_tool_calls",
+        "prompt_cache_key",
+        "reasoning",
+        "stream",
+        "store",
+        "tools",
+    }
     blocked = sorted(key for key in parsed if key in protected)
     if blocked:
         raise ProviderError(f"TINYAGENT_MODEL_EXTRA_BODY_JSON cannot override protected keys: {', '.join(blocked)}")
@@ -523,7 +699,7 @@ def _codex_token_from_command(command: str, values: Mapping[str, str]) -> str:
     token = result.stdout.strip()
     if not token:
         raise ProviderError("Codex auth command did not print a bearer token.")
-    if any(char.isspace() for char in token):
+    if any(ch.isspace() for ch in token):
         raise ProviderError("Codex auth command must print only the bearer token.")
     return token
 
@@ -588,6 +764,14 @@ def _string_content(content: Any) -> str:
 
 def _string_or_none(value: Any) -> str | None:
     return value if isinstance(value, str) else None
+
+
+def _conversation_id(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Mapping):
+        return _string_or_none(value.get("id"))
+    return None
 
 
 def _provider_error(message: str):

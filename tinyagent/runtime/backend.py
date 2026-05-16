@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Protocol
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
-from typing import Protocol
 
 from tinyagent.core.events import Event
 from tinyagent.runtime.protocol_v1 import run_object
@@ -24,6 +24,7 @@ class RunRequest:
     turn_id: str | None = None
     parent_turn_id: str | None = None
     approval_mode: str | None = None
+    approvals_reviewer: str | None = None
     profile: str | None = None
 
 
@@ -84,6 +85,7 @@ class LocalRunBackend:
                 turn_id=request.turn_id,
                 parent_turn_id=request.parent_turn_id,
                 approval_mode=request.approval_mode,
+                approvals_reviewer=request.approvals_reviewer,
                 profile=request.profile,
             )
         else:
@@ -91,6 +93,7 @@ class LocalRunBackend:
                 request.task,
                 run_id=request.run_id,
                 approval_mode=request.approval_mode,
+                approvals_reviewer=request.approvals_reviewer,
                 profile=request.profile,
             )
         run_id = str(payload["run_id"])
@@ -157,6 +160,7 @@ class HTTPRunBackend:
             "turn_id": request.turn_id,
             "parent_turn_id": request.parent_turn_id,
             "approval_mode": request.approval_mode,
+            "approvals_reviewer": request.approvals_reviewer,
             "profile": request.profile,
         }
         payload = self._json("POST", "/v1/runs", {key: value for key, value in body.items() if value is not None})

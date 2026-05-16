@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any, Literal, Protocol, TextIO
 from uuid import uuid4
 
+from tinyagent.core.token_utils import clip_text_to_token_budget, estimate_tokens
+
 EventVisibility = Literal["internal", "debug", "user", "public"]
 EventDurability = Literal["ephemeral", "event_log", "artifact_only"]
 
@@ -83,6 +85,8 @@ DURABLE_EVENT_TYPES = frozenset(
         "model.usage",
         "observation.recorded",
         "policy.evaluated",
+        "auto_review.started",
+        "auto_review.completed",
         "approval.requested",
         "approval.resolved",
         "approval.expired",
@@ -200,6 +204,8 @@ EVENT_DEBUG_LEVELS = {
     "compaction.started": 2,
     "checkpoint.completed": 2,
     "policy.evaluated": 2,
+    "auto_review.started": 1,
+    "auto_review.completed": 1,
     "approval.requested": 1,
     "approval.resolved": 1,
     "approval.expired": 1,
@@ -240,7 +246,7 @@ VISIBILITY_DEBUG_LEVELS = {
     "debug": 1,
     "internal": 4,
 }
-MAX_EVENT_DATA_CHARS = 4_000
+MAX_EVENT_DATA_TOKENS = 1_000
 
 
 def utc_now() -> datetime:
@@ -285,12 +291,12 @@ def json_safe(value: Any) -> Any:
 def small_event_data(data: dict[str, Any]) -> dict[str, Any]:
     safe = json_safe(data)
     encoded = json.dumps(safe, sort_keys=True)
-    if len(encoded) <= MAX_EVENT_DATA_CHARS:
+    if estimate_tokens(encoded) <= MAX_EVENT_DATA_TOKENS:
         return safe
     return {
         "_truncated": True,
-        "json_chars": len(encoded),
-        "preview": encoded[:MAX_EVENT_DATA_CHARS],
+        "json_tokens": estimate_tokens(encoded),
+        "preview": clip_text_to_token_budget(encoded, MAX_EVENT_DATA_TOKENS),
     }
 
 
@@ -441,8 +447,8 @@ def _tool_status_summary(event: Event) -> str:
     tool = str(event.data.get("tool") or "tool")
     match event.type:
         case "tool.execution.completed":
-            output_chars = event.data.get("output_chars")
-            suffix = f", {output_chars} chars" if isinstance(output_chars, int) else ""
+            output_tokens = event.data.get("output_tokens")
+            suffix = f", {output_tokens} tokens" if isinstance(output_tokens, int) else ""
             return f"[ok] {tool} completed{suffix}"
         case "tool.execution.failed":
             return f"[fail] {tool}: {_event_text(event)}"

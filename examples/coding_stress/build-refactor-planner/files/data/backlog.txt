@@ -1,0 +1,7 @@
+# key | title | owner= | status= | points= | priority= | depends= | tags=
+FF-100 | Set up release API | owner=ana | status=done | points=3 | priority=1 | tags=api
+FF-101 | Build ingestion queue | owner=bo | status=todo | points=5 | priority=2 | depends=FF-100 | tags=backend,data
+FF-102 | Wire dashboard cards | owner=cy | status=todo | points=3 | priority=1 | depends=FF-101 | tags=frontend
+FF-103 | Fix billing retry | owner=ana | status=doing | points=2 | priority=0 | tags=billing
+FF-104 | Partner import blocked | owner=bo | status=blocked | points=8 | priority=0 | depends=EXT-9 | tags=partners
+FF-105 | Polish empty states | owner=cy | status=todo | points=2 | priority=3 | tags=frontend,ux

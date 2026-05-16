@@ -13,6 +13,7 @@ V1_RUN_START_KEYS = frozenset(
         "task",
         "run_id",
         "approval_mode",
+        "approvals_reviewer",
         "profile",
         "conversation_id",
         "turn_id",
@@ -63,6 +64,7 @@ def run_object(summary: dict[str, Any], *, workspace_id: str | None = None) -> d
         "profile": summary.get("profile") or "",
         "workspace_mode": summary.get("workspace_mode") or "",
         "approval_mode": summary.get("approval_mode") or "",
+        "approvals_reviewer": summary.get("approvals_reviewer") or "",
         "sandbox_mode": summary.get("sandbox_mode") or "",
         "event_count": summary.get("event_count") or 0,
         "artifact_count": summary.get("artifact_count") or 0,
@@ -122,7 +124,14 @@ def openapi_spec() -> dict[str, Any]:
                     "summary": "Fetch public run artifact",
                     "parameters": [_path_param("run_id"), _path_param("path"), _workspace_param(required=False)],
                     "responses": {
-                        "200": {"description": "Artifact bytes", "content": {"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}}},
+                        "200": {
+                            "description": "Artifact bytes",
+                            "content": {
+                                "application/octet-stream": {
+                                    "schema": {"type": "string", "format": "binary"},
+                                },
+                            },
+                        },
                         **_error_responses(),
                     },
                 }
@@ -151,8 +160,21 @@ def openapi_spec() -> dict[str, Any]:
         },
         "components": {
             "schemas": {
-                "Health": _object({"healthy": {"type": "boolean"}, "version": {"type": "string"}, "schema_version": {"type": "integer"}}),
-                "Workspace": _object({"workspace_id": {"type": "string"}, "id": {"type": "string"}, "root": {"type": "string"}, "name": {"type": "string"}}),
+                "Health": _object(
+                    {
+                        "healthy": {"type": "boolean"},
+                        "version": {"type": "string"},
+                        "schema_version": {"type": "integer"},
+                    }
+                ),
+                "Workspace": _object(
+                    {
+                        "workspace_id": {"type": "string"},
+                        "id": {"type": "string"},
+                        "root": {"type": "string"},
+                        "name": {"type": "string"},
+                    }
+                ),
                 "WorkspaceList": _object({"items": {"type": "array", "items": {"$ref": "#/components/schemas/Workspace"}}}),
                 "WorkspaceResponse": _object({"workspace": {"$ref": "#/components/schemas/Workspace"}}),
                 "Run": _object(
@@ -173,6 +195,7 @@ def openapi_spec() -> dict[str, Any]:
                         "profile": {"type": "string"},
                         "workspace_mode": {"type": "string"},
                         "approval_mode": {"type": "string"},
+                        "approvals_reviewer": {"type": "string"},
                         "sandbox_mode": {"type": "string"},
                         "event_count": {"type": "integer"},
                         "artifact_count": {"type": "integer"},
