@@ -211,10 +211,20 @@ def render_doctor(home: ProductHome, *, workspace: Path, provider: str, port: in
         ok = _check(lines, f"tool {tool}", shutil.which(tool) is not None) and ok
     ok = _check(lines, f"port {port}", _port_available(port)) and ok
 
-    if provider == "openai-compatible":
+    if provider in {"openai-compatible", "openai-responses"}:
         has_key = bool(os.environ.get("TINYAGENT_MODEL_API_KEY"))
         has_model = bool(os.environ.get("TINYAGENT_MODEL_NAME"))
         ok = _check(lines, "provider api key", has_key, "TINYAGENT_MODEL_API_KEY") and ok
+        ok = _check(lines, "provider model", has_model, "TINYAGENT_MODEL_NAME") and ok
+    elif provider == "openai-codex":
+        has_token_source = bool(
+            os.environ.get("TINYAGENT_CODEX_BEARER_TOKEN")
+            or os.environ.get("TINYAGENT_CODEX_AUTH_COMMAND")
+            or os.environ.get("TINYAGENT_CODEX_AUTH_FILE")
+            or (Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "auth.json").is_file()
+        )
+        has_model = bool(os.environ.get("TINYAGENT_CODEX_MODEL_NAME") or os.environ.get("TINYAGENT_MODEL_NAME"))
+        ok = _check(lines, "provider codex auth", has_token_source, "Codex bearer token source") and ok
         ok = _check(lines, "provider model", has_model, "TINYAGENT_MODEL_NAME") and ok
     else:
         lines.append(f"provider: ok ({provider})")

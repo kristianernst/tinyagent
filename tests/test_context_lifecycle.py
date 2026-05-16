@@ -33,6 +33,19 @@ class BuiltProfile(TinyProfile):
         return self.built_context
 
 
+class VisibleAwareProfile(TinyProfile):
+    def build_context(self, state: RunState, *, visible_tools=None) -> BuiltContext:
+        names = ",".join(tool.name for tool in visible_tools or ())
+        messages = [Message(role="user", content=f"{state.task}:{names}")]
+        return BuiltContext(
+            messages=messages,
+            token_estimate=estimate_messages_tokens(messages),
+            static_context_chars=sum(len(str(message.content)) for message in messages),
+            tool_context_chars=0,
+            project_instruction_chars=0,
+        )
+
+
 class TinyTool:
     name = "tiny"
     schema = {"name": "tiny", "parameters": {"type": "object", "properties": {}}}
@@ -83,6 +96,20 @@ def test_build_context_preserves_profile_built_context_and_adds_visible_tool_tok
     assert built.contextfs_index_path == "context/INDEX.md"
     assert built.token_estimate == 17 + estimate_tools_tokens([tool])
     assert state.context_token_estimate == built.token_estimate
+
+
+def test_build_context_passes_visible_tools_to_profile_context_builder(tmp_path) -> None:
+    state = RunState.create("visible", Workspace(tmp_path))
+    tool = TinyTool()
+
+    built = build_context(
+        state,
+        VisibleAwareProfile(),
+        [tool],
+        contextfs_enabled=False,
+    )
+
+    assert built.messages[0].content == "visible:tiny"
 
 
 def test_refresh_contextfs_respects_runtime_capability(tmp_path) -> None:

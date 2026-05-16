@@ -12,10 +12,9 @@ def test_record_tool_result_event_emits_snapshot_before_terminal_and_bounds_data
         call_id="call_1",
         output="abcdef",
         ok=False,
-        data={"output_artifact": "artifacts/tool.txt", "large": "x" * 5_000, "output_chars": 12},
-        artifact_path="artifacts/tool.txt",
+        data={"captured_output_artifact": "artifacts/captured.txt", "large": "x" * 5_000, "output_chars": 12},
         failure_kind="command_failed",
-        read_hints=["artifacts/tool.txt"],
+        read_hints=["artifacts/captured.txt"],
     )
 
     record_tool_result_event(state, call, result)
@@ -23,13 +22,13 @@ def test_record_tool_result_event_emits_snapshot_before_terminal_and_bounds_data
     snapshot, terminal = state.events
     assert snapshot.type == "tool.execution.output.snapshot"
     assert snapshot.data["output_chars"] == 12
+    assert snapshot.data["captured_output_artifact"] == "artifacts/captured.txt"
     assert terminal.type == "tool.execution.failed"
     assert terminal.data["output"] == "abcdef"
     assert terminal.data["output_chars"] == 12
     assert terminal.data["output_truncated"] is True
-    assert terminal.data["artifact_path"] == "artifacts/tool.txt"
     assert terminal.data["failure_kind"] == "command_failed"
-    assert terminal.data["read_hints"] == ["artifacts/tool.txt"]
+    assert terminal.data["read_hints"] == ["artifacts/captured.txt"]
     assert terminal.data["data"]["_truncated"] is True
 
 
@@ -68,7 +67,11 @@ def test_append_tool_step_records_transcript_refs_observations_and_synthetic_fla
         call_id=call.id,
         output="blocked",
         ok=False,
-        data={"blocked": True, "output_artifact": "artifacts/output.txt"},
+        data={
+            "blocked": True,
+            "output_artifact": "artifacts/output.txt",
+            "captured_output_artifact": "artifacts/captured.txt",
+        },
         artifact_path="artifacts/tool.txt",
         failure_kind="policy_denied",
     )
@@ -78,10 +81,11 @@ def test_append_tool_step_records_transcript_refs_observations_and_synthetic_fla
     assert state.transcript.pending_tool_call_ids == set()
     tool_result = state.transcript.items[-1]
     assert tool_result.kind == "tool_result"
-    assert tool_result.artifact_refs == ("artifacts/tool.txt", "artifacts/output.txt")
+    assert tool_result.artifact_refs == ("artifacts/tool.txt", "artifacts/output.txt", "artifacts/captured.txt")
     assert tool_result.data["synthetic"] is True
     assert state.tool_steps[0].call == call
     assert state.observations
+    assert state.observations[0].refs == ("artifacts/tool.txt", "artifacts/output.txt", "artifacts/captured.txt")
     assert state.observations[0].data["tool_call_id"] == "call_1"
     assert state.events[-1].type == "observation.recorded"
 

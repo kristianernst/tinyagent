@@ -6,6 +6,7 @@ import re
 from collections.abc import Sequence
 from typing import Any
 
+from tinyagent.core.artifacts import tool_result_artifact_refs
 from tinyagent.core.context.types import ArtifactRef, ContextConfig, ContextState
 from tinyagent.core.output import write_text_artifact
 from tinyagent.core.state import RunState, ToolStep
@@ -92,9 +93,8 @@ def artifact_refs_from_tool_steps(steps: Sequence[ToolStep]) -> list[ArtifactRef
     refs: list[ArtifactRef] = []
     seen: set[str] = set()
     for step in steps:
-        for key in ("context_artifact", "output_artifact", "captured_output_artifact"):
-            path = step.result.data.get(key)
-            if not isinstance(path, str) or path in seen:
+        for path in tool_result_artifact_refs(step.result, include_primary=False):
+            if path in seen:
                 continue
             seen.add(path)
             refs.append(ArtifactRef(path=path, description=_artifact_description(step)))

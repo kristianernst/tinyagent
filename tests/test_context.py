@@ -4,9 +4,11 @@ import subprocess
 from collections.abc import Sequence
 
 from tinyagent.core.context import ContextConfig, load_project_instructions
+from tinyagent.core.context.checkpoint import artifact_refs_from_tool_steps
 from tinyagent.core.contracts import Tool
 from tinyagent.core.kernel import Kernel
 from tinyagent.core.models import FakeModelProvider
+from tinyagent.core.observations import Observation
 from tinyagent.core.policy import LocalPolicy
 from tinyagent.core.profiles import ApexCoderProfile
 from tinyagent.core.state import Message, ModelResponse, PolicyDecision, RunState, ToolCall, ToolResult, ToolStep, Workspace
@@ -181,6 +183,14 @@ def test_recent_tool_context_uses_stable_contextfs_refs_for_product_home_output(
             ),
         )
     )
+    state.observations.append(
+        Observation(
+            kind="file_changed",
+            subject="research/iphone-costs.md",
+            summary="research/iphone-costs.md changed by write_file.",
+            refs=("context/patch/0002-call_write.txt", "artifacts/edit-output-call_write.txt"),
+        )
+    )
     profile = ApexCoderProfile(context_config=ContextConfig(max_recent_tool_tokens=999_999, compact_at_tokens=999_999))
 
     built = profile.build_context(state)
@@ -189,6 +199,56 @@ def test_recent_tool_context_uses_stable_contextfs_refs_for_product_home_output(
     assert 'context_read({"ref":"contextfs:context/shell/0001-call_shell.txt"})' in recent.content
     assert str(output_dir) not in recent.content
     assert str(output_dir.parent.parent) not in recent.content
+
+
+def test_recent_tool_context_hides_unreadable_artifacts_when_context_read_is_hidden(tmp_path) -> None:
+    state = RunState.create("research prices", Workspace(tmp_path), run_id="run_hidden_context_artifacts")
+    state.prior_messages = [Message(role="user", content="previous turn"), Message(role="assistant", content="previous answer")]
+    state.prior_context_artifact = "artifacts/prior-context.json"
+    state.tool_steps.append(
+        ToolStep(
+            call=ToolCall(id="call_fetch", name="fetch_url", args={"url": "https://example.test/source"}),
+            result=ToolResult(
+                tool_name="fetch_url",
+                call_id="call_fetch",
+                output="Fetched source text with the usable evidence.",
+                artifact_path="context/fetch_url/0001-call_fetch.txt",
+                read_hints=["tail -120 .tinyagent/runs/run_hidden_context_artifacts/context/fetch_url/0001-call_fetch.txt"],
+                data={
+                    "url": "https://example.test/source",
+                    "context_artifact": "context/fetch_url/0001-call_fetch.txt",
+                    "output_artifact": "artifacts/fetch-url-output-call_fetch.txt",
+                    "captured_output_artifact": "artifacts/fetch-url-output-call_fetch.txt",
+                    "output_chars": 4096,
+                    "workspace_delta": {
+                        "diff_artifact": "artifacts/workspace-delta-0001.patch",
+                        "paths": ["research/iphone-costs.md"],
+                    },
+                },
+            ),
+        )
+    )
+    profile = ApexCoderProfile(
+        visible_tool_names=("read_file", "web_search", "fetch_url", "write_file"),
+        context_config=ContextConfig(max_recent_tool_tokens=999_999, compact_at_tokens=999_999),
+    )
+
+    built = profile.build_context(state)
+
+    recent = next(message for message in built.messages if message.meta.get("context_layer") == "recent_tool_steps")
+    full_text = "\n".join(message.content for message in built.messages if isinstance(message.content, str))
+    assert "Fetched source text with the usable evidence." in recent.content
+    assert '"url": "https://example.test/source"' in recent.content
+    assert "context/fetch_url" not in full_text
+    assert "context/patch" not in full_text
+    assert "artifacts/fetch-url-output" not in full_text
+    assert "artifacts/edit-output" not in full_text
+    assert "artifacts/workspace-delta" not in full_text
+    assert "artifacts/prior-context" not in full_text
+    assert "Artifact:" not in full_text
+    assert "tail -120" not in full_text
+    assert "context_read(" not in full_text
+    assert "contextfs:" not in full_text
 
 
 def test_apex_context_includes_prior_conversation_before_current_task(tmp_path, monkeypatch) -> None:
@@ -356,3 +416,28 @@ def test_fake_model_remains_usable_with_layered_context(tmp_path, monkeypatch) -
     response = FakeModelProvider([ModelResponse(content="ok")]).complete(profile.build_messages(state), [], state)
 
     assert response.content == "ok"
+
+
+def test_artifact_refs_from_tool_steps_skips_empty_refs_and_dedupes() -> None:
+    steps = [
+        ToolStep(
+            call=ToolCall(name="shell", id="call_1"),
+            result=ToolResult(
+                tool_name="shell",
+                output="ok",
+                data={"context_artifact": "", "output_artifact": "artifacts/output.txt"},
+            ),
+        ),
+        ToolStep(
+            call=ToolCall(name="shell", id="call_2"),
+            result=ToolResult(
+                tool_name="shell",
+                output="ok",
+                data={"context_artifact": "artifacts/output.txt", "captured_output_artifact": "artifacts/captured.txt"},
+            ),
+        ),
+    ]
+
+    refs = artifact_refs_from_tool_steps(steps)
+
+    assert [ref.path for ref in refs] == ["artifacts/output.txt", "artifacts/captured.txt"]

@@ -19,6 +19,11 @@ from tinyagent.core.policy import default_policy
 from tinyagent.core.profiles import ApexCoderProfile
 from tinyagent.core.providers.factory import ProviderRegistry, ProviderSpec, provider_for
 from tinyagent.core.providers.openai_compat import OpenAICompatibleConfig, OpenAICompatibleProvider
+from tinyagent.core.providers.openai_responses import (
+    OpenAIResponsesConfig,
+    OpenAIResponsesProvider,
+    parse_response_stream_event,
+)
 from tinyagent.core.state import Message, ModelResponse, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, Workspace
 from tinyagent.core.tools import default_tools
 
@@ -98,6 +103,40 @@ class StreamingOpenAIProvider(OpenAICompatibleProvider):
     def _post_stream(self, payload: dict):
         self.payloads.append(payload)
         yield from self.raw_chunks
+
+
+class RecordingResponsesProvider(OpenAIResponsesProvider):
+    def __init__(self, raw_response: dict) -> None:
+        super().__init__(
+            OpenAIResponsesConfig(
+                base_url="https://models.example.test/v1",
+                api_key="test-key",
+                model="test-model",
+            )
+        )
+        self.payloads: list[dict] = []
+        self.raw_response = raw_response
+
+    def _post(self, payload: dict) -> dict:
+        self.payloads.append(payload)
+        return self.raw_response
+
+
+class StreamingResponsesProvider(OpenAIResponsesProvider):
+    def __init__(self, raw_events: list[dict]) -> None:
+        super().__init__(
+            OpenAIResponsesConfig(
+                base_url="https://models.example.test/v1",
+                api_key="test-key",
+                model="test-model",
+            )
+        )
+        self.payloads: list[dict] = []
+        self.raw_events = raw_events
+
+    def _post_stream(self, payload: dict):
+        self.payloads.append(payload)
+        yield from self.raw_events
 
 
 def test_fake_provider_returns_responses_in_order() -> None:
@@ -640,6 +679,229 @@ def test_openai_compatible_provider_requires_tool_call_name() -> None:
 
     with pytest.raises(ProviderError, match="function.name"):
         provider.complete([], [], _state_stub())
+
+
+def test_openai_responses_config_reads_environment() -> None:
+    config = OpenAIResponsesConfig.from_env(
+        {
+            "TINYAGENT_MODEL_BASE_URL": "https://models.example.test/v1",
+            "TINYAGENT_MODEL_API_KEY": "key",
+            "TINYAGENT_MODEL_NAME": "model",
+            "TINYAGENT_MODEL_TIMEOUT_SECONDS": "12",
+            "TINYAGENT_MODEL_CONTEXT_WINDOW": "64000",
+            "TINYAGENT_MODEL_MAX_OUTPUT_TOKENS": "4000",
+            "TINYAGENT_MODEL_REASONING_JSON": '{"effort":"medium"}',
+            "TINYAGENT_MODEL_EXTRA_BODY_JSON": '{"temperature":0}',
+        }
+    )
+
+    assert config.base_url == "https://models.example.test/v1"
+    assert config.api_key == "key"
+    assert config.model == "model"
+    assert config.timeout_seconds == 12
+    assert config.context_window == 64_000
+    assert config.max_output_tokens == 4_000
+    assert config.reasoning == {"effort": "medium"}
+    assert config.extra_body == {"temperature": 0}
+
+
+def test_openai_responses_provider_sends_responses_payload_and_parses_tool_calls() -> None:
+    provider = RecordingResponsesProvider(
+        {
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Working."}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "sample_tool",
+                    "arguments": json.dumps({"value": "done"}),
+                },
+            ],
+        }
+    )
+
+    response = provider.complete(
+        [
+            Message(role="system", content="system instructions"),
+            Message(role="user", content="use the sample tool"),
+        ],
+        [SampleTool()],
+        _state_stub(),
+    )
+
+    assert provider.payloads == [
+        {
+            "model": "test-model",
+            "instructions": "system instructions",
+            "input": [{"role": "user", "content": "use the sample tool"}],
+            "store": False,
+            "max_output_tokens": 8000,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "sample_tool",
+                    "description": "Sample tool.",
+                    "parameters": SampleTool.schema["parameters"],
+                    "strict": False,
+                }
+            ],
+            "parallel_tool_calls": False,
+        }
+    ]
+    assert response.content == "Working."
+    assert response.finish_reason == "tool_calls"
+    assert response.tool_calls == (ToolCall(id="call_1", name="sample_tool", args={"value": "done"}),)
+    assert provider.capabilities.tool_protocol == "responses"
+    assert provider.model_spec.to_json_dict()["adapter"] == "tinyagent.openai_responses.v1"
+
+
+def test_openai_responses_provider_streams_text_tool_args_and_usage() -> None:
+    provider = StreamingResponsesProvider(
+        [
+            {
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "delta": "Working ",
+            },
+            {
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "sample_tool",
+                    "arguments": "",
+                },
+            },
+            {
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_1",
+                "output_index": 1,
+                "delta": '{"value":',
+            },
+            {
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_1",
+                "output_index": 1,
+                "delta": '"done"}',
+            },
+            {
+                "type": "response.function_call_arguments.done",
+                "item_id": "fc_1",
+                "output_index": 1,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "sample_tool",
+                    "arguments": '{"value":"done"}',
+                },
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "output": [{"type": "function_call"}],
+                    "usage": {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+                },
+            },
+        ]
+    )
+
+    response = assemble_model_deltas(
+        provider.name,
+        provider.stream([Message(role="user", content="use tool")], [SampleTool()], _state_stub()),
+    )
+
+    assert provider.payloads == [
+        {
+            "model": "test-model",
+            "instructions": "",
+            "input": [{"role": "user", "content": "use tool"}],
+            "store": False,
+            "max_output_tokens": 8000,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "sample_tool",
+                    "description": "Sample tool.",
+                    "parameters": SampleTool.schema["parameters"],
+                    "strict": False,
+                }
+            ],
+            "parallel_tool_calls": False,
+            "stream": True,
+        }
+    ]
+    assert response.content == "Working "
+    assert response.tool_calls == (ToolCall(id="call_1", name="sample_tool", args={"value": "done"}),)
+    assert response.finish_reason == "tool_calls"
+    assert response.raw["usage"] == {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7}
+
+
+def test_openai_responses_stream_parser_maps_reasoning_summary_delta() -> None:
+    deltas = list(
+        parse_response_stream_event(
+            {
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "rs_1",
+                "delta": "reasoning",
+            }
+        )
+    )
+
+    assert deltas == [
+        ModelDelta(
+            kind="reasoning_summary_delta",
+            item_id="rs_1",
+            delta="reasoning",
+            data={"provider_field": "response.reasoning_summary_text.delta"},
+        )
+    ]
+
+
+def test_openai_codex_provider_uses_responses_transport_with_codex_auth() -> None:
+    provider = OpenAIResponsesProvider.codex_from_env(
+        {
+            "TINYAGENT_CODEX_BEARER_TOKEN": "codex-token",
+            "TINYAGENT_MODEL_NAME": "gpt-5.5-codex",
+        }
+    )
+
+    assert provider.name == "openai-codex"
+    assert provider.adapter == "tinyagent.openai_codex_responses.v1"
+    assert provider.config.base_url == "https://chatgpt.com/backend-api/codex"
+    assert provider.config.api_key == "codex-token"
+    assert provider.config.send_max_output_tokens is False
+    assert provider.model_spec.protocol == "responses"
+    assert provider.build_payload([Message(role="user", content="hello")], [], _state_stub()) == {
+        "model": "gpt-5.5-codex",
+        "instructions": "",
+        "input": [{"role": "user", "content": "hello"}],
+        "store": False,
+    }
+
+
+def test_provider_registry_creates_responses_and_codex_providers() -> None:
+    responses = provider_for(
+        ProviderSpec(kind="openai-responses", model="gpt-test"),
+        "task",
+        env={"TINYAGENT_MODEL_API_KEY": "key"},
+    )
+    codex = provider_for(
+        ProviderSpec(kind="openai-codex", model="gpt-codex-test"),
+        "task",
+        env={"TINYAGENT_CODEX_BEARER_TOKEN": "token"},
+    )
+
+    assert responses.name == "openai-responses"
+    assert codex.name == "openai-codex"
 
 
 def test_kernel_surfaces_provider_errors_as_run_failures(tmp_path) -> None:

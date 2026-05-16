@@ -94,6 +94,29 @@ def test_event_invariants_catch_unsafe_artifact_path() -> None:
     assert "artifact path escapes run output: ../escape.txt" in check_event_invariants(events)
 
 
+def test_event_invariants_catch_empty_top_level_and_nested_artifact_paths() -> None:
+    direct = [
+        Event(type="run.started", run_id="run_bad_empty_artifact", seq=1),
+        Event(type="artifact.created", run_id="run_bad_empty_artifact", seq=2, data={"path": ""}),
+        Event(type="run.completed", run_id="run_bad_empty_artifact", seq=3),
+    ]
+    nested = [
+        Event(type="run.started", run_id="run_bad_nested_empty_artifact", seq=1),
+        Event(
+            type="tool.execution.completed",
+            run_id="run_bad_nested_empty_artifact",
+            seq=2,
+            data={"tool_call_id": "call-1", "tool": "shell", "ok": True, "data": {"output_artifact": ""}},
+        ),
+        Event(type="artifact.finalization.started", run_id="run_bad_nested_empty_artifact", seq=3),
+        Event(type="artifact.finalization.completed", run_id="run_bad_nested_empty_artifact", seq=4),
+        Event(type="run.completed", run_id="run_bad_nested_empty_artifact", seq=5),
+    ]
+
+    for events in (direct, nested):
+        assert "artifact path escapes run output: " in check_event_invariants(events)
+
+
 def test_event_invariants_do_not_treat_generic_path_as_artifact_path() -> None:
     events = [
         Event(type="run.started", run_id="run_workspace_path", seq=1),
@@ -395,7 +418,7 @@ def test_event_invariants_require_output_snapshot_before_artifact_tool_terminal_
                 "tool_call_id": "call-1",
                 "tool": "shell",
                 "ok": False,
-                "data": {"output_artifact": "artifacts/output.txt"},
+                "data": {"captured_output_artifact": "artifacts/output.txt"},
             },
         ),
         Event(type="tool.execution.output.snapshot", run_id="run_late_snapshot", seq=8, data={"tool_call_id": "call-1"}),

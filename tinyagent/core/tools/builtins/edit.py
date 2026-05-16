@@ -8,9 +8,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from tinyagent.core.contextfs import model_readable_path, read_hints, write_context_tool_output
 from tinyagent.core.state import RunState, ToolCall, ToolResult
-from tinyagent.core.tools.core import error_result, relative_workspace_path, resolve_workspace_path, visible_output, write_tool_output_artifact
+from tinyagent.core.tools.core import capture_tool_output, duration_ms, error_result, relative_workspace_path, resolve_workspace_path
 
 MAX_WRITE_FILE_BYTES = 128_000
 
@@ -96,10 +95,8 @@ def _edit_result(
     paths: list[str],
     started: float,
 ) -> ToolResult:
-    artifact = write_tool_output_artifact(state, call, "edit-output", output, kind="edit_output")
-    context_artifact = write_context_tool_output(state, call, output, kind="edit_output")
-    context_read_path = model_readable_path(state, context_artifact)
-    preview = visible_output(output, state)
+    captured = capture_tool_output(state, call, output, prefix="edit-output", kind="edit_output")
+    elapsed_ms = duration_ms(started)
     state.emit(
         "file.edited",
         {
@@ -107,31 +104,23 @@ def _edit_result(
             "tool": tool_name,
             "paths": paths,
             "ok": ok,
-            "output_artifact": artifact,
-            "context_artifact": context_artifact,
-            "output_chars": len(output),
-            "duration_ms": _duration_ms(started),
+            **captured.data,
+            "duration_ms": elapsed_ms,
         },
     )
-    return ToolResult(
-        tool_name=tool_name,
-        call_id=call.id,
-        output=preview,
+    return captured.tool_result(
+        tool_name,
+        call,
         ok=ok,
-        duration_ms=_duration_ms(started),
+        duration_ms=elapsed_ms,
         summary=output.strip(),
-        content_preview=preview,
-        artifact_path=context_artifact,
-        truncated=len(preview) < len(output),
         data={
             "paths": paths,
-            "output_artifact": artifact,
-            "context_artifact": context_artifact,
-            "output_chars": len(output),
-            "duration_ms": _duration_ms(started),
+            **captured.data,
+            "duration_ms": elapsed_ms,
         },
         metadata={"paths": paths},
-        read_hints=read_hints(context_read_path, failure=not ok),
+        failure=not ok,
     )
 
 
@@ -168,7 +157,3 @@ def _atomic_write_text(path: Path, content: str) -> None:
                 pass
         _restore(path, snapshot)
         raise
-
-
-def _duration_ms(started: float) -> int:
-    return int((time.monotonic() - started) * 1000)

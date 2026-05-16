@@ -76,7 +76,7 @@ class RenderedContextFile:
 class ContextRenderHelpers:
     context_ref: Callable[[str | Path], str]
     safe_recovery_artifact_ref: Callable[[object], str | None]
-    primary_tool_artifact: Callable[["ToolStep"], object]
+    tool_artifact_refs: Callable[["ToolStep"], tuple[str, ...]]
     safe_transcript_refs: Callable[[tuple[str, ...]], str]
     sanitize_value: Callable[[str], str]
     sanitize_data: Callable[[Any], Any]
@@ -208,10 +208,8 @@ def render_last_failure(state: "RunState", helpers: ContextRenderHelpers) -> str
     for step in reversed(state.tool_steps):
         if step.result.ok:
             continue
-        artifact = helpers.safe_recovery_artifact_ref(
-            step.result.artifact_path or step.result.data.get("context_artifact") or step.result.data.get("output_artifact")
-        )
-        readable_artifact = helpers.context_ref(artifact) if artifact else "(none)"
+        artifacts = _safe_tool_artifacts(step, helpers)
+        readable_artifacts = ", ".join(helpers.context_ref(artifact) for artifact in artifacts) or "(none)"
         return "\n".join(
             [
                 "# Last Failure",
@@ -219,7 +217,7 @@ def render_last_failure(state: "RunState", helpers: ContextRenderHelpers) -> str
                 f"tool: {step.call.name}",
                 f"call_id: {step.call.id}",
                 f"failure_kind: {step.result.failure_kind or step.result.data.get('failure_kind') or 'unknown'}",
-                f"artifact: {readable_artifact}",
+                f"artifact: {readable_artifacts}",
                 "",
                 "## Preview",
                 "",
@@ -290,11 +288,13 @@ def render_tool_docs(state: "RunState", helpers: ContextRenderHelpers) -> tuple[
     lines = ["# Tool Context", ""]
     by_tool: dict[str, list[str]] = {}
     for step in state.tool_steps:
-        artifact = helpers.safe_recovery_artifact_ref(helpers.primary_tool_artifact(step))
-        if not artifact:
+        artifacts = _safe_tool_artifacts(step, helpers)
+        if not artifacts:
             continue
-        readable = helpers.context_ref(artifact)
-        by_tool.setdefault(step.call.name, []).append(f"- {readable}: `{step.call.id}` {'ok' if step.result.ok else 'failed'}")
+        entries = by_tool.setdefault(step.call.name, [])
+        for artifact in artifacts:
+            readable = helpers.context_ref(artifact)
+            entries.append(f"- {readable}: `{step.call.id}` {'ok' if step.result.ok else 'failed'}")
     for tool_name, description in TOOL_CONTEXT_DESCRIPTIONS.items():
         safe_name = helpers.safe_artifact_name(tool_name)
         entries = by_tool.get(tool_name, ["- No readable output artifacts yet."])
@@ -353,14 +353,13 @@ def render_context_index(
         lines.append("- No tool outputs yet.")
     else:
         for step in state.tool_steps:
-            artifact = helpers.safe_recovery_artifact_ref(
-                step.result.artifact_path or step.result.data.get("context_artifact") or step.result.data.get("output_artifact")
-            )
+            artifacts = _safe_tool_artifacts(step, helpers)
             ok = "ok" if step.result.ok else "failed"
-            if artifact:
-                readable = helpers.context_ref(artifact)
-                lines.append(f"- {readable}: {step.call.name} `{step.call.id}` {ok}. Artifact id: `{artifact}`.")
-                lines.append(f'  Suggested read: `context_read({{"ref":"contextfs:{readable}"}})`')
+            if artifacts:
+                for artifact in artifacts:
+                    readable = helpers.context_ref(artifact)
+                    lines.append(f"- {readable}: {step.call.name} `{step.call.id}` {ok}. Artifact id: `{artifact}`.")
+                    lines.append(f'  Suggested read: `context_read({{"ref":"contextfs:{readable}"}})`')
             else:
                 lines.append(f"- {step.call.name} `{step.call.id}` {ok}: no artifact.")
 
@@ -372,3 +371,8 @@ def render_context_index(
             lines.append(f"  Suggested read: `{entry.read_hint}`")
     lines.append("")
     return "\n".join(lines)
+
+
+def _safe_tool_artifacts(step: "ToolStep", helpers: ContextRenderHelpers) -> tuple[str, ...]:
+    refs = (helpers.safe_recovery_artifact_ref(ref) for ref in helpers.tool_artifact_refs(step))
+    return tuple(dict.fromkeys(ref for ref in refs if ref))

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import difflib
 import json
 import subprocess
 from dataclasses import asdict
@@ -10,11 +9,12 @@ from pathlib import Path
 from typing import Any
 
 from tinyagent.core.contracts import Tool
+from tinyagent.core.diffs import join_diff_parts, new_file_patch
 from tinyagent.core.events import json_safe
+from tinyagent.core.path_safety import checked_relative_path, looks_like_secret_path, relative_path_is_within, resolved_relative_to
 from tinyagent.core.state import Message, ModelResponse, RunState
 
 ARTIFACTS_DIR = "artifacts"
-MAX_UNTRACKED_DIFF_BYTES = 1_000_000
 
 
 def write_run_outputs(state: RunState) -> None:
@@ -44,28 +44,10 @@ def capture_final_diff(state: RunState) -> None:
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        state.final_diff = ""
-        state.emit(
-            "diff.finalized",
-            {
-                "available": False,
-                "reason": f"git unavailable: {exc}",
-                "path": "final.diff",
-                "chars": 0,
-            },
-        )
+        _finalize_diff_unavailable(state, f"git unavailable: {exc}")
         return
     if result.returncode != 0:
-        state.final_diff = ""
-        state.emit(
-            "diff.finalized",
-            {
-                "available": False,
-                "reason": "workspace is not a git worktree",
-                "path": "final.diff",
-                "chars": 0,
-            },
-        )
+        _finalize_diff_unavailable(state, "workspace is not a git worktree")
         return
 
     try:
@@ -78,19 +60,10 @@ def capture_final_diff(state: RunState) -> None:
         )
         untracked = _untracked_files(state)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        state.final_diff = ""
-        state.emit(
-            "diff.finalized",
-            {
-                "available": False,
-                "reason": f"git diff failed: {exc}",
-                "path": "final.diff",
-                "chars": 0,
-            },
-        )
+        _finalize_diff_unavailable(state, f"git diff failed: {exc}")
         return
-    untracked_diff = "".join(_new_file_diff(root, path) for path in untracked)
-    state.final_diff = _join_diff_parts(diff.stdout, untracked_diff) if diff.returncode == 0 else ""
+    untracked_diff = "".join(new_file_patch(root / path, path) for path in untracked)
+    state.final_diff = join_diff_parts(diff.stdout, untracked_diff) if diff.returncode == 0 else ""
     state.emit(
         "diff.finalized",
         {
@@ -101,6 +74,11 @@ def capture_final_diff(state: RunState) -> None:
             "untracked_file_count": len(untracked),
         },
     )
+
+
+def _finalize_diff_unavailable(state: RunState, reason: str) -> None:
+    state.final_diff = ""
+    state.emit("diff.finalized", {"available": False, "reason": reason, "path": "final.diff", "chars": 0})
 
 
 def _final_diff_command(root: Path) -> list[str]:
@@ -121,7 +99,7 @@ def _git_has_head(root: Path) -> bool:
 
 
 def write_text_artifact(state: RunState, name: str, content: str, *, kind: str) -> str:
-    relative_path = Path(ARTIFACTS_DIR) / name
+    relative_path = Path(ARTIFACTS_DIR) / checked_relative_path(name, label="Artifact name")
     artifact_path = state.output_dir / relative_path
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     artifact_path.write_text(content)
@@ -317,52 +295,13 @@ def _untracked_files(state: RunState) -> list[str]:
     return [path for path in result.stdout.splitlines() if path and not _excluded_from_final_diff(state, path)]
 
 
-def _new_file_diff(root: Path, relative_path: str) -> str:
-    path = root / relative_path
-    if path.is_symlink():
-        return ""
-    try:
-        file_size = path.stat().st_size
-    except OSError:
-        return ""
-    header = f"diff --git a/{relative_path} b/{relative_path}\nnew file mode 100644\nindex 0000000..0000000\n"
-    if file_size > MAX_UNTRACKED_DIFF_BYTES:
-        return f"{header}Binary files /dev/null and b/{relative_path} differ\n"
-    try:
-        raw = path.read_bytes()
-    except OSError:
-        return ""
-    if b"\0" in raw:
-        return f"{header}Binary files /dev/null and b/{relative_path} differ\n"
-    text = raw.decode(errors="replace")
-    lines = text.splitlines()
-    body_lines = difflib.unified_diff([], lines, fromfile="/dev/null", tofile=f"b/{relative_path}", lineterm="")
-    body = "\n".join(body_lines) + "\n"
-    return header + body
-
-
 def _excluded_from_final_diff(state: RunState, relative_path: str) -> bool:
     if relative_path.startswith(".tinyagent/"):
         return True
-    try:
-        output_relative = state.output_dir.resolve().relative_to(state.workspace.root).as_posix()
-    except ValueError:
-        return False
-    if output_relative in {"", "."}:
+    if looks_like_secret_path(relative_path):
         return True
-    return relative_path == output_relative or relative_path.startswith(f"{output_relative}/")
-
-
-def _join_diff_parts(*parts: str) -> str:
-    chunks = [part for part in parts if part]
-    if not chunks:
-        return ""
-    output = chunks[0]
-    for chunk in chunks[1:]:
-        if output and not output.endswith("\n"):
-            output += "\n"
-        output += chunk
-    return output
+    output_relative = resolved_relative_to(state.output_dir, state.workspace.root)
+    return output_relative is not None and relative_path_is_within(relative_path, output_relative)
 
 
 def _context_markdown(messages: list[Message], tools: list[Tool]) -> str:

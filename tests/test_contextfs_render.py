@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from tinyagent.core.context_sources import ContextReadTool, ContextSearchTool
-from tinyagent.core.contextfs import allowed_context_read_paths, refresh_contextfs
+from tinyagent.core.contextfs import _write_text, allowed_context_read_paths, refresh_contextfs, write_context_tool_output
 from tinyagent.core.contextfs_render import OPTIONAL_CONTEXT_FILE_RELS, STATIC_CONTEXT_FILE_RELS
 from tinyagent.core.observations import Observation
 from tinyagent.core.output import write_text_artifact
@@ -173,6 +175,58 @@ def test_contextfs_exposes_truncated_context_tool_output_artifacts(tmp_path) -> 
         ToolCall(name="context_read", args={"ref": "contextfs:artifacts/context-read-call_read.txt", "max_lines": 5}),
         state,
     ).ok is True
+
+
+def test_contextfs_tool_output_sanitizes_reserved_path_components(tmp_path) -> None:
+    state = RunState.create("reserved path output", Workspace(tmp_path), run_id="run_reserved_context_path")
+
+    path = write_context_tool_output(state, ToolCall(id="..", name="..", args={}), "output\n", kind="tool_output")
+
+    assert path == "context/call/0001-call.txt"
+    assert (state.output_dir / "context" / "call" / "0001-call.txt").read_text() == "output\n"
+    assert not (state.output_dir / "0001-call.txt").exists()
+
+
+def test_contextfs_render_write_stays_inside_context_dir(tmp_path) -> None:
+    state = RunState.create("contextfs write boundary", Workspace(tmp_path), run_id="run_contextfs_write_boundary")
+    outside = tmp_path / "outside.md"
+
+    for relative in ("../outside.md", "context/../outside.md", str(outside), ""):
+        with pytest.raises(ValueError):
+            _write_text(state, relative, "escape\n")
+
+    assert not outside.exists()
+    assert not (state.output_dir / "outside.md").exists()
+
+
+def test_contextfs_render_uses_captured_output_artifact(tmp_path) -> None:
+    state = RunState.create("captured artifact render", Workspace(tmp_path), run_id="run_contextfs_captured_artifact")
+    context_artifact = write_context_tool_output(state, ToolCall(id="call_capture", name="shell", args={}), "tool output\n", kind="shell_output")
+    captured = write_text_artifact(state, "workspace-delta-0001.patch", "diff --git a/file.txt b/file.txt\n", kind="workspace_delta")
+    state.tool_steps.append(
+        ToolStep(
+            call=ToolCall(id="call_capture", name="shell", args={"cmd": "pytest"}),
+            result=ToolResult(
+                tool_name="shell",
+                call_id="call_capture",
+                output="failed",
+                ok=False,
+                artifact_path=context_artifact,
+                data={"context_artifact": context_artifact, "captured_output_artifact": captured},
+                failure_kind="command_failed",
+            ),
+        )
+    )
+
+    refresh_contextfs(state)
+
+    last_failure = (state.output_dir / "context/last_failure.md").read_text()
+    tool_doc = (state.output_dir / "context/tools/shell.md").read_text()
+    index = (state.output_dir / "context/INDEX.md").read_text()
+    for artifact in (context_artifact, captured):
+        assert artifact in last_failure
+        assert artifact in tool_doc
+        assert artifact in index
 
 
 def _snapshot_state(tmp_path) -> RunState:

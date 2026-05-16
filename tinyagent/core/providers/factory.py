@@ -12,6 +12,7 @@ from typing import Any, Protocol
 from tinyagent.core.contracts import ModelProvider
 from tinyagent.core.models import FakeModelProvider, ProviderError
 from tinyagent.core.providers.openai_compat import OpenAICompatibleProvider
+from tinyagent.core.providers.openai_responses import OpenAIResponsesProvider
 from tinyagent.core.state import ModelResponse, ToolCall
 
 
@@ -76,9 +77,37 @@ class OpenAICompatibleProviderFactory:
         return OpenAICompatibleProvider.from_env(values)
 
 
+class OpenAIResponsesProviderFactory:
+    kind = "openai-responses"
+
+    def create(self, spec: ProviderSpec, task: str, env: Mapping[str, str] | None = None) -> ModelProvider:
+        del task
+        values = dict(os.environ if env is None else env)
+        if spec.model:
+            values["TINYAGENT_MODEL_NAME"] = spec.model
+        if spec.reasoning is not None:
+            values["TINYAGENT_MODEL_REASONING_JSON"] = json.dumps(spec.reasoning, sort_keys=True)
+        return OpenAIResponsesProvider.from_env(values)
+
+
+class OpenAICodexProviderFactory:
+    kind = "openai-codex"
+
+    def create(self, spec: ProviderSpec, task: str, env: Mapping[str, str] | None = None) -> ModelProvider:
+        del task
+        values = dict(os.environ if env is None else env)
+        if spec.model:
+            values["TINYAGENT_MODEL_NAME"] = spec.model
+        if spec.reasoning is not None:
+            values["TINYAGENT_MODEL_REASONING_JSON"] = json.dumps(spec.reasoning, sort_keys=True)
+        return OpenAIResponsesProvider.codex_from_env(values)
+
+
 DEFAULT_PROVIDER_REGISTRY = ProviderRegistry()
 DEFAULT_PROVIDER_REGISTRY.register(FakeProviderFactory())
 DEFAULT_PROVIDER_REGISTRY.register(OpenAICompatibleProviderFactory())
+DEFAULT_PROVIDER_REGISTRY.register(OpenAIResponsesProviderFactory())
+DEFAULT_PROVIDER_REGISTRY.register(OpenAICodexProviderFactory())
 
 
 def _fake_responses(task: str) -> list[ModelResponse]:
@@ -91,6 +120,47 @@ def _fake_responses(task: str) -> list[ModelResponse]:
         return [
             ModelResponse(tool_calls=(ToolCall(id="call_approval", name="shell", args={"cmd": "printf approved > ../approved.txt"}),)),
             ModelResponse(content="approval done", finish_reason="stop"),
+        ]
+    if "status says done" in task and "notes.txt" in task:
+        patch = "\n".join(
+            [
+                "*** Begin Patch",
+                "*** Update File: notes.txt",
+                "@@",
+                "-status: todo",
+                "+status: done",
+                "*** End Patch",
+            ]
+        )
+        return [
+            ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "sed -n '1,120p' notes.txt"}),)),
+            ModelResponse(tool_calls=(ToolCall(name="apply_patch", args={"patch": patch}),)),
+            ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "git diff -- notes.txt"}),)),
+            ModelResponse(
+                content=(
+                    "Fake run updated notes.txt and inspected the diff. "
+                    "Verification not run; this fixture has only a harness validation script."
+                ),
+                finish_reason="stop",
+            ),
+        ]
+    if "Fix the bug in calc.py" in task:
+        patch = "\n".join(
+            [
+                "*** Begin Patch",
+                "*** Update File: calc.py",
+                "@@",
+                "-    return a - b",
+                "+    return a + b",
+                "*** End Patch",
+            ]
+        )
+        return [
+            ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "sed -n '1,120p' calc.py"}),)),
+            ModelResponse(tool_calls=(ToolCall(name="apply_patch", args={"patch": patch}),)),
+            ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "pytest"}),)),
+            ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "git diff -- calc.py"}),)),
+            ModelResponse(content="Fake run fixed calc.py, ran pytest, and inspected the diff.", finish_reason="stop"),
         ]
     path = _first_mentioned_file(task)
     if path is not None:

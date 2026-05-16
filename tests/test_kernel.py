@@ -1750,6 +1750,27 @@ def test_run_state_emit_uses_one_sequence_for_durable_and_live_events(tmp_path) 
     assert [line.split()[0] for line in replay_lines] == ["0001", "0003"]
 
 
+def test_replay_renders_captured_tool_output_artifact() -> None:
+    replay = render_timeline(
+        [
+            Event(
+                run_id="run_replay_captured",
+                type="tool.execution.output.snapshot",
+                seq=1,
+                data={"tool": "shell", "tool_call_id": "call-1", "captured_output_artifact": "artifacts/captured.txt"},
+            ),
+            Event(
+                run_id="run_replay_captured",
+                type="tool.execution.failed",
+                seq=2,
+                data={"tool": "shell", "tool_call_id": "call-1", "data": {"_truncated": True}},
+            ),
+        ]
+    )
+
+    assert "tool.execution.output.snapshot shell call-1 artifacts/captured.txt" in replay
+
+
 def test_event_data_is_json_safe_for_common_non_json_types(tmp_path) -> None:
     class Custom:
         def __repr__(self) -> str:

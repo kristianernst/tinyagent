@@ -7,15 +7,14 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from tinyagent.core.contextfs import model_readable_path, read_hints, write_context_tool_output
 from tinyagent.core.state import RunState, ToolCall, ToolResult
 from tinyagent.core.tools.core import (
     ToolError,
+    capture_tool_output,
+    duration_ms,
     error_result,
     relative_workspace_path,
     resolve_workspace_path,
-    visible_output,
-    write_tool_output_artifact,
 )
 
 
@@ -38,17 +37,7 @@ class ApplyPatchTool:
         started = time.monotonic()
         patch = str(call.args.get("patch", ""))
         if not patch:
-            return ToolResult(
-                tool_name=self.name,
-                call_id=call.id,
-                output="patch is required",
-                ok=False,
-                duration_ms=_duration_ms(started),
-                summary="patch is required",
-                content_preview="patch is required",
-                failure_kind="invalid_tool_args",
-                data={"failure_kind": "invalid_tool_args"},
-            )
+            return _invalid_patch_result(self.name, call, started, "patch is required")
         try:
             touched = [
                 relative_workspace_path(state, resolve_workspace_path(state, path, allow_run_artifacts=self.allow_run_artifacts))
@@ -57,17 +46,7 @@ class ApplyPatchTool:
         except Exception as exc:
             return error_result(self.name, call, exc)
         if not touched:
-            return ToolResult(
-                tool_name=self.name,
-                call_id=call.id,
-                output="patch did not declare any file paths",
-                ok=False,
-                duration_ms=_duration_ms(started),
-                summary="patch did not declare any file paths",
-                content_preview="patch did not declare any file paths",
-                failure_kind="invalid_tool_args",
-                data={"failure_kind": "invalid_tool_args"},
-            )
+            return _invalid_patch_result(self.name, call, started, "patch did not declare any file paths")
 
         try:
             output = apply_openai_patch(state.workspace.root, patch)
@@ -75,45 +54,49 @@ class ApplyPatchTool:
         except Exception as exc:
             output = str(exc)
             ok = False
-        artifact = write_tool_output_artifact(state, call, "patch-output", output, kind="patch_output")
-        context_artifact = write_context_tool_output(state, call, output, kind="patch_output")
-        context_read_path = model_readable_path(state, context_artifact)
-        preview = visible_output(output, state)
+        captured = capture_tool_output(state, call, output, prefix="patch-output", kind="patch_output")
         failure_kind = None if ok else "invalid_tool_args"
+        elapsed_ms = duration_ms(started)
         state.emit(
             "patch.applied",
             {
                 "paths": touched,
                 "ok": ok,
-                "output_chars": len(output),
-                "output_artifact": artifact,
-                "context_artifact": context_artifact,
-                "duration_ms": _duration_ms(started),
+                **captured.data,
+                "duration_ms": elapsed_ms,
                 "failure_kind": failure_kind,
             },
         )
-        return ToolResult(
-            tool_name=self.name,
-            call_id=call.id,
-            output=preview,
+        return captured.tool_result(
+            self.name,
+            call,
             ok=ok,
-            duration_ms=_duration_ms(started),
+            duration_ms=elapsed_ms,
             summary="Patch applied." if ok else output.splitlines()[0] if output else "Patch failed.",
-            content_preview=preview,
-            artifact_path=context_artifact,
-            truncated=len(preview) < len(output),
             failure_kind=failure_kind,
             data={
                 "paths": touched,
-                "output_artifact": artifact,
-                "context_artifact": context_artifact,
-                "output_chars": len(output),
-                "duration_ms": _duration_ms(started),
+                **captured.data,
+                "duration_ms": elapsed_ms,
                 "failure_kind": failure_kind,
             },
             metadata={"paths": touched},
-            read_hints=read_hints(context_read_path, failure=not ok),
+            failure=not ok,
         )
+
+
+def _invalid_patch_result(tool_name: str, call: ToolCall, started: float, message: str) -> ToolResult:
+    return ToolResult(
+        tool_name=tool_name,
+        call_id=call.id,
+        output=message,
+        ok=False,
+        duration_ms=duration_ms(started),
+        summary=message,
+        content_preview=message,
+        failure_kind="invalid_tool_args",
+        data={"failure_kind": "invalid_tool_args"},
+    )
 
 
 @dataclass(frozen=True)
@@ -266,11 +249,6 @@ def _patch_path(root: Path, path: str) -> Path:
     except ValueError as exc:
         raise ToolError(f"Path is outside workspace: {path}") from exc
     return resolved
-
-
-def _duration_ms(started: float) -> int:
-    return int((time.monotonic() - started) * 1000)
-
 
 def _raw_patch_path(root: Path, path: str) -> Path:
     candidate = Path(path).expanduser()

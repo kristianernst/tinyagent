@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
+from tinyagent.core.artifacts import tool_result_artifact_refs
 from tinyagent.core.events import json_safe, utc_now
 from tinyagent.core.state import Message, RunState
 
@@ -254,14 +255,13 @@ class ConversationStore:
 def _tool_summary(state: RunState) -> list[dict[str, Any]]:
     summary = []
     for step in state.tool_steps:
-        artifact_refs = [value for value in (step.result.artifact_path, step.result.data.get("output_artifact")) if value]
         summary.append(
             {
                 "tool_call_id": step.call.id,
                 "tool": step.call.name,
                 "ok": step.result.ok,
                 "summary": step.result.summary or _preview(step.result.output),
-                "artifact_refs": artifact_refs,
+                "artifact_refs": list(tool_result_artifact_refs(step.result)),
             }
         )
     return summary

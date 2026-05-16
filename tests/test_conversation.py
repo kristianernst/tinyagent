@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 
 from tinyagent.core.models import FakeModelProvider
-from tinyagent.core.state import ModelResponse
+from tinyagent.core.state import ModelResponse, RunState, ToolCall, ToolResult, ToolStep, Workspace
 from tinyagent.runtime.conversation import ConversationStore
 from tinyagent.runtime.server import RunController, RuntimeConfig
 
@@ -82,6 +82,38 @@ def test_run_controller_conversation_turn_records_run_and_uses_prior_context(tmp
     assert prior_context.exists()
     assert "first" in prior_context.read_text()
     assert "answer" in prior_context.read_text()
+
+
+def test_conversation_run_turn_summarizes_all_tool_artifact_refs(tmp_path) -> None:
+    store = ConversationStore(tmp_path / "conversations")
+    conversation = store.create(workspace=tmp_path, title="Conversation", conversation_id="conv_artifacts")
+    state = RunState.create("conversation artifacts", Workspace(tmp_path), run_id="run_artifacts")
+    state.final_output = "done"
+    state.tool_steps.append(
+        ToolStep(
+            call=ToolCall(name="shell", id="call_1"),
+            result=ToolResult(
+                tool_name="shell",
+                call_id="call_1",
+                output="ok",
+                ok=True,
+                artifact_path="context/shell/0001-call_1.txt",
+                data={
+                    "context_artifact": "context/shell/0001-call_1.txt",
+                    "output_artifact": "artifacts/output.txt",
+                    "captured_output_artifact": "artifacts/captured.txt",
+                },
+            ),
+        )
+    )
+
+    entry = store.record_run_turn(conversation_id=conversation.conversation_id, turn_id="turn_1", user_content="hi", state=state)
+
+    assert entry["tool_summary"][0]["artifact_refs"] == [
+        "context/shell/0001-call_1.txt",
+        "artifacts/output.txt",
+        "artifacts/captured.txt",
+    ]
 
 
 def test_conversation_store_archives(tmp_path) -> None:

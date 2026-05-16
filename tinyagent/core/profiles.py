@@ -90,10 +90,12 @@ class ApexCoderProfile:
             "Use apply_patch for edits. Finish by returning assistant content when done."
         )
 
-    def build_context(self, state: RunState) -> BuiltContext:
+    def build_context(self, state: RunState, *, visible_tools: Sequence[Tool] | None = None) -> BuiltContext:
+        visible_tool_names = [tool.name for tool in visible_tools] if visible_tools is not None else self.visible_tool_names
         return ContextBuilder(system_prompt=self.system_prompt(), config=self._context_config_for_state(state)).build(
             state,
             plan=self.plan_next_context(state),
+            visible_tool_names=visible_tool_names,
         )
 
     def plan_next_context(self, state: RunState) -> ContextPlan:
@@ -254,13 +256,15 @@ class TinyPiProfile:
     def system_prompt(self) -> str:
         return self._system_prompt
 
-    def build_context(self, state: RunState) -> BuiltContext:
+    def build_context(self, state: RunState, *, visible_tools: Sequence[Tool] | None = None) -> BuiltContext:
         config = self._context_config_for_state(state)
+        visible_tool_names = [tool.name for tool in visible_tools] if visible_tools is not None else self.visible_tool_names
         instructions = load_project_instructions(state.workspace.root, config)
         recent = render_recent_tool_steps(
             state,
             config,
             ContextPlan(mode="edit" if state.tool_steps else "explore", reason="tiny-pi lean context"),
+            visible_tool_names=visible_tool_names,
         )
         messages = [
             Message(role="system", content=self.system_prompt()),
@@ -269,7 +273,7 @@ class TinyPiProfile:
             Message(role="user", content=f"Task:\n{state.task}"),
             Message(role="user", content=recent),
         ]
-        conversation = render_conversation_history(state)
+        conversation = render_conversation_history(state, visible_tool_names=frozenset(visible_tool_names))
         if conversation:
             messages.insert(3, Message(role="user", content=conversation))
         finish_gate = render_finish_gate_messages(state)

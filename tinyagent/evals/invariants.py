@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from pathlib import PurePosixPath
 
+from tinyagent.core.artifacts import TOOL_RESULT_ARTIFACT_KEYS
 from tinyagent.core.events import Event
+from tinyagent.core.path_safety import checked_relative_path
 
 STEP_TERMINALS = {"step.completed", "step.failed", "step.cancelled", "step.timeout", "step.idle_timeout"}
 RUN_TERMINALS = {"run.completed", "run.failed", "run.cancelled", "run.timed_out"}
@@ -358,16 +359,15 @@ def _artifact_paths(event: Event) -> list[str]:
     paths: list[str] = []
     for key in _ARTIFACT_PATH_KEYS:
         value = event.data.get(key)
-        if isinstance(value, str) and value:
+        if isinstance(value, str):
             paths.append(value)
     if event.type in _ARTIFACT_PATH_EVENTS:
         value = event.data.get("path")
-        if isinstance(value, str) and value:
+        if isinstance(value, str):
             paths.append(value)
     paths.extend(_nested_artifact_paths(event.data))
     for ref in event.artifact_refs:
-        if ref:
-            paths.append(ref)
+        paths.append(ref)
     return paths
 
 
@@ -398,7 +398,7 @@ def _nested_artifact_paths(value: object) -> list[str]:
     paths: list[str] = []
     if isinstance(value, dict):
         for key, item in value.items():
-            if key in _ARTIFACT_PATH_KEYS and isinstance(item, str) and item:
+            if key in _ARTIFACT_PATH_KEYS and isinstance(item, str):
                 paths.append(item)
             elif isinstance(item, dict):
                 paths.extend(_nested_artifact_paths(item))
@@ -409,10 +409,11 @@ def _nested_artifact_paths(value: object) -> list[str]:
 
 
 def _path_escapes(path: str) -> bool:
-    if path.startswith("/"):
+    try:
+        checked_relative_path(path)
+    except ValueError:
         return True
-    pure = PurePosixPath(path)
-    return any(part == ".." for part in pure.parts)
+    return False
 
 
 def _tool_call_key(event: Event) -> str:
@@ -423,9 +424,7 @@ def _tool_event_has_artifact_output(event: Event) -> bool:
     if _string(event.data.get("artifact_path")):
         return True
     data = event.data.get("data")
-    return isinstance(data, dict) and any(
-        _string(data.get(key)) for key in ("output_artifact", "context_artifact")
-    )
+    return isinstance(data, dict) and any(_string(data.get(key)) for key in TOOL_RESULT_ARTIFACT_KEYS)
 
 
 def _string(value: object) -> str:

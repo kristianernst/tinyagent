@@ -21,6 +21,7 @@ from tinyagent.core.profiles import ApexCoderProfile
 from tinyagent.core.sdk import Agent
 from tinyagent.core.state import Message, ModelResponse, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, ToolStep, Workspace
 from tinyagent.core.tools import ShellTool, default_tools
+from tinyagent.core.workspace_delta import WorkspaceDeltaObserver
 from tinyagent.evals.metrics import evaluate_thresholds, extract_run_metrics
 from tinyagent.runtime.run_graph import fork_run
 
@@ -382,10 +383,15 @@ def test_contextfs_sanitizes_transcript_observations_and_workspace_delta_artifac
     state.observations.append(
         Observation(
             kind="hook",
-            subject="artifacts/model-response-0001.json",
-            summary="command used TOKEN=secret-value against artifacts/model-response-0001.json",
+            subject=".ssh/config",
+            summary="command used TOKEN=secret-value against .ssh/config, .env.local, and artifacts/model-response-0001.json",
             refs=("artifacts/model-response-0001.json",),
-            data={"cmd": "curl https://example.com?token=secret-value", "artifact": "artifacts/model-response-0001.json"},
+            data={
+                "cmd": "cat .env.local && curl https://example.com?token=secret-value --config .ssh/config",
+                "artifact": "artifacts/model-response-0001.json",
+                "path": ".ssh/config",
+                "env_path": ".env.local",
+            },
         )
     )
     state.transcript.record_tool_call(
@@ -394,15 +400,14 @@ def test_contextfs_sanitizes_transcript_observations_and_workspace_delta_artifac
         model_call_id="model-call-x",
         tool_call_id="call_sanitize",
         tool_name="shell",
-        args={"cmd": "curl https://example.com?token=secret-value"},
+        args={"cmd": "cat .env.local && curl https://example.com?token=secret-value --config .ssh/config"},
     )
     refresh_contextfs(state)
     transcript = (state.output_dir / "context" / "transcript.md").read_text()
     observations = (state.output_dir / "context" / "observations.md").read_text()
-    assert "secret-value" not in transcript
-    assert "secret-value" not in observations
-    assert "artifacts/model-response-0001" not in transcript
-    assert "artifacts/model-response-0001" not in observations
+    for hidden in ("secret-value", "artifacts/model-response-0001", ".ssh", ".env.local", "(hidden).local"):
+        assert hidden not in transcript
+        assert hidden not in observations
 
 
 def test_workspace_delta_redacts_preexisting_dirty_tracked_diffs_from_contextfs(tmp_path) -> None:
@@ -1117,6 +1122,78 @@ def test_workspace_delta_ignores_common_generated_artifacts(tmp_path) -> None:
 
     assert state.failed is False
     assert not any(event.type == "workspace.mutation.detected" for event in state.events)
+
+
+def test_workspace_delta_ignores_secret_paths_in_non_git_workspaces(tmp_path) -> None:
+    state = RunState.create("write local secrets", Workspace(tmp_path), run_id="run_secret_delta")
+    observer = WorkspaceDeltaObserver()
+    before = observer.snapshot(state)
+    (tmp_path / ".env.local").write_text("TOKEN=secret\n")
+    (tmp_path / ".ssh").mkdir()
+    (tmp_path / ".ssh" / "config").write_text("Host secret\n")
+    after = observer.snapshot(state)
+
+    delta = observer.diff(state, before, after, ToolCall(id="call_secret", name="shell", args={}))
+
+    assert delta.mutated is False
+    assert not state.events
+
+
+def test_workspace_delta_handles_output_dir_outside_workspace(tmp_path) -> None:
+    output_dir = tmp_path.parent / "outside-delta-output"
+    output_dir.mkdir()
+    state = RunState.create("outside output delta", Workspace(tmp_path), run_id="run_outside_delta", output_dir=output_dir)
+    observer = WorkspaceDeltaObserver()
+    before = observer.snapshot(state)
+    (output_dir / "events.jsonl").write_text("trace\n")
+    (tmp_path / "generated.txt").write_text("generated\n")
+    after = observer.snapshot(state)
+
+    delta = observer.diff(state, before, after, ToolCall(id="call_generated", name="shell", args={}))
+
+    assert delta.mutated is True
+    assert delta.paths == ("generated.txt",)
+
+
+def _write_root_output_user_neighbors_and_expected_paths(root) -> tuple[str, ...]:
+    (root / "generated.txt").write_text("generated\n")
+    (root / "artifacts.txt").write_text("user artifact neighbor\n")
+    (root / "contextual").mkdir()
+    (root / "contextual" / "file.txt").write_text("user context neighbor\n")
+    (root / "metrics.json.bak").write_text("user metrics neighbor\n")
+    return ("artifacts.txt", "contextual/file.txt", "generated.txt", "metrics.json.bak")
+
+
+def test_workspace_delta_detects_git_mutation_when_output_dir_is_workspace_root(tmp_path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    state = RunState.create("root output delta", Workspace(tmp_path), run_id="run_root_output_delta", output_dir=tmp_path)
+    observer = WorkspaceDeltaObserver()
+    before = observer.snapshot(state)
+    user_paths = _write_root_output_user_neighbors_and_expected_paths(tmp_path)
+    (tmp_path / "artifacts").mkdir()
+    (tmp_path / "artifacts" / "trace.txt").write_text("trace\n")
+    after = observer.snapshot(state)
+
+    delta = observer.diff(state, before, after, ToolCall(id="call_generated", name="shell", args={}))
+
+    assert delta.mutated is True
+    assert delta.paths == user_paths
+
+
+def test_workspace_delta_detects_non_git_mutation_when_output_dir_is_workspace_root(tmp_path) -> None:
+    state = RunState.create("root output non git delta", Workspace(tmp_path), run_id="run_root_output_non_git_delta", output_dir=tmp_path)
+    observer = WorkspaceDeltaObserver()
+    before = observer.snapshot(state)
+    user_paths = _write_root_output_user_neighbors_and_expected_paths(tmp_path)
+    (tmp_path / "context").mkdir()
+    (tmp_path / "context" / "INDEX.md").write_text("context\n")
+    (tmp_path / "events.jsonl").write_text("trace\n")
+    after = observer.snapshot(state)
+
+    delta = observer.diff(state, before, after, ToolCall(id="call_generated", name="shell", args={}))
+
+    assert delta.mutated is True
+    assert delta.paths == user_paths
 
 
 def test_failed_shell_mutation_still_requires_mutation_gates(tmp_path) -> None:
