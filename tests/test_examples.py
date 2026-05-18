@@ -170,11 +170,5 @@ def _logical_request_texts(workspace: Path, run_id: str) -> list[str]:
     texts: list[str] = []
     for request_path in sorted(artifacts.glob("model-request-logical-*.json")):
         request = json.loads(request_path.read_text(encoding="utf-8"))
-        texts.append(
-            "\n".join(
-                message["content"]
-                for message in request["messages"]
-                if isinstance(message.get("content"), str)
-            )
-        )
+        texts.append("\n".join(message["content"] for message in request["messages"] if isinstance(message.get("content"), str)))
     return texts

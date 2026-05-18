@@ -52,11 +52,11 @@ _RECOVERY_ARTIFACT_RULES = (
 )
 
 
-def contextfs_index_path(state: "RunState") -> str:
+def contextfs_index_path(state: RunState) -> str:
     return f"{CONTEXT_DIR}/INDEX.md"
 
 
-def model_readable_path(state: "RunState", context_relative: str | Path) -> str:
+def model_readable_path(state: RunState, context_relative: str | Path) -> str:
     absolute = (state.output_dir / context_relative).resolve()
     try:
         return absolute.relative_to(state.workspace.root.resolve()).as_posix()
@@ -71,7 +71,7 @@ def context_display_ref(context_relative: str | Path) -> str:
     return f"context/{rel}"
 
 
-def resolve_context_path(state: "RunState", value: str) -> Path:
+def resolve_context_path(state: RunState, value: str) -> Path:
     raw = Path(value)
     if raw.is_absolute():
         candidate = raw.resolve()
@@ -98,28 +98,28 @@ def resolve_context_path(state: "RunState", value: str) -> Path:
     raise ValueError(f"Context path is not an allowed recovery file: {value}")
 
 
-def relative_output_path(state: "RunState", path: Path) -> str:
+def relative_output_path(state: RunState, path: Path) -> str:
     try:
         return path.resolve().relative_to(state.output_dir.resolve()).as_posix()
     except ValueError:
         return model_readable_path(state, path)
 
 
-def artifact_kind(state: "RunState", relative_path: str) -> str | None:
+def artifact_kind(state: RunState, relative_path: str) -> str | None:
     for event in reversed(state.events):
         if event.type == "artifact.created" and event.data.get("path") == relative_path:
             return str(event.data.get("kind") or "")
     return None
 
 
-def _recovery_artifact_allowed(state: "RunState", artifact: str) -> bool:
+def _recovery_artifact_allowed(state: RunState, artifact: str) -> bool:
     return any(
         artifact.startswith(prefix) and (not suffix or artifact.endswith(suffix)) and artifact_kind(state, artifact) == kind
         for prefix, suffix, kind in _RECOVERY_ARTIFACT_RULES
     )
 
 
-def write_context_tool_output(state: "RunState", call: "ToolCall", output: str, *, kind: str) -> str:
+def write_context_tool_output(state: RunState, call: ToolCall, output: str, *, kind: str) -> str:
     sequence = len(state.tool_steps) + 1
     tool_dir = _TOOL_CONTEXT_DIRS.get(call.name, safe_artifact_name(call.name))
     path = Path(CONTEXT_DIR) / tool_dir / f"{sequence:04d}-{safe_artifact_name(call.id)}.txt"
@@ -143,11 +143,11 @@ def read_hints(path: str, *, failure: bool = False) -> list[str]:
     quoted = shlex.quote(path)
     hints = [f"tail -120 {quoted}"]
     if failure:
-        hints.append(f"rg \"FAILED|ERROR|Traceback|AssertionError\" {quoted}")
+        hints.append(f'rg "FAILED|ERROR|Traceback|AssertionError" {quoted}')
     return hints
 
 
-def allowed_context_read_paths(state: "RunState") -> set[str]:
+def allowed_context_read_paths(state: RunState) -> set[str]:
     paths = set(_STATIC_CONTEXT_FILES)
     for optional in OPTIONAL_CONTEXT_FILE_RELS:
         if (state.output_dir / optional).exists():
@@ -170,7 +170,7 @@ def allowed_context_read_paths(state: "RunState") -> set[str]:
     return paths
 
 
-def refresh_contextfs(state: "RunState") -> str:
+def refresh_contextfs(state: RunState) -> str:
     context_dir = state.output_dir / CONTEXT_DIR
     context_dir.mkdir(parents=True, exist_ok=True)
     helpers = _context_render_helpers(state)
@@ -208,7 +208,7 @@ def refresh_contextfs(state: "RunState") -> str:
     return contextfs_index_path(state)
 
 
-def _write_text(state: "RunState", relative: str, content: str) -> None:
+def _write_text(state: RunState, relative: str, content: str) -> None:
     rel = _context_relative_path(relative)
     path = state.output_dir / rel
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -224,7 +224,7 @@ def _context_relative_path(relative: str) -> Path:
     return rel
 
 
-def _context_render_helpers(state: "RunState") -> ContextRenderHelpers:
+def _context_render_helpers(state: RunState) -> ContextRenderHelpers:
     return ContextRenderHelpers(
         context_ref=context_display_ref,
         safe_recovery_artifact_ref=lambda artifact: _safe_recovery_artifact_ref(state, artifact),
@@ -240,7 +240,7 @@ def _context_render_helpers(state: "RunState") -> ContextRenderHelpers:
     )
 
 
-def _repo_status_text(state: "RunState") -> str:
+def _repo_status_text(state: RunState) -> str:
     status = _git(state, ["status", "--short"])
     paths = _tracked_diff_paths(state)
     diff_stat = _tracked_diff_stat(state, paths)
@@ -255,7 +255,7 @@ def _repo_status_text(state: "RunState") -> str:
     return "\n".join(lines)
 
 
-def _repo_diff_text(state: "RunState") -> str:
+def _repo_diff_text(state: RunState) -> str:
     paths = _tracked_diff_paths(state)
     diff = ""
     if paths:
@@ -265,7 +265,7 @@ def _repo_diff_text(state: "RunState") -> str:
     return join_diff_parts(diff, untracked)
 
 
-def _raw_history_text(state: "RunState") -> str:
+def _raw_history_text(state: RunState) -> str:
     events_path = state.output_dir / "events.jsonl"
     if events_path.exists():
         lines = []
@@ -283,19 +283,17 @@ def _raw_history_text(state: "RunState") -> str:
                 "turn_id": event.get("turn_id"),
                 "item_id": event.get("item_id"),
                 "visibility": event.get("visibility"),
-                "artifact_refs": [
-                    artifact
-                    for artifact in event.get("artifact_refs", [])
-                    if _safe_recovery_artifact_ref(state, artifact)
-                ],
-                "data": _safe_event_data(state, str(event.get("type") or ""), event.get("data") if isinstance(event.get("data"), dict) else {}),
+                "artifact_refs": [artifact for artifact in event.get("artifact_refs", []) if _safe_recovery_artifact_ref(state, artifact)],
+                "data": _safe_event_data(
+                    state, str(event.get("type") or ""), event.get("data") if isinstance(event.get("data"), dict) else {}
+                ),
             }
             lines.append(json.dumps(safe_event, sort_keys=True))
         return "\n".join(lines) + ("\n" if lines else "")
     return ""
 
 
-def _safe_transcript_refs(state: "RunState", refs: tuple[str, ...]) -> str:
+def _safe_transcript_refs(state: RunState, refs: tuple[str, ...]) -> str:
     if not refs:
         return "(none)"
     safe = [_safe_recovery_artifact_ref(state, ref) for ref in refs]
@@ -305,7 +303,7 @@ def _safe_transcript_refs(state: "RunState", refs: tuple[str, ...]) -> str:
     return ", ".join(rendered)
 
 
-def _safe_recovery_artifact_ref(state: "RunState", artifact: object) -> str | None:
+def _safe_recovery_artifact_ref(state: RunState, artifact: object) -> str | None:
     if not isinstance(artifact, str):
         return None
     if artifact.startswith("context/"):
@@ -313,11 +311,11 @@ def _safe_recovery_artifact_ref(state: "RunState", artifact: object) -> str | No
     return artifact if _recovery_artifact_allowed(state, artifact) else None
 
 
-def _diff_doc_paths(state: "RunState") -> list[str]:
+def _diff_doc_paths(state: RunState) -> list[str]:
     return [target for _artifact, target in _diff_artifact_targets(state)]
 
 
-def _diff_artifact_targets(state: "RunState") -> list[tuple[str, str]]:
+def _diff_artifact_targets(state: RunState) -> list[tuple[str, str]]:
     output: list[tuple[str, str]] = []
     seen: set[str] = set()
     for event in state.events:
@@ -332,7 +330,7 @@ def _diff_artifact_targets(state: "RunState") -> list[tuple[str, str]]:
     return output
 
 
-def _untracked_diff_text(state: "RunState") -> str:
+def _untracked_diff_text(state: RunState) -> str:
     paths = _git(state, ["ls-files", "--others", "--exclude-standard"])
     if not paths:
         return ""
@@ -346,11 +344,13 @@ def _untracked_diff_text(state: "RunState") -> str:
     return join_diff_parts(*parts)
 
 
-def _filter_hidden_status(state: "RunState", status: str) -> str:
-    return "\n".join(line for line in status.splitlines() if not _is_hidden_recovery_path(state, line[3:].strip() if len(line) > 3 else line.strip()))
+def _filter_hidden_status(state: RunState, status: str) -> str:
+    return "\n".join(
+        line for line in status.splitlines() if not _is_hidden_recovery_path(state, line[3:].strip() if len(line) > 3 else line.strip())
+    )
 
 
-def _tracked_diff_paths(state: "RunState") -> list[str]:
+def _tracked_diff_paths(state: RunState) -> list[str]:
     args = ["diff", "--name-only", "HEAD", "--"] if _git_has_head(state) else ["diff", "--name-only", "--"]
     output = _git(state, args)
     if not output:
@@ -358,14 +358,14 @@ def _tracked_diff_paths(state: "RunState") -> list[str]:
     return [path for path in output.splitlines() if path and not _is_hidden_recovery_path(state, path)]
 
 
-def _tracked_diff_stat(state: "RunState", paths: list[str]) -> str | None:
+def _tracked_diff_stat(state: RunState, paths: list[str]) -> str | None:
     if not paths:
         return ""
     args = ["diff", "--stat", "HEAD", "--", *paths] if _git_has_head(state) else ["diff", "--stat", "--", *paths]
     return _git(state, args)
 
 
-def _is_hidden_recovery_path(state: "RunState", path: str) -> bool:
+def _is_hidden_recovery_path(state: RunState, path: str) -> bool:
     normalized = path.strip()
     while normalized.startswith("./"):
         normalized = normalized[2:]
@@ -376,12 +376,12 @@ def _is_hidden_recovery_path(state: "RunState", path: str) -> bool:
     return looks_like_secret_path(normalized)
 
 
-def _is_output_dir_path(state: "RunState", path: str) -> bool:
+def _is_output_dir_path(state: RunState, path: str) -> bool:
     output_relative = resolved_relative_to(state.output_dir, state.workspace.root)
     return output_relative is not None and relative_path_is_within(path, output_relative)
 
 
-def _safe_event_data(state: "RunState", event_type: str, data: dict) -> dict[str, object]:
+def _safe_event_data(state: RunState, event_type: str, data: dict) -> dict[str, object]:
     match event_type:
         case "run.started":
             return {
@@ -432,12 +432,16 @@ def _safe_event_data(state: "RunState", event_type: str, data: dict) -> dict[str
             return {"paths": _safe_paths(state, data.get("paths")), "ok": data.get("ok")}
         case "artifact.created":
             path = _safe_recovery_artifact_ref(state, data.get("path"))
-            return {"kind": data.get("kind"), "path": path, "bytes": data.get("bytes")} if path else {"kind": data.get("kind"), "path": "(internal)", "bytes": data.get("bytes")}
+            return (
+                {"kind": data.get("kind"), "path": path, "bytes": data.get("bytes")}
+                if path
+                else {"kind": data.get("kind"), "path": "(internal)", "bytes": data.get("bytes")}
+            )
         case _:
             return {}
 
 
-def _safe_paths(state: "RunState", value: object) -> list[str]:
+def _safe_paths(state: RunState, value: object) -> list[str]:
     if not isinstance(value, list | tuple):
         return []
     paths: list[str] = []
@@ -447,7 +451,7 @@ def _safe_paths(state: "RunState", value: object) -> list[str]:
     return paths
 
 
-def _sanitize_context_data(state: "RunState", value: Any) -> Any:
+def _sanitize_context_data(state: RunState, value: Any) -> Any:
     if isinstance(value, dict):
         output: dict[str, Any] = {}
         for key, item in value.items():
@@ -466,9 +470,13 @@ def _sanitize_context_data(state: "RunState", value: Any) -> Any:
     return value
 
 
-def _sanitize_context_value(state: "RunState", value: str) -> str:
+def _sanitize_context_value(state: RunState, value: str) -> str:
     output = str(value)
-    output = re.sub(r"artifacts/(model-(?:request|response)[A-Za-z0-9_.-]*|context-report-[A-Za-z0-9_.-]*|context-[0-9][A-Za-z0-9_.-]*)", "(internal artifact)", output)
+    output = re.sub(
+        r"artifacts/(model-(?:request|response)[A-Za-z0-9_.-]*|context-report-[A-Za-z0-9_.-]*|context-[0-9][A-Za-z0-9_.-]*)",
+        "(internal artifact)",
+        output,
+    )
     output = re.sub(r"(?i)(token|api[_-]?key|password|secret)=([^\s&]+)", r"\1=(redacted)", output)
     output = re.sub(r"\.env(?:\.[A-Za-z0-9_.-]+)?", "(hidden)", output)
     for secret_name in sorted((SECRET_FILE_NAMES | SECRET_DIR_NAMES) - {".env"}):
@@ -480,7 +488,7 @@ def _sanitize_context_value(state: "RunState", value: str) -> str:
     return output
 
 
-def _git(state: "RunState", args: list[str]) -> str | None:
+def _git(state: RunState, args: list[str]) -> str | None:
     try:
         result = subprocess.run(
             ["git", "-C", str(state.workspace.root), *args],
@@ -496,5 +504,5 @@ def _git(state: "RunState", args: list[str]) -> str | None:
     return result.stdout
 
 
-def _git_has_head(state: "RunState") -> bool:
+def _git_has_head(state: RunState) -> bool:
     return _git(state, ["rev-parse", "--verify", "HEAD"]) is not None

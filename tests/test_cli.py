@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import signal
 import socket
@@ -72,6 +73,7 @@ def test_tinyagent_serve_uses_runtime_server_options(tmp_path, capsys, monkeypat
         debug_level,
         workspace_mode,
         approval_mode,
+        session_mode,
         approvals_reviewer,
         sandbox_mode,
         profile,
@@ -90,6 +92,7 @@ def test_tinyagent_serve_uses_runtime_server_options(tmp_path, capsys, monkeypat
                 debug_level,
                 workspace_mode,
                 approval_mode,
+                session_mode,
                 approvals_reviewer,
                 sandbox_mode,
                 profile,
@@ -146,6 +149,7 @@ def test_tinyagent_serve_uses_runtime_server_options(tmp_path, capsys, monkeypat
             1,
             "current",
             "yolo",
+            "normal",
             "user",
             "none",
             "tiny-pi",
@@ -186,6 +190,72 @@ def test_tinyagent_serve_does_not_require_workspace(tmp_path, capsys, monkeypatc
     assert not (home / "workspaces").exists()
 
 
+def test_tinyagent_serve_print_json_emits_startup_contract(tmp_path, capsys, monkeypatch) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("TINYAGENT_HOME", str(home))
+    calls = []
+
+    class FakeServer:
+        server_port = 8765
+
+        def serve_forever(self):
+            raise KeyboardInterrupt
+
+        def server_close(self):
+            calls.append(("closed",))
+
+    def fake_create_product_runtime_server(home_arg, **kwargs):
+        calls.append((Path(home_arg.root), kwargs["provider"]))
+        return FakeServer()
+
+    monkeypatch.setattr(cli, "create_product_runtime_server", fake_create_product_runtime_server)
+
+    exit_code = cli.main(["serve", "--provider", "fake", "--print-json"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 130
+    assert json.loads(captured.out) == {
+        "host": "127.0.0.1",
+        "port": 8765,
+        "url": "http://127.0.0.1:8765",
+    }
+    assert calls == [(home, "fake"), ("closed",)]
+
+
+def test_tinyagent_tui_launcher_resolves_workspace_before_switching_to_tui(tmp_path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    calls = []
+
+    class Result:
+        returncode = 0
+
+    def fake_run(cmd, *, cwd, check):
+        calls.append((cmd, cwd, check))
+        return Result()
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/bun" if name == "bun" else None)
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    exit_code = cli._run_tui_launcher(
+        server=None,
+        workspace="workspace",
+        provider="fake",
+        model=None,
+        profile=None,
+        approval_mode="on-request",
+    )
+
+    assert exit_code == 0
+    cmd, cwd, check = calls[0]
+    assert cwd.name == "tui"
+    assert check is False
+    assert cmd[0] == "/usr/local/bin/bun"
+    workspace_index = cmd.index("--workspace") + 1
+    assert cmd[workspace_index] == str(workspace.resolve())
+
+
 def test_tinyagent_version_exits_successfully(capsys) -> None:
     try:
         main(["--version"])
@@ -194,7 +264,19 @@ def test_tinyagent_version_exits_successfully(capsys) -> None:
 
     captured = capsys.readouterr()
 
-    assert "tinyagent 0.1.0" in captured.out
+    assert "tinyagent 0.1.0a0" in captured.out
+
+
+def test_tinyagent_version_json_reports_alpha_product_metadata(tmp_path, capsys, monkeypatch) -> None:
+    monkeypatch.setenv("TINYAGENT_HOME", str(tmp_path / "home"))
+
+    exit_code = cli.main(["version", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["version"] == "0.1.0a0"
+    assert payload["channel"] == "alpha"
+    assert payload["home"] == str(tmp_path / "home")
 
 
 def test_tinyagent_config_path_creates_product_home(tmp_path, capsys, monkeypatch) -> None:
@@ -222,14 +304,30 @@ def test_tinyagent_doctor_reports_ok_with_fake_provider(tmp_path, capsys, monkey
     assert "status: ok" in captured.out
 
 
+def test_tinyagent_doctor_accepts_python3_without_python(tmp_path, capsys, monkeypatch) -> None:
+    monkeypatch.setenv("TINYAGENT_HOME", str(tmp_path / "home"))
+
+    def fake_which(tool: str) -> str | None:
+        if tool in {"rg", "git", "sed", "python3"}:
+            return f"/usr/bin/{tool}"
+        return None
+
+    monkeypatch.setattr("tinyagent.app.product.shutil.which", fake_which)
+
+    exit_code = cli.main(["doctor", "--workspace", str(tmp_path), "--provider", "fake", "--port", "0"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "tool python: ok (python3)" in captured.out
+    assert "status: ok" in captured.out
+
+
 def test_tinyagent_doctor_fails_for_missing_openai_compatible_env(tmp_path, capsys, monkeypatch) -> None:
     monkeypatch.setenv("TINYAGENT_HOME", str(tmp_path / "home"))
     monkeypatch.delenv("TINYAGENT_MODEL_API_KEY", raising=False)
     monkeypatch.delenv("TINYAGENT_MODEL_NAME", raising=False)
 
-    exit_code = cli.main(
-        ["doctor", "--workspace", str(tmp_path), "--provider", "openai-compatible", "--port", "0"]
-    )
+    exit_code = cli.main(["doctor", "--workspace", str(tmp_path), "--provider", "openai-compatible", "--port", "0"])
     captured = capsys.readouterr()
 
     assert exit_code == 1
@@ -342,6 +440,82 @@ def test_tinyagent_run_fake_and_replay(tmp_path, capsys) -> None:
     assert "Tinyagent Run Inspect" in inspected.out
     assert "run_id: run_cli" in inspected.out
     assert "status: completed" in inspected.out
+
+
+def test_tinyagent_run_output_format_json_is_machine_readable(tmp_path, capsys) -> None:
+    exit_code = main(
+        [
+            "run",
+            "json summary",
+            "--provider",
+            "fake",
+            "--workspace",
+            str(tmp_path),
+            "--run-id",
+            "run_json_summary",
+            "--output-format",
+            "json",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    payload = json.loads(captured.out)
+    assert payload["run_id"] == "run_json_summary"
+    assert payload["status"] == "completed"
+    assert payload["final_output"] == "Fake run finished: json summary"
+    assert payload["usage"]["model_calls"] == 1
+    assert set(payload["usage"]) == {"input_tokens", "output_tokens", "total_tokens", "model_calls", "latency_ms"}
+
+
+def test_tinyagent_run_output_format_json_keeps_text_stream_off_stdout(tmp_path, capsys) -> None:
+    exit_code = main(
+        [
+            "run",
+            "json stream check",
+            "--provider",
+            "fake",
+            "--workspace",
+            str(tmp_path),
+            "--run-id",
+            "run_json_stream",
+            "--stream",
+            "text",
+            "--output-format",
+            "json",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    payload = json.loads(captured.out)
+    assert payload["run_id"] == "run_json_stream"
+    assert payload["status"] == "completed"
+    assert "Fake run finished: json stream check" in captured.err
+    assert len(captured.out.splitlines()) == 1
+
+
+def test_tinyagent_agent_stdio_emits_jsonrpc_only_on_stdout(tmp_path, capsys, monkeypatch) -> None:
+    request = "\n".join(
+        [
+            json.dumps({"jsonrpc": "2.0", "id": 1, "method": "session.start", "params": {}}),
+            json.dumps({"jsonrpc": "2.0", "id": 2, "method": "session.prompt", "params": {"task": "stdio prompt"}}),
+            "",
+        ]
+    )
+    monkeypatch.setattr(sys, "stdin", io.StringIO(request))
+
+    exit_code = main(["agent", "stdio", "--workspace", str(tmp_path), "--provider", "fake", "--protocol", "acp"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert captured.err == ""
+    lines = [json.loads(line) for line in captured.out.splitlines()]
+    assert all(line["jsonrpc"] == "2.0" for line in lines)
+    assert lines[0]["result"]["protocol"] == "acp"
+    assert any(line.get("method") == "session.event" for line in lines)
+    assert lines[-1]["id"] == 2
+    assert lines[-1]["result"]["status"] == "completed"
 
 
 def test_tinyagent_eval_fake_smoke_suite_passes(tmp_path, capsys) -> None:
@@ -571,9 +745,7 @@ def test_tinyagent_run_explicit_provider_preserves_registered_default(tmp_path, 
     record["default_provider"] = "openai-compatible"
     workspace_record_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
 
-    exit_code = cli.main(
-        ["run", "answer", "--workspace", str(workspace), "--provider", "fake", "--run-id", "run_explicit_provider"]
-    )
+    exit_code = cli.main(["run", "answer", "--workspace", str(workspace), "--provider", "fake", "--run-id", "run_explicit_provider"])
     captured = capsys.readouterr()
     updated = json.loads(workspace_record_path.read_text())
 
@@ -595,9 +767,7 @@ def test_tinyagent_run_equals_form_provider_preserves_registered_default(tmp_pat
     record["default_provider"] = "openai-compatible"
     workspace_record_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
 
-    exit_code = cli.main(
-        ["run", "answer", "--workspace", str(workspace), "--provider=fake", "--run-id", "run_equals_provider"]
-    )
+    exit_code = cli.main(["run", "answer", "--workspace", str(workspace), "--provider=fake", "--run-id", "run_equals_provider"])
     captured = capsys.readouterr()
     updated = json.loads(workspace_record_path.read_text())
 
@@ -619,9 +789,7 @@ def test_tinyagent_run_from_git_subdir_uses_registered_git_root(tmp_path, capsys
     assert init_code == 0
     [workspace_record_path] = list((home / "workspaces").glob("ws_*/workspace.json"))
 
-    run_code = cli.main(
-        ["run", "answer", "--workspace", str(nested), "--provider", "fake", "--run-id", "run_git_root"]
-    )
+    run_code = cli.main(["run", "answer", "--workspace", str(nested), "--provider", "fake", "--run-id", "run_git_root"])
     captured = capsys.readouterr()
     record = json.loads(workspace_record_path.read_text())
     run_path = home / "workspaces" / record["workspace_id"] / "runs" / "run_git_root"
@@ -642,9 +810,7 @@ def test_tinyagent_conversations_list_show_and_archive(tmp_path, capsys, monkeyp
     workspace.mkdir()
     monkeypatch.setenv("TINYAGENT_HOME", str(home))
 
-    run_code = cli.main(
-        ["run", "hello", "--workspace", str(workspace), "--provider", "fake", "--run-id", "run_conversation_cli"]
-    )
+    run_code = cli.main(["run", "hello", "--workspace", str(workspace), "--provider", "fake", "--run-id", "run_conversation_cli"])
     run_output = capsys.readouterr().out
     assert run_code == 0
     conversation_id = next(line.split(": ", 1)[1] for line in run_output.splitlines() if line.startswith("conversation_id: "))
@@ -700,6 +866,7 @@ def test_tinyagent_serve_uses_product_conversation_root(tmp_path, capsys, monkey
         debug_level,
         workspace_mode,
         approval_mode,
+        session_mode,
         approvals_reviewer,
         sandbox_mode,
         profile,
@@ -713,13 +880,14 @@ def test_tinyagent_serve_uses_product_conversation_root(tmp_path, capsys, monkey
                 host,
                 port,
                 stream,
-                    debug_level,
-                    workspace_mode,
-                    approval_mode,
-                    approvals_reviewer,
-                    sandbox_mode,
-                    profile,
-                    profile_override,
+                debug_level,
+                workspace_mode,
+                approval_mode,
+                session_mode,
+                approvals_reviewer,
+                sandbox_mode,
+                profile,
+                profile_override,
                 memory_enabled,
             )
         )
@@ -744,6 +912,7 @@ def test_tinyagent_serve_uses_product_conversation_root(tmp_path, capsys, monkey
             0,
             "current",
             "yolo",
+            "normal",
             "user",
             "none",
             "tiny-coder",

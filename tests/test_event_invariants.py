@@ -185,9 +185,8 @@ def test_event_invariants_catch_model_tool_count_mismatch() -> None:
         Event(type="run.completed", run_id="run_bad_tool_count", seq=6),
     ]
 
-    assert (
-        "model call tool_call_count mismatch: model-call-1 expected 1, saw 0 completed assembly event(s)"
-        in check_event_invariants(events)
+    assert "model call tool_call_count mismatch: model-call-1 expected 1, saw 0 completed assembly event(s)" in check_event_invariants(
+        events
     )
 
 

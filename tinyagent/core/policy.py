@@ -354,9 +354,7 @@ _TINYAGENT_WRITE_PATTERN = re.compile(
     r"(?:(?:>|>>)\s*(?P<redirect>(?:\./)?\.tinyagent(?:/|\b)[^\s;&|]*)|"
     r"\b(?:tee|mkdir|touch|rm|mv|cp)\b[^\n;&|]*(?P<command>(?:\./)?\.tinyagent(?:/|\b)[^\s;&|]*))"
 )
-_ENV_FILE_PATTERN = re.compile(
-    r"(?P<path>(?:^|[\s'\"(=])(?:\./)?(?:[A-Za-z0-9_.-]+/)*\.env(?:\.[A-Za-z0-9_.-]+)?)(?:[\s'\"),]|$)"
-)
+_ENV_FILE_PATTERN = re.compile(r"(?P<path>(?:^|[\s'\"(=])(?:\./)?(?:[A-Za-z0-9_.-]+/)*\.env(?:\.[A-Za-z0-9_.-]+)?)(?:[\s'\"),]|$)")
 
 
 def _dirty_current_workspace(state: RunState) -> bool:
@@ -445,8 +443,11 @@ def _read_only_command_mutation(cmd: str) -> str:
     command = Path(words[0]).name
     if command == "sed" and any(word == "-i" or word.startswith("-i") for word in words[1:]):
         return "sed -i"
-    if command == "git" and len(words) > 2 and words[1] == "diff" and any(
-        word == "--output" or word.startswith("--output=") for word in words[2:]
+    if (
+        command == "git"
+        and len(words) > 2
+        and words[1] == "diff"
+        and any(word == "--output" or word.startswith("--output=") for word in words[2:])
     ):
         return "git diff --output"
     return ""

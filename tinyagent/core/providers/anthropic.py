@@ -46,8 +46,7 @@ class AnthropicMessagesConfig:
             max_output_tokens = int(values.get("TINYAGENT_MODEL_MAX_OUTPUT_TOKENS", "8000"))
         except ValueError as exc:
             raise ProviderError(
-                "TINYAGENT_MODEL_TIMEOUT_SECONDS, TINYAGENT_MODEL_CONTEXT_WINDOW, and "
-                "TINYAGENT_MODEL_MAX_OUTPUT_TOKENS must be integers."
+                "TINYAGENT_MODEL_TIMEOUT_SECONDS, TINYAGENT_MODEL_CONTEXT_WINDOW, and TINYAGENT_MODEL_MAX_OUTPUT_TOKENS must be integers."
             ) from exc
         return cls(
             base_url=base_url,

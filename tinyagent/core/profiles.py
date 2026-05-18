@@ -173,8 +173,7 @@ class ApexCoderProfile:
                 if (file_inspection_index is None or file_inspection_index <= edited_index) and not _mentions_diff_limitation(content):
                     return FinishDecision.blocked(
                         "finish blocked: inspect changed files after edits",
-                        "Before finalizing in this non-git workspace, inspect changed files "
-                        "or explain that git diff is unavailable.",
+                        "Before finalizing in this non-git workspace, inspect changed files or explain that git diff is unavailable.",
                     )
             verification_index = _latest_index(state.tool_steps, _is_successful_verification)
             if verification_index is None or verification_index < edited_index:

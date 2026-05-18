@@ -1,9 +1,0 @@
-node_modules
-dist
-dist-ssr
-.vite
-*.log
-.DS_Store
-*.tsbuildinfo
-vite.config.js
-vite.config.d.ts

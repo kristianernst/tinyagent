@@ -115,8 +115,7 @@ def is_verification_command_text(command: str) -> bool:
     return (
         is_test_command_text(command)
         or any(
-            token in text
-            for token in ("-m pytest", "-m unittest", "ruff", "mypy", "cargo check", "npm run lint", "pnpm lint", "yarn lint")
+            token in text for token in ("-m pytest", "-m unittest", "ruff", "mypy", "cargo check", "npm run lint", "pnpm lint", "yarn lint")
         )
         or _is_python_assertion_command(text)
     )

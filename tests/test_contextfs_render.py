@@ -143,7 +143,9 @@ def test_contextfs_exposes_truncated_context_tool_output_artifacts(tmp_path) -> 
         budgets=RunBudgets(max_tool_output_tokens_visible=20),
     )
     refresh_contextfs(state)
-    search = ContextSearchTool().run(ToolCall(id="call_search", name="context_search", args={"query": "truncated", "source": "contextfs"}), state)
+    search = ContextSearchTool().run(
+        ToolCall(id="call_search", name="context_search", args={"query": "truncated", "source": "contextfs"}), state
+    )
     state.tool_steps.append(ToolStep(ToolCall(id="call_search", name="context_search", args={"query": "truncated"}), search))
 
     read = ContextReadTool().run(
@@ -171,10 +173,15 @@ def test_contextfs_exposes_truncated_context_tool_output_artifacts(tmp_path) -> 
     assert "artifacts/context-read-call_read.txt: context_read `call_read` ok" in index
     assert "artifacts/context-search-call_search.txt" in (state.output_dir / "context/tools/context_search.md").read_text()
     assert "artifacts/context-read-call_read.txt" in (state.output_dir / "context/tools/context_read.md").read_text()
-    assert ContextReadTool().run(
-        ToolCall(name="context_read", args={"ref": "contextfs:artifacts/context-read-call_read.txt", "max_lines": 5}),
-        state,
-    ).ok is True
+    assert (
+        ContextReadTool()
+        .run(
+            ToolCall(name="context_read", args={"ref": "contextfs:artifacts/context-read-call_read.txt", "max_lines": 5}),
+            state,
+        )
+        .ok
+        is True
+    )
 
 
 def test_contextfs_tool_output_sanitizes_reserved_path_components(tmp_path) -> None:
@@ -201,7 +208,9 @@ def test_contextfs_render_write_stays_inside_context_dir(tmp_path) -> None:
 
 def test_contextfs_render_uses_captured_output_artifact(tmp_path) -> None:
     state = RunState.create("captured artifact render", Workspace(tmp_path), run_id="run_contextfs_captured_artifact")
-    context_artifact = write_context_tool_output(state, ToolCall(id="call_capture", name="shell", args={}), "tool output\n", kind="shell_output")
+    context_artifact = write_context_tool_output(
+        state, ToolCall(id="call_capture", name="shell", args={}), "tool output\n", kind="shell_output"
+    )
     captured = write_text_artifact(state, "workspace-delta-0001.patch", "diff --git a/file.txt b/file.txt\n", kind="workspace_delta")
     state.tool_steps.append(
         ToolStep(

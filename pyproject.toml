@@ -1,6 +1,6 @@
 [project]
 name = "tinyagent"
-version = "0.1.0"
+version = "0.1.0a0"
 description = "Minimal general-purpose agent harness."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -8,6 +8,7 @@ dependencies = []
 
 [project.scripts]
 tinyagent = "tinyagent.cli:main"
+tinyagent-tui = "tinyagent.cli:main_tui"
 
 [dependency-groups]
 dev = [
@@ -21,6 +22,18 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["tinyagent"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"tui/package.json" = "tinyagent/tui/package.json"
+"tui/bun.lock" = "tinyagent/tui/bun.lock"
+"tui/dist" = "tinyagent/tui/dist"
+"tui/src" = "tinyagent/tui/src"
+"tui/fixtures" = "tinyagent/tui/fixtures"
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "/tui/node_modules",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

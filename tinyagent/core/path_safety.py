@@ -31,7 +31,7 @@ def resolved_relative_to(path: str | Path, root: str | Path) -> Path | None:
 
 
 def is_env_file_name(name: str) -> bool:
-    return name == ".env" or name.startswith(".env.")
+    return name.startswith(".env")
 
 
 def looks_like_env_path(path: str | Path) -> bool:

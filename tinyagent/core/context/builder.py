@@ -52,18 +52,12 @@ class ContextBuilder:
             _item("system:profile", "system", self.system_prompt, "system_prompt", 1000, stable=True),
             _item("environment:current", "user", environment, "environment", 850, stable=True),
             _item("project:instructions", "user", project, "project_instructions", 800, stable=True),
-            _item("conversation:history", "user", conversation, "conversation_history", 925, stable=True)
-            if conversation
-            else None,
+            _item("conversation:history", "user", conversation, "conversation_history", 925, stable=True) if conversation else None,
             _item("task:current", "user", task, "task", 950, stable=True),
             _item("context:plan", "user", context_plan, "context_plan", 875, stable=True),
-            _item("context:observations", "user", observations, "observations", 870, stable=True)
-            if observations
-            else None,
+            _item("context:observations", "user", observations, "observations", 870, stable=True) if observations else None,
             _item("context:sources", "user", dynamic_sources, "dynamic_context_sources", 845, stable=True),
-            _item("contextfs:index", "user", contextfs_index, "contextfs_index", 900, stable=True)
-            if contextfs_index
-            else None,
+            _item("contextfs:index", "user", contextfs_index, "contextfs_index", 900, stable=True) if contextfs_index else None,
             _item("finish_gate:messages", "user", finish_gate, "finish_gate", 780) if finish_gate else None,
             _item(
                 "working_state:checkpoint",
@@ -77,13 +71,10 @@ class ContextBuilder:
         ]
         included, excluded = _pack_items([item for item in candidates if item is not None], self.config)
         messages = [
-            Message(role=item.role, content=item.text, meta={"context_layer": item.source, "context_item_id": item.id})
-            for item in included
+            Message(role=item.role, content=item.text, meta={"context_layer": item.source, "context_item_id": item.id}) for item in included
         ]
         static_context_tokens = sum(
-            estimate_tokens(message_text(message))
-            for message in messages
-            if message.meta.get("context_layer") != "recent_tool_steps"
+            estimate_tokens(message_text(message)) for message in messages if message.meta.get("context_layer") != "recent_tool_steps"
         )
         tool_context_tokens = estimate_tokens(recent_tools)
         return BuiltContext(
@@ -134,6 +125,7 @@ def render_environment_context(state: RunState, config: ContextConfig | None = N
             f"  workspace_mode: {envelope.mode if envelope else 'current'}",
             f"  workspace_effective_mode: {envelope.effective_mode if envelope else 'current'}",
             f"  approval_mode: {state.approval_mode}",
+            f"  session_mode: {state.session_mode}",
             f"  sandbox_mode: {envelope.sandbox_mode if envelope else 'none'}",
             f"  sandbox_backend: {envelope.sandbox_backend if envelope else 'none'}",
             f"  network_mode: {envelope.network_mode if envelope else 'deny'}",
@@ -555,9 +547,7 @@ def _pack_items(items: Sequence[ContextItem], config: ContextConfig) -> tuple[li
     excluded: list[ContextExclusion] = []
     total = 0
     for item in sorted(items, key=lambda value: (-value.priority, value.id)):
-        hard_include = item.stable and (
-            item.priority >= CRITICAL_CONTEXT_PRIORITY or item.token_estimate <= SMALL_STABLE_CONTEXT_TOKENS
-        )
+        hard_include = item.stable and (item.priority >= CRITICAL_CONTEXT_PRIORITY or item.token_estimate <= SMALL_STABLE_CONTEXT_TOKENS)
         if hard_include or total + item.token_estimate <= budget:
             included.append(item)
             total += item.token_estimate

@@ -427,8 +427,7 @@ class WebResearchProfile:
                 f"finish blocked: {REPORT_PATH} is incomplete",
                 (
                     f"Rewrite {REPORT_PATH} with Summary, Findings, Source Notes with exact fetched URLs, "
-                    "Caveats, and Next Checks. Do not use placeholder text."
-                    + (f"\n\n{digest}" if digest else "")
+                    "Caveats, and Next Checks. Do not use placeholder text." + (f"\n\n{digest}" if digest else "")
                 ),
             )
         if not _wrote_report(state):

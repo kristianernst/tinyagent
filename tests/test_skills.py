@@ -89,9 +89,7 @@ def test_resource_loader_can_use_resolved_runtime_capabilities(tmp_path) -> None
     extension_path = tmp_path / "extension.py"
     extension_path.write_text("raise RuntimeError('should not load')\n")
 
-    resources = ResourceLoader(
-        ResourceLoaderConfig(memory_enabled=True, trust="trusted", extension_paths=(extension_path,))
-    ).load(
+    resources = ResourceLoader(ResourceLoaderConfig(memory_enabled=True, trust="trusted", extension_paths=(extension_path,))).load(
         tmp_path,
         runtime_capabilities=ProfileRuntimeCapabilities(skills=False, dynamic_context=False, extensions=False),
     )
@@ -128,9 +126,9 @@ def test_resource_loader_extension_paths_require_trust_or_explicit_allowance(tmp
         tmp_path,
         runtime_capabilities=DEFAULT_RUNTIME_CAPABILITIES,
     )
-    allowed = ResourceLoader(
-        ResourceLoaderConfig(extension_paths=(extension_path,), allow_extension_paths=True)
-    ).load(tmp_path, runtime_capabilities=DEFAULT_RUNTIME_CAPABILITIES)
+    allowed = ResourceLoader(ResourceLoaderConfig(extension_paths=(extension_path,), allow_extension_paths=True)).load(
+        tmp_path, runtime_capabilities=DEFAULT_RUNTIME_CAPABILITIES
+    )
 
     assert [extension.name for extension in trusted.extensions] == ["local-ext"]
     assert [extension.name for extension in allowed.extensions] == ["local-ext"]

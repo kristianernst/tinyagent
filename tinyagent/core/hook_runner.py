@@ -5,8 +5,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any, Literal
 
-from tinyagent.core.contracts import Tool
 from tinyagent.core.context import BuiltContext
+from tinyagent.core.contracts import Tool
 from tinyagent.core.hooks import TinyHook
 from tinyagent.core.state import FinishDecision, ModelResponse, PolicyDecision, RunState, ToolCall, ToolResult
 
@@ -19,7 +19,7 @@ class HookRunner:
         self.error_policy = error_policy
 
     def call_void(self, state: RunState, method_name: str, *args: Any) -> None:
-        for hook, method, name in self._methods(method_name):
+        for _hook, method, name in self._methods(method_name):
             state.emit("hook.started", {"hook": name, "method": method_name})
             try:
                 method(*args)
@@ -42,7 +42,7 @@ class HookRunner:
 
     def transform(self, state: RunState, method_name: str, value: Any, *leading_args: Any) -> Any:
         current = value
-        for hook, method, name in self._methods(method_name):
+        for _hook, method, name in self._methods(method_name):
             state.emit("hook.started", {"hook": name, "method": method_name})
             try:
                 current = method(*leading_args, current)
@@ -55,7 +55,7 @@ class HookRunner:
     def before_model_call(self, state: RunState, messages: list, tools: list[Tool]) -> tuple[list, list[Tool]]:
         current_messages = messages
         current_tools = tools
-        for hook, method, name in self._methods("before_model_call"):
+        for _hook, method, name in self._methods("before_model_call"):
             state.emit("hook.started", {"hook": name, "method": "before_model_call"})
             try:
                 returned = method(state, current_messages, current_tools)
@@ -71,7 +71,7 @@ class HookRunner:
     def before_tool_call(self, state: RunState, call: ToolCall, decision: PolicyDecision) -> ToolCall | ToolResult | None:
         current = call
         changed = False
-        for hook, method, name in self._methods("before_tool_call"):
+        for _hook, method, name in self._methods("before_tool_call"):
             state.emit("hook.started", {"hook": name, "method": "before_tool_call"})
             try:
                 returned = method(state, current, decision)

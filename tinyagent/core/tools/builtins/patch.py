@@ -252,6 +252,7 @@ def _patch_path(root: Path, path: str) -> Path:
         raise ToolError(f"Path is outside workspace: {path}") from exc
     return resolved
 
+
 def _raw_patch_path(root: Path, path: str) -> Path:
     candidate = Path(path).expanduser()
     return candidate if candidate.is_absolute() else root / candidate

@@ -327,6 +327,7 @@ def _signal_process_group(process: subprocess.Popen[str], sig: signal.Signals) -
     except ProcessLookupError:
         return
 
+
 def _failure_data(failure_kind: str | None, *, capability: str, source: str, recoverability: str) -> dict[str, str]:
     if not failure_kind:
         return {}

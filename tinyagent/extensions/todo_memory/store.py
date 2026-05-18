@@ -32,9 +32,7 @@ class TodoStore:
         current = {item.id: item for item in self.read(state).items}
         next_items: list[TodoItem] = []
         reserved_ids = {
-            _safe_id(str(raw.get("id") or ""))
-            for raw in items
-            if isinstance(raw.get("id"), str) and str(raw.get("id") or "").strip()
+            _safe_id(str(raw.get("id") or "")) for raw in items if isinstance(raw.get("id"), str) and str(raw.get("id") or "").strip()
         }
         used_ids: set[str] = set()
         for index, raw in enumerate(items[:MAX_TODO_ITEMS], start=1):

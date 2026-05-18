@@ -20,7 +20,7 @@ from tinyagent.core.events import EventSink
 from tinyagent.core.kernel import Kernel
 from tinyagent.core.resources import LoadedResources
 from tinyagent.core.run_control import CancelToken
-from tinyagent.core.state import ApprovalMode, RunBudgets
+from tinyagent.core.state import ApprovalMode, RunBudgets, SessionMode
 from tinyagent.core.workspace import SandboxModeInput, WorkspaceMode
 from tinyagent.evals.metrics import evaluate_thresholds, extract_run_metrics
 from tinyagent.evals.variants import VariantSpec, validate_supported_eval_compare
@@ -138,6 +138,7 @@ def run_eval_suite(
     cancel_token: CancelToken | None = None,
     workspace_mode: WorkspaceMode = "current",
     approval_mode: ApprovalMode = "yolo",
+    session_mode: SessionMode = "normal",
     approvals_reviewer: str = "user",
     sandbox_mode: SandboxModeInput = "none",
     budgets: RunBudgets | None = None,
@@ -174,6 +175,7 @@ def run_eval_suite(
             cancel_token=cancel_token,
             workspace_mode=workspace_mode,
             approval_mode=approval_mode,
+            session_mode=session_mode,
             approvals_reviewer=approvals_reviewer,
             sandbox_mode=sandbox_mode,
             budgets=budgets,
@@ -255,7 +257,8 @@ def render_eval_report(eval_run: EvalRun) -> str:
         )
     lines.extend(
         [
-            "| Case | Provider | Protocol | Success | Status | Validation | Model calls | Tools | Batches | Input tok | Cached tok | Output tok | Errors | Policy | Finish blocks | Diff tokens |",
+            "| Case | Provider | Protocol | Success | Status | Validation | Model calls | Tools | Batches | "
+            "Input tok | Cached tok | Output tok | Errors | Policy | Finish blocks | Diff tokens |",
             "| --- | --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
@@ -410,7 +413,8 @@ def render_eval_comparison(comparison: EvalComparison) -> str:
         f"suite: {comparison.suite_path}",
         f"output_dir: {comparison.output_dir}",
         "",
-        "| Variant | Provider | Protocol | Solve rate | Validation rate | Model calls | Tools | Batches | Input tok | Cached tok | Output tok | Reason tok | Errors | Policy | Sandbox | Finish blocks | Compactions | Config | Git |",
+        "| Variant | Provider | Protocol | Solve rate | Validation rate | Model calls | Tools | Batches | "
+        "Input tok | Cached tok | Output tok | Reason tok | Errors | Policy | Sandbox | Finish blocks | Compactions | Config | Git |",
         "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
     ]
     for run in comparison.variants:
@@ -539,6 +543,7 @@ def _run_case(
     cancel_token: CancelToken | None,
     workspace_mode: WorkspaceMode,
     approval_mode: ApprovalMode,
+    session_mode: SessionMode,
     approvals_reviewer: str,
     sandbox_mode: SandboxModeInput,
     budgets: RunBudgets | None,
@@ -560,6 +565,7 @@ def _run_case(
         event_sink=event_sink,
         workspace_mode=workspace_mode,
         approval_mode=approval_mode,
+        session_mode=session_mode,
         sandbox_mode=sandbox_mode,
         resources=resources,
     )
@@ -572,6 +578,7 @@ def _run_case(
         cancel_token=cancel_token,
         workspace_mode=workspace_mode,
         approval_mode=approval_mode,
+        session_mode=session_mode,
         sandbox_mode=sandbox_mode,
     )
     record = load_run_record(run_dir)
@@ -734,9 +741,7 @@ def _write_results(
     variant_name: str = "",
     variant_metadata: dict[str, Any] | None = None,
 ) -> None:
-    (output_dir / "results.jsonl").write_text(
-        "".join(json.dumps(result.to_json_dict(), sort_keys=True) + "\n" for result in results)
-    )
+    (output_dir / "results.jsonl").write_text("".join(json.dumps(result.to_json_dict(), sort_keys=True) + "\n" for result in results))
     if variant_metadata is not None:
         (output_dir / "variant.json").write_text(json.dumps(variant_metadata, indent=2, sort_keys=True) + "\n")
     eval_run = EvalRun(

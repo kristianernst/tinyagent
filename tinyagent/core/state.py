@@ -186,6 +186,7 @@ class FinishDecision:
 
 ApprovalDecision = Literal["approved", "denied", "cancelled", "expired"]
 ApprovalMode = Literal["never", "on-request", "yolo"]
+SessionMode = Literal["normal", "plan"]
 ApprovalScope = Literal["once", "run"]
 PolicyDecisionKind = Literal["allow", "deny", "needs_approval"]
 StepKind = Literal["model_call", "tool_execution", "approval_wait", "artifact_finalization"]
@@ -312,6 +313,7 @@ class RunState:
     model_spec: dict[str, Any] = field(default_factory=dict)
     model_conversation_state: ModelConversationState | None = None
     approval_mode: ApprovalMode = "yolo"
+    session_mode: SessionMode = "normal"
     pending_approvals: dict[str, ApprovalRequest] = field(default_factory=dict)
     approval_grants: dict[str, ApprovalGrant] = field(default_factory=dict)
     finalization_attempted: bool = False
@@ -361,9 +363,7 @@ class RunState:
             raise ValueError(f"Workspace does not exist or is not a directory: {resolved_workspace.root}")
         resolved_run_id = run_id or f"run_{uuid4().hex}"
         resolved_output_dir = (
-            output_dir.expanduser().resolve()
-            if output_dir
-            else resolved_workspace.root / ".tinyagent" / "runs" / resolved_run_id
+            output_dir.expanduser().resolve() if output_dir else resolved_workspace.root / ".tinyagent" / "runs" / resolved_run_id
         )
         return cls(
             run_id=resolved_run_id,

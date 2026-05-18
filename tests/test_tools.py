@@ -33,6 +33,7 @@ from tinyagent.core.profile_catalog import (
 )
 from tinyagent.core.profiles import ApexCoderProfile, TinyPiProfile, profile_for
 from tinyagent.core.run_control import CancelToken
+from tinyagent.core.skills.tools import ListSkillsTool, LoadSkillTool
 from tinyagent.core.state import Message, ModelResponse, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, ToolStep, Workspace
 from tinyagent.core.token_utils import estimate_tokens
 from tinyagent.core.tools import (
@@ -48,7 +49,6 @@ from tinyagent.core.tools import (
 )
 from tinyagent.core.tools.builtins.patch import apply_openai_patch
 from tinyagent.core.tools.repo import MAX_READ_FILE_BYTES, repo_inspect_tools
-from tinyagent.core.skills.tools import ListSkillsTool, LoadSkillTool
 from tinyagent.extensions.todo_memory.tools import TodoReadTool, TodoWriteTool
 from tinyagent.runtime.replay import replay_run
 
@@ -68,7 +68,12 @@ def test_path_safety_helpers_cover_artifacts_envs_secrets_and_containment() -> N
         "call",
         "call",
     ]
-    assert [is_env_file_name(value) for value in (".env", ".env.local", "config.env")] == [True, True, False]
+    assert [is_env_file_name(value) for value in (".env", ".env.local", ".envrc", "config.env")] == [
+        True,
+        True,
+        True,
+        False,
+    ]
     assert [looks_like_secret_path(value) for value in (".ssh/config", "package/.npmrc", "src/env.py")] == [True, True, False]
     assert looks_like_env_path("config/.env.local")
     assert checked_relative_path("nested/file.txt").as_posix() == "nested/file.txt"
@@ -346,9 +351,7 @@ def test_shell_cancel_kills_command_and_records_cancelled(tmp_path) -> None:
         "run.cancel.requested",
         "command.cancelled",
     ]
-    assert not any(
-        event.type == "command.completed" and event.data.get("tool_call_id") == call.id for event in state.events
-    )
+    assert not any(event.type == "command.completed" and event.data.get("tool_call_id") == call.id for event in state.events)
     command = next(event for event in state.events if event.type == "command.cancelled")
     assert command.data["cmd"] == call.args["cmd"]
     assert command.data["output_artifact"].startswith("artifacts/command-output-")
@@ -407,14 +410,10 @@ def test_kernel_shell_cancel_records_only_cancelled_tool_and_command_events(tmp_
     state = state_box["state"]
     assert state.cancelled is True
     command_events = [
-        event.type
-        for event in state.events
-        if event.data.get("tool_call_id") == call.id and event.type.startswith("command.")
+        event.type for event in state.events if event.data.get("tool_call_id") == call.id and event.type.startswith("command.")
     ]
     tool_execution_events = [
-        event.type
-        for event in state.events
-        if event.data.get("tool_call_id") == call.id and event.type.startswith("tool.execution.")
+        event.type for event in state.events if event.data.get("tool_call_id") == call.id and event.type.startswith("tool.execution.")
     ]
     assert command_events == ["command.started", "command.cancelled"]
     assert tool_execution_events == ["tool.execution.started", "tool.execution.cancelled"]
@@ -798,7 +797,9 @@ def test_apex_profile_exposes_structured_inspection_edit_and_shell_by_default(tm
 
 def test_apex_profile_selects_claude_like_edit_tool_from_model_spec(tmp_path) -> None:
     state = RunState.create("test", Workspace(tmp_path), run_id="run_test")
-    state.model_spec = ModelSpec(provider="anthropic", model="claude", protocol="anthropic_messages", edit_style="str_replace").to_json_dict()
+    state.model_spec = ModelSpec(
+        provider="anthropic", model="claude", protocol="anthropic_messages", edit_style="str_replace"
+    ).to_json_dict()
     tools = _default_kernel_tools()
 
     visible = ApexCoderProfile().visible_tools(state, tools)
@@ -1036,7 +1037,9 @@ def test_tiny_pi_profile_hides_unreadable_artifacts_in_direct_build(tmp_path) ->
 
 def test_tiny_pi_profile_selects_model_specific_edit_tool(tmp_path) -> None:
     state = RunState.create("test", Workspace(tmp_path), run_id="run_tiny_pi_edit_style")
-    state.model_spec = ModelSpec(provider="anthropic", model="claude", protocol="anthropic_messages", edit_style="str_replace").to_json_dict()
+    state.model_spec = ModelSpec(
+        provider="anthropic", model="claude", protocol="anthropic_messages", edit_style="str_replace"
+    ).to_json_dict()
     tools = _default_kernel_tools()
 
     visible = TinyPiProfile().visible_tools(state, tools)
@@ -1525,9 +1528,7 @@ def test_fake_provider_trace_shells_patches_answers_with_content_and_captures_di
     assert "turn.completed" in event_types
     patch_result = next(result for result in state.tool_results if result.tool_name == "apply_patch")
     shell_result = next(
-        result
-        for step, result in [(step, step.result) for step in state.tool_steps]
-        if step.call.args.get("cmd") == "cat hello.txt"
+        result for step, result in [(step, step.result) for step in state.tool_steps] if step.call.args.get("cmd") == "cat hello.txt"
     )
     assert (state.output_dir / patch_result.data["output_artifact"]).exists()
     assert (state.output_dir / shell_result.data["output_artifact"]).read_text() == "hello tinyagent\n"

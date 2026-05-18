@@ -125,8 +125,7 @@ def prepare_workspace(
         if detected_backend is None:
             image = default_container_image()
             raise ValueError(
-                "sandbox-mode=container requires a usable Docker or Podman backend "
-                f"with local image {image!r}; image pulls are disabled"
+                f"sandbox-mode=container requires a usable Docker or Podman backend with local image {image!r}; image pulls are disabled"
             )
         sandbox_backend = detected_backend
         sandbox_enforced = True

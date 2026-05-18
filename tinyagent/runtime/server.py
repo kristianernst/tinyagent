@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import parse_qs, unquote, urlparse
 from uuid import uuid4
 
@@ -27,9 +27,11 @@ from tinyagent.core.profiles import profile_for
 from tinyagent.core.providers.factory import ProviderSpec, provider_for
 from tinyagent.core.resources import ResourceLoader, ResourceLoaderConfig
 from tinyagent.core.run_control import CancelToken
-from tinyagent.core.state import ApprovalMode, ApprovalRequest, ApprovalResolution, Message, RunState
+from tinyagent.core.skills.drafts import draft_from_run, install_draft, list_drafts, reject_draft, show_draft
+from tinyagent.core.state import ApprovalMode, ApprovalRequest, ApprovalResolution, Message, RunState, SessionMode
 from tinyagent.core.tools import default_tools
 from tinyagent.core.workspace import SandboxModeInput, WorkspaceMode
+from tinyagent.evals.runner import default_eval_output_dir, render_eval_report, run_eval_suite
 from tinyagent.extensions.lsp import LspConfig
 from tinyagent.extensions.mcp import McpClient, McpConfig, McpExtension
 from tinyagent.extensions.todo_memory import TodoMemoryExtension
@@ -37,17 +39,25 @@ from tinyagent.runtime.conversation import ConversationStore
 from tinyagent.runtime.protocol_v1 import V1_RUN_START_KEYS, error_response, health_response, openapi_spec, run_object
 from tinyagent.runtime.run_graph import fork_run
 from tinyagent.runtime.run_record import load_run_record
+from tinyagent.runtime.workspace_surface import git_status_response, workspace_files_response
 
 TERMINAL_EVENT_TYPES = {"run.completed", "run.failed", "run.cancelled", "run.timed_out"}
+APPROVAL_MODES = frozenset({"never", "on-request", "yolo"})
+SESSION_MODES = frozenset({"normal", "plan"})
 SURFACE_EVENT_TYPES = frozenset(
     {
         "run.started",
         "turn.started",
         "model.call.started",
         "model.text.delta",
+        "model.reasoning.delta",
+        "model.reasoning.completed",
         "model.message.completed",
+        "model.usage",
         "model.tool_call.assembly.completed",
         "tool.execution.started",
+        "tool.execution.output.delta",
+        "tool.execution.output.snapshot",
         "tool.execution.completed",
         "tool.execution.failed",
         "tool.execution.blocked",
@@ -59,6 +69,9 @@ SURFACE_EVENT_TYPES = frozenset(
         "artifact.created",
         "artifact.materialized",
         "workspace.mutation.detected",
+        "patch.applied",
+        "file.edited",
+        "diff.finalized",
         "run.completed",
         "run.failed",
         "run.cancelled",
@@ -96,6 +109,7 @@ class RuntimeConfig:
     debug_level: int = 0
     workspace_mode: WorkspaceMode = "current"
     approval_mode: ApprovalMode = "yolo"
+    session_mode: SessionMode = "normal"
     approvals_reviewer: str = "user"
     sandbox_mode: SandboxModeInput = "none"
     profile: str = "tiny-coder"
@@ -235,11 +249,7 @@ class RunBus(EventSink):
 
     def _purge_expired_locked(self) -> None:
         now = time.monotonic()
-        expired = [
-            run_id
-            for run_id, terminal_at in self._terminal_at_by_run.items()
-            if now - terminal_at >= self._ttl_seconds
-        ]
+        expired = [run_id for run_id, terminal_at in self._terminal_at_by_run.items() if now - terminal_at >= self._ttl_seconds]
         for run_id in expired:
             self._events_by_run.pop(run_id, None)
             self._terminal_at_by_run.pop(run_id, None)
@@ -316,6 +326,10 @@ class RunStore:
             "run_id": run_id,
             "task": started.data.get("task", "") if started else "",
             "status": _status_from_events(events, active=active),
+            "workspace_mode": started.data.get("workspace_mode", "") if started else "",
+            "approval_mode": started.data.get("approval_mode", "") if started else "",
+            "session_mode": started.data.get("session_mode", "normal") if started else "normal",
+            "sandbox_mode": started.data.get("sandbox_mode", "") if started else "",
             "event_count": events[-1].seq if events else 0,
             "event_log_only": True,
         }
@@ -328,13 +342,7 @@ class RunStore:
         events = {event.seq: event for event in load_events_jsonl(event_path) if event.seq > after_seq}
         surface_path = run_path / "surface-events.jsonl"
         if surface_path.exists():
-            events.update(
-                {
-                    event.seq: event
-                    for event in load_events_jsonl(surface_path)
-                    if event.seq > after_seq
-                }
-            )
+            events.update({event.seq: event for event in load_events_jsonl(surface_path) if event.seq > after_seq})
         return [events[seq] for seq in sorted(events)]
 
     def artifact_path(self, run_id: str, relative_path: str) -> Path:
@@ -364,6 +372,7 @@ class RunController:
         *,
         run_id: str | None = None,
         approval_mode: str | None = None,
+        session_mode: str | None = None,
         approvals_reviewer: str | None = None,
         profile: str | None = None,
     ) -> dict[str, Any]:
@@ -371,6 +380,7 @@ class RunController:
             task,
             run_id=run_id,
             approval_mode=approval_mode,
+            session_mode=session_mode,
             approvals_reviewer=approvals_reviewer,
             profile=profile,
         )
@@ -384,6 +394,7 @@ class RunController:
         parent_turn_id: str | None = None,
         run_id: str | None = None,
         approval_mode: str | None = None,
+        session_mode: str | None = None,
         approvals_reviewer: str | None = None,
         profile: str | None = None,
     ) -> dict[str, Any]:
@@ -403,6 +414,7 @@ class RunController:
             task,
             run_id=run_id,
             approval_mode=approval_mode,
+            session_mode=session_mode,
             approvals_reviewer=approvals_reviewer,
             profile=profile,
             prior_messages=prior_messages,
@@ -417,11 +429,7 @@ class RunController:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             turns = self.config.conversation_store.turns(conversation_id)
-            completed = {
-                str(turn.get("run_id"))
-                for turn in turns
-                if turn.get("type") == "turn.completed" and turn.get("run_id")
-            }
+            completed = {str(turn.get("run_id")) for turn in turns if turn.get("type") == "turn.completed" and turn.get("run_id")}
             pending = [
                 str(turn.get("run_id"))
                 for turn in turns
@@ -437,6 +445,7 @@ class RunController:
         *,
         run_id: str | None = None,
         approval_mode: str | None = None,
+        session_mode: str | None = None,
         approvals_reviewer: str | None = None,
         profile: str | None = None,
         prior_messages=(),
@@ -453,7 +462,8 @@ class RunController:
                 raise ValueError(f"run already exists: {resolved_run_id}")
             self._reserved_run_ids.add(resolved_run_id)
             self._cancel_tokens[resolved_run_id] = token
-        resolved_approval_mode = approval_mode or self.config.approval_mode
+        resolved_approval_mode = validate_approval_mode(approval_mode, self.config.approval_mode)
+        resolved_session_mode = validate_session_mode(session_mode, self.config.session_mode)
         resolved_approvals_reviewer = approvals_reviewer or self.config.approvals_reviewer
         try:
             extensions = []
@@ -476,6 +486,7 @@ class RunController:
                 stream=self.config.stream,
                 workspace_mode=self.config.workspace_mode,
                 approval_mode=resolved_approval_mode,  # type: ignore[arg-type]
+                session_mode=resolved_session_mode,  # type: ignore[arg-type]
                 sandbox_mode=self.config.sandbox_mode,
                 workspace_index_manager=self.config.workspace_index_manager,
                 extensions=extensions,
@@ -513,6 +524,7 @@ class RunController:
                     stream=self.config.stream,
                     workspace_mode=self.config.workspace_mode,
                     approval_mode=resolved_approval_mode,  # type: ignore[arg-type]
+                    session_mode=resolved_session_mode,  # type: ignore[arg-type]
                     sandbox_mode=self.config.sandbox_mode,
                     prior_messages=prior_messages,
                 )
@@ -537,6 +549,9 @@ class RunController:
             self._threads[resolved_run_id] = thread
         thread.start()
         payload = {"run_id": resolved_run_id, "run_path": str(output_dir), "status": "running"}
+        payload["approval_mode"] = resolved_approval_mode
+        payload["session_mode"] = resolved_session_mode
+        payload["profile"] = resolved_profile.name
         if conversation_id:
             payload["conversation_id"] = conversation_id
         if turn_id:
@@ -601,6 +616,75 @@ class RunController:
         )
         return {"fork_dir": str(destination)}
 
+    def eval_suite(
+        self,
+        suite_path: str,
+        *,
+        output_dir: str | None = None,
+        profile: str | None = None,
+        approval_mode: str | None = None,
+        session_mode: str | None = None,
+        approvals_reviewer: str | None = None,
+    ) -> dict[str, Any]:
+        suite = _workspace_child_path(self.config.workspace, suite_path, label="suite_path")
+        output = (
+            _workspace_child_path(self.config.workspace, output_dir, label="output_dir")
+            if output_dir
+            else self.config.workspace / default_eval_output_dir(suite)
+        )
+        resolved_profile = profile_for(profile or self.config.profile)
+        resolved_approval_mode = validate_approval_mode(approval_mode, self.config.approval_mode)
+        resolved_session_mode = validate_session_mode(session_mode, self.config.session_mode)
+        resolved_reviewer = approvals_reviewer or self.config.approvals_reviewer
+        eval_run = run_eval_suite(
+            suite,
+            output_dir=output,
+            model_factory=self.config.provider_factory,
+            profile=resolved_profile,
+            tools=default_tools(),
+            policy=default_policy(),
+            stream=False,
+            workspace_mode=self.config.workspace_mode,
+            approval_mode=resolved_approval_mode,  # type: ignore[arg-type]
+            session_mode=resolved_session_mode,  # type: ignore[arg-type]
+            approvals_reviewer=resolved_reviewer,
+            sandbox_mode=self.config.sandbox_mode,
+            resources=ResourceLoader(ResourceLoaderConfig(memory_enabled=self.config.memory_enabled)).load(
+                self.config.workspace,
+                runtime_capabilities=resolved_profile.runtime_capabilities,
+            ),
+        )
+        results = [result.to_json_dict() for result in eval_run.results]
+        passed = sum(1 for result in eval_run.results if result.success)
+        return {
+            "suite_path": str(suite),
+            "output_dir": str(output),
+            "total": len(eval_run.results),
+            "passed": passed,
+            "report": render_eval_report(eval_run),
+            "results": results,
+        }
+
+    def skill_drafts(self) -> dict[str, Any]:
+        return {"items": [_skill_draft_response(draft) for draft in list_drafts(workspace=self.config.workspace)]}
+
+    def create_skill_draft(self, run_id: str) -> dict[str, Any]:
+        if not self.run_exists(run_id):
+            raise FileNotFoundError(f"run not found: {run_id}")
+        draft = draft_from_run(self.store.run_path(run_id), workspace=self.config.workspace)
+        return {"draft": _skill_draft_response(draft)}
+
+    def show_skill_draft(self, draft_id: str) -> dict[str, Any]:
+        return {"draft_id": draft_id, "markdown": show_draft(draft_id, workspace=self.config.workspace)}
+
+    def install_skill_draft(self, draft_id: str) -> dict[str, Any]:
+        path = install_draft(draft_id, workspace=self.config.workspace)
+        return {"draft_id": draft_id, "path": str(path)}
+
+    def reject_skill_draft(self, draft_id: str) -> dict[str, Any]:
+        path = reject_draft(draft_id, workspace=self.config.workspace)
+        return {"draft_id": draft_id, "path": str(path)}
+
     def todo_state(self, run_id: str) -> dict[str, Any]:
         if not self.config.todo_memory_enabled:
             raise FileNotFoundError("todo memory extension is not enabled")
@@ -659,9 +743,7 @@ class RunController:
         if relative_path == "final.md":
             return True
         return any(
-            event.type == "artifact.created"
-            and event.data.get("path") == relative_path
-            and _artifact_public(event, relative_path)
+            event.type == "artifact.created" and event.data.get("path") == relative_path and _artifact_public(event, relative_path)
             for event in self.events(run_id)
         )
 
@@ -759,10 +841,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     self._json(HTTPStatus.NOT_FOUND, {"error": "conversation store is not configured"})
                     return
                 self.server.controller.config.conversation_store.load(parts[2])
-                turns = [
-                    turn
-                    for turn in self.server.controller.config.conversation_store.turns(parts[2])
-                ]
+                turns = [turn for turn in self.server.controller.config.conversation_store.turns(parts[2])]
                 self._json(HTTPStatus.OK, {"conversation_id": parts[2], "turns": turns})
                 return
             if len(parts) == 3 and parts[:2] == ["api", "runs"]:
@@ -818,7 +897,8 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     self.server.controller.start_run(
                         task,
                         run_id=body.get("run_id"),
-                        approval_mode=str(body.get("approval_mode") or self.server.controller.config.approval_mode),
+                        approval_mode=validate_approval_mode(body.get("approval_mode"), self.server.controller.config.approval_mode),
+                        session_mode=validate_session_mode(body.get("session_mode"), self.server.controller.config.session_mode),
                         approvals_reviewer=str(body.get("approvals_reviewer") or self.server.controller.config.approvals_reviewer),
                         profile=str(body.get("profile") or self.server.controller.config.profile),
                     ),
@@ -835,7 +915,8 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     run_id=body.get("run_id"),
                     turn_id=body.get("turn_id"),
                     parent_turn_id=body.get("parent_turn_id"),
-                    approval_mode=str(body.get("approval_mode") or self.server.controller.config.approval_mode),
+                    approval_mode=validate_approval_mode(body.get("approval_mode"), self.server.controller.config.approval_mode),
+                    session_mode=validate_session_mode(body.get("session_mode"), self.server.controller.config.session_mode),
                     approvals_reviewer=str(body.get("approvals_reviewer") or self.server.controller.config.approvals_reviewer),
                     profile=str(body.get("profile") or self.server.controller.config.profile),
                 )
@@ -895,19 +976,61 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if len(parts) == 3 and parts[0] == "workspaces" and parts[2] == "files":
+                _require_default_workspace(parts[1])
+                self._json(HTTPStatus.OK, workspace_files_response(self.server.controller.config.workspace))
+                return
+            if len(parts) == 4 and parts[0] == "workspaces" and parts[2:] == ["git", "status"]:
+                _require_default_workspace(parts[1])
+                self._json(HTTPStatus.OK, git_status_response(self.server.controller.config.workspace))
+                return
+            if parts == ["conversations"]:
+                conversations = (
+                    self.server.controller.config.conversation_store.list(workspace=self.server.controller.config.workspace)
+                    if self.server.controller.config.conversation_store is not None
+                    else []
+                )
+                self._json(HTTPStatus.OK, {"items": conversations})
+                return
+            if len(parts) == 3 and parts[0] == "conversations" and parts[2] == "turns":
+                if self.server.controller.config.conversation_store is None:
+                    self._v1_error(HTTPStatus.NOT_FOUND, "conversation_store_missing", "conversation store is not configured")
+                    return
+                self.server.controller.config.conversation_store.load(parts[1])
+                turns = self.server.controller.config.conversation_store.turns(parts[1])
+                self._json(HTTPStatus.OK, {"conversation_id": parts[1], "items": turns, "turns": turns})
+                return
             if parts == ["runs"]:
+                workspace_id = _workspace_id(parsed.query)
+                if workspace_id is not None:
+                    _require_default_workspace(workspace_id)
                 self._json(
                     HTTPStatus.OK,
                     {"items": [run_object(run) for run in self.server.controller.store.list_runs()]},
                 )
                 return
+            if parts == ["skills", "drafts"]:
+                workspace_id = _workspace_id(parsed.query)
+                if workspace_id is not None:
+                    _require_default_workspace(workspace_id)
+                self._json(HTTPStatus.OK, self.server.controller.skill_drafts())
+                return
+            if len(parts) == 3 and parts[:2] == ["skills", "drafts"]:
+                workspace_id = _workspace_id(parsed.query)
+                if workspace_id is not None:
+                    _require_default_workspace(workspace_id)
+                self._json(HTTPStatus.OK, self.server.controller.show_skill_draft(parts[2]))
+                return
             if len(parts) >= 2 and parts[0] == "runs":
+                workspace_id = _workspace_id(parsed.query)
+                if workspace_id is not None:
+                    _require_default_workspace(workspace_id)
                 self._v1_run_get_shared(
                     self.server.controller,
                     parts[1],
                     parts[2:],
                     parsed.query,
-                    workspace_id=None,
+                    workspace_id=workspace_id,
                     conversation_id=_conversation_id_for_run(self.server.controller, parts[1]),
                 )
                 return
@@ -918,7 +1041,6 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self._v1_error(HTTPStatus.BAD_REQUEST, _bad_request_code(str(exc)), str(exc))
 
     def _v1_post(self, parts: list[str], parsed, body: dict[str, Any]) -> None:
-        del parsed
         try:
             if parts == ["runs"]:
                 unsupported = sorted(set(body) - V1_RUN_START_KEYS)
@@ -926,10 +1048,13 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 if unsupported:
                     self._v1_error(HTTPStatus.BAD_REQUEST, "bad_request", f"Unsupported run fields: {', '.join(unsupported)}")
                     return
+                _require_default_workspace(_workspace_id(parsed.query) or str(body.get("workspace_id") or "default"))
                 task = str(body.get("task") or "").strip()
                 if not task:
                     self._v1_error(HTTPStatus.BAD_REQUEST, "bad_request", "task is required")
                     return
+                approval_mode = validate_approval_mode(body.get("approval_mode"), self.server.controller.config.approval_mode)
+                session_mode = validate_session_mode(body.get("session_mode"), self.server.controller.config.session_mode)
                 if body.get("conversation_id"):
                     payload = self.server.controller.start_conversation_turn(
                         str(body["conversation_id"]),
@@ -937,7 +1062,8 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                         run_id=body.get("run_id"),
                         turn_id=body.get("turn_id"),
                         parent_turn_id=body.get("parent_turn_id"),
-                        approval_mode=str(body.get("approval_mode") or self.server.controller.config.approval_mode),
+                        approval_mode=approval_mode,
+                        session_mode=session_mode,
                         approvals_reviewer=str(body.get("approvals_reviewer") or self.server.controller.config.approvals_reviewer),
                         profile=str(body.get("profile") or self.server.controller.config.profile),
                     )
@@ -945,7 +1071,8 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     payload = self.server.controller.start_run(
                         task,
                         run_id=body.get("run_id"),
-                        approval_mode=str(body.get("approval_mode") or self.server.controller.config.approval_mode),
+                        approval_mode=approval_mode,
+                        session_mode=session_mode,
                         approvals_reviewer=str(body.get("approvals_reviewer") or self.server.controller.config.approvals_reviewer),
                         profile=str(body.get("profile") or self.server.controller.config.profile),
                     )
@@ -954,7 +1081,39 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     {"run": run_object(payload), "events_url": f"/v1/runs/{payload['run_id']}/events"},
                 )
                 return
+            if parts == ["evals"]:
+                workspace_id = _workspace_id(parsed.query) or str(body.get("workspace_id") or "default")
+                _require_default_workspace(workspace_id)
+                self._json(
+                    HTTPStatus.CREATED,
+                    self.server.controller.eval_suite(
+                        str(body.get("suite_path") or ""),
+                        output_dir=str(body.get("output_dir")) if body.get("output_dir") else None,
+                        profile=str(body.get("profile")) if body.get("profile") else None,
+                        approval_mode=str(body.get("approval_mode")) if body.get("approval_mode") else None,
+                        session_mode=str(body.get("session_mode")) if body.get("session_mode") else None,
+                        approvals_reviewer=str(body.get("approvals_reviewer")) if body.get("approvals_reviewer") else None,
+                    ),
+                )
+                return
+            if parts == ["skills", "drafts"]:
+                workspace_id = _workspace_id(parsed.query) or str(body.get("workspace_id") or "default")
+                _require_default_workspace(workspace_id)
+                self._json(HTTPStatus.CREATED, self.server.controller.create_skill_draft(str(body.get("run_id") or "")))
+                return
+            if len(parts) == 4 and parts[:2] == ["skills", "drafts"] and parts[3] == "install":
+                workspace_id = _workspace_id(parsed.query) or str(body.get("workspace_id") or "default")
+                _require_default_workspace(workspace_id)
+                self._json(HTTPStatus.CREATED, self.server.controller.install_skill_draft(parts[2]))
+                return
+            if len(parts) == 4 and parts[:2] == ["skills", "drafts"] and parts[3] == "reject":
+                workspace_id = _workspace_id(parsed.query) or str(body.get("workspace_id") or "default")
+                _require_default_workspace(workspace_id)
+                self._json(HTTPStatus.CREATED, self.server.controller.reject_skill_draft(parts[2]))
+                return
             if len(parts) == 3 and parts[0] == "runs" and parts[2] == "cancel":
+                workspace_id = _workspace_id(parsed.query) or str(body.get("workspace_id") or "default")
+                _require_default_workspace(workspace_id)
                 ok = self.server.controller.cancel(parts[1], str(body.get("reason") or "server_cancelled"))
                 if not ok:
                     self._v1_error(HTTPStatus.NOT_FOUND, "run_not_active", f"Run is not active: {parts[1]}")
@@ -962,6 +1121,8 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, {"cancelled": True})
                 return
             if len(parts) == 5 and parts[0] == "runs" and parts[2] == "approvals" and parts[4] == "resolve":
+                workspace_id = _workspace_id(parsed.query) or str(body.get("workspace_id") or "default")
+                _require_default_workspace(workspace_id)
                 ok = self.server.controller.approvals.approve(
                     parts[1],
                     parts[3],
@@ -973,6 +1134,14 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     self._v1_error(HTTPStatus.NOT_FOUND, "approval_not_found", f"Approval not found: {parts[3]}")
                     return
                 self._json(HTTPStatus.OK, {"resolved": True})
+                return
+            if len(parts) == 3 and parts[0] == "runs" and parts[2] == "fork":
+                workspace_id = _workspace_id(parsed.query) or str(body.get("workspace_id") or "default")
+                _require_default_workspace(workspace_id)
+                if "output_dir" in body:
+                    self._v1_error(HTTPStatus.BAD_REQUEST, "bad_request", "custom fork output_dir is not supported by the HTTP API")
+                    return
+                self._json(HTTPStatus.CREATED, self.server.controller.fork(parts[1], str(body.get("at") or "")))
                 return
             self._v1_error(HTTPStatus.NOT_FOUND, "not_found", "Endpoint not found.")
         except FileNotFoundError as exc:
@@ -1065,9 +1234,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                         payload = _surface_event_dict(event, controller.config.debug_level)
                         payload["workspace_id"] = workspace_id or ""
                         payload["conversation_id"] = conversation_id
-                        self.wfile.write(
-                            f"id: {event.seq}\nevent: {event.type}\ndata: {json.dumps(payload, sort_keys=True)}\n\n".encode()
-                        )
+                        self.wfile.write(f"id: {event.seq}\nevent: {event.type}\ndata: {json.dumps(payload, sort_keys=True)}\n\n".encode())
                         self.wfile.flush()
                     after_seq = max(after_seq, event.seq)
                 if events and events[-1].type in TERMINAL_EVENT_TYPES:
@@ -1214,6 +1381,7 @@ def create_runtime_server(
     debug_level: int = 0,
     workspace_mode: WorkspaceMode = "current",
     approval_mode: ApprovalMode = "yolo",
+    session_mode: SessionMode = "normal",
     approvals_reviewer: str = "user",
     sandbox_mode: SandboxModeInput = "none",
     conversation_root: Path | None = None,
@@ -1225,9 +1393,7 @@ def create_runtime_server(
     resolved_workspace = workspace.expanduser().resolve()
     root = (run_root or resolved_workspace / ".tinyagent" / "runs").expanduser().resolve()
     resolved_conversation_root = (
-        conversation_root.expanduser().resolve()
-        if conversation_root is not None
-        else resolved_workspace / ".tinyagent" / "conversations"
+        conversation_root.expanduser().resolve() if conversation_root is not None else resolved_workspace / ".tinyagent" / "conversations"
     )
     spec = ProviderSpec(kind=provider, model=model_name, reasoning=reasoning)  # type: ignore[arg-type]
     provider_for(spec, "provider validation")
@@ -1240,6 +1406,7 @@ def create_runtime_server(
             debug_level=debug_level,
             workspace_mode=workspace_mode,
             approval_mode=approval_mode,
+            session_mode=session_mode,
             approvals_reviewer=approvals_reviewer,
             sandbox_mode=sandbox_mode,
             profile=profile,
@@ -1256,6 +1423,59 @@ def _path_parts(path: str) -> list[str]:
     return [unquote(part) for part in path.split("/") if part]
 
 
+def _require_default_workspace(workspace_id: str) -> None:
+    if workspace_id != "default":
+        raise FileNotFoundError(f"workspace not found: {workspace_id}")
+
+
+def _workspace_id(query: str) -> str | None:
+    values = parse_qs(query).get("workspace_id")
+    if not values:
+        return None
+    value = values[0].strip()
+    return value or None
+
+
+def validate_approval_mode(value: object | None, default: ApprovalMode) -> ApprovalMode:
+    mode = str(value or default)
+    if mode not in APPROVAL_MODES:
+        raise ValueError(f"invalid approval_mode: {mode}")
+    return cast(ApprovalMode, mode)
+
+
+def validate_session_mode(value: object | None, default: SessionMode) -> SessionMode:
+    mode = str(value or default)
+    if mode not in SESSION_MODES:
+        raise ValueError(f"invalid session_mode: {mode}")
+    return cast(SessionMode, mode)
+
+
+def _workspace_child_path(workspace: Path, value: str | None, *, label: str) -> Path:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{label} is required")
+    candidate = Path(text).expanduser()
+    if not candidate.is_absolute():
+        candidate = workspace / candidate
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(workspace.resolve())
+    except ValueError as exc:
+        raise ValueError(f"{label} must be inside the workspace: {value}") from exc
+    return resolved
+
+
+def _skill_draft_response(draft: Any) -> dict[str, Any]:
+    return {
+        "draft_id": draft.draft_id,
+        "name": draft.name,
+        "path": str(draft.path),
+        "status": draft.status,
+        "source_run_id": draft.source_run_id,
+        "created_at": draft.created_at,
+    }
+
+
 def _after_seq(query: str, last_event_id: str | None) -> int:
     values = parse_qs(query).get("after_seq")
     candidate = values[0] if values else last_event_id
@@ -1268,9 +1488,7 @@ def _after_seq(query: str, last_event_id: str | None) -> int:
 def _redact_default_surface_data(value: Any) -> Any:
     if isinstance(value, dict):
         return {
-            key: _redact_default_surface_data(item)
-            for key, item in value.items()
-            if key not in DEFAULT_SURFACE_REDACTED_EVENT_DATA_KEYS
+            key: _redact_default_surface_data(item) for key, item in value.items() if key not in DEFAULT_SURFACE_REDACTED_EVENT_DATA_KEYS
         }
     if isinstance(value, list):
         return [_redact_default_surface_data(item) for item in value]
@@ -1320,6 +1538,8 @@ def _status_from_events(events: list[Event], *, active: bool = False) -> str:
 
 def _not_found_code(message: str) -> str:
     lowered = message.lower()
+    if "workspace" in lowered:
+        return "workspace_not_found"
     if "approval" in lowered:
         return "approval_not_found"
     if "artifact" in lowered:

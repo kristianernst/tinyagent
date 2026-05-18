@@ -44,4 +44,3 @@ def join_diff_parts(*parts: str) -> str:
             output += "\n"
         output += part
     return output
-

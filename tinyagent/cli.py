@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import signal
+import subprocess
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -15,8 +17,9 @@ from uuid import uuid4
 from tinyagent import __version__
 from tinyagent.app.product import ProductHome, WorkspaceStore, render_doctor
 from tinyagent.app.server import create_product_runtime_server
+from tinyagent.app.update import DEFAULT_UPDATE_CHANNEL, UpdateManager, install_shims, render_update_status, version_payload
 from tinyagent.core.auto_review import AutoReviewApprovalHandler
-from tinyagent.core.events import ConsoleTextSink, JsonlStreamSink, debug_level_from_env
+from tinyagent.core.events import ConsoleTextSink, Event, JsonlStreamSink, debug_level_from_env
 from tinyagent.core.evolution import accept_candidate, create_prompt_experiment, create_skill_experiment, render_experiment_report
 from tinyagent.core.ids import validate_run_id
 from tinyagent.core.kernel import Kernel
@@ -54,6 +57,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"tinyagent {__version__}")
 
     subparsers = parser.add_subparsers(dest="command")
+    install_parser = subparsers.add_parser("install", help="Install a standalone alpha payload into the product home.")
+    install_parser.add_argument("--manifest", required=True, help="Manifest URL or local manifest path.")
+    install_parser.add_argument("--channel", default=DEFAULT_UPDATE_CHANNEL)
+    install_parser.add_argument("--bin-dir", type=Path, default=Path("~/.local/bin"))
+    install_parser.add_argument("--json", action="store_true")
+
+    version_parser = subparsers.add_parser("version", help="Print product version and install metadata.")
+    version_parser.add_argument("--json", action="store_true")
+
+    update_parser = subparsers.add_parser("update", help="Check, apply, and rollback standalone tinyagent updates.")
+    update_subparsers = update_parser.add_subparsers(dest="update_command")
+    update_status = update_subparsers.add_parser("status", help="Show last update state.")
+    update_status.add_argument("--json", action="store_true")
+    update_check = update_subparsers.add_parser("check", help="Check the alpha release channel for an update.")
+    update_check.add_argument("--manifest", help="Manifest URL or local manifest path.")
+    update_check.add_argument("--channel", default=DEFAULT_UPDATE_CHANNEL)
+    update_check.add_argument("--json", action="store_true")
+    update_apply = update_subparsers.add_parser("apply", help="Apply a verified standalone update.")
+    update_apply.add_argument("--manifest", help="Manifest URL or local manifest path.")
+    update_apply.add_argument("--channel", default=DEFAULT_UPDATE_CHANNEL)
+    update_apply.add_argument("--json", action="store_true")
+    update_apply.add_argument("--force-managed", action="store_true", help=argparse.SUPPRESS)
+    update_rollback = update_subparsers.add_parser("rollback", help="Switch back to the previously active version.")
+    update_rollback.add_argument("--json", action="store_true")
+
     run_parser = subparsers.add_parser("run", help="Run an agent task.")
     run_parser.add_argument("task", help="Task for the agent.")
     run_parser.add_argument("--provider", choices=DEFAULT_PROVIDER_REGISTRY.kinds(), default="fake")
@@ -61,6 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--workspace", default=".")
     run_parser.add_argument("--workspace-mode", choices=["auto", "worktree", "current"], default="auto")
     run_parser.add_argument("--approval-mode", choices=["never", "on-request", "yolo"], default="yolo")
+    run_parser.add_argument("--session-mode", choices=["normal", "plan"], default="normal")
     run_parser.add_argument("--approvals-reviewer", choices=["user", "auto_review"], default="user")
     run_parser.add_argument("--sandbox-mode", choices=["none", "container", "native"], default="none")
     run_parser.add_argument("--profile", help="Profile to run, e.g. tiny-coder or tiny-pi.")
@@ -79,6 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Live stream verbosity. Defaults to TINYAGENT_DEBUG or 0.",
     )
+    run_parser.add_argument("--output-format", choices=["text", "json"], default="text", help="Render the final run summary.")
 
     init_parser = subparsers.add_parser("init", help="Register the current folder as a tinyagent workspace.")
     init_parser.add_argument("--workspace", default=".")
@@ -138,10 +168,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve_parser.add_argument("--workspace-mode", choices=["auto", "worktree", "current"], default="current")
     serve_parser.add_argument("--approval-mode", choices=["never", "on-request", "yolo"], default="yolo")
+    serve_parser.add_argument("--session-mode", choices=["normal", "plan"], default="normal")
     serve_parser.add_argument("--approvals-reviewer", choices=["user", "auto_review"], default="user")
     serve_parser.add_argument("--sandbox-mode", choices=["none", "container", "native"], default="none")
     serve_parser.add_argument("--profile", default="tiny-coder", help="Default runtime profile.")
     serve_parser.add_argument("--memory", action="store_true", help="Enable explicit file-backed memory context.")
+    serve_parser.add_argument("--print-json", action="store_true", help="Print machine-readable server metadata before serving.")
+
+    tui_parser = subparsers.add_parser("tui", help="Launch the Bun/OpenTUI terminal client.")
+    tui_parser.add_argument("task", nargs="*", help="Optional task to start after the TUI connects.")
+    tui_parser.add_argument("--server", help="Connect to an existing tinyagent server.")
+    tui_parser.add_argument("--workspace", default=".")
+    tui_parser.add_argument("--provider", choices=DEFAULT_PROVIDER_REGISTRY.kinds(), default="fake")
+    tui_parser.add_argument("--model")
+    tui_parser.add_argument("--profile")
+    tui_parser.add_argument("--approval-mode", choices=["never", "on-request", "yolo"], default="on-request")
 
     eval_parser = subparsers.add_parser("eval", help="Run a local eval suite.")
     eval_parser.add_argument("suite_path", type=Path, help="Directory containing eval cases.")
@@ -152,6 +193,7 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument("--thresholds", type=Path)
     eval_parser.add_argument("--workspace-mode", choices=["auto", "worktree", "current"], default="current")
     eval_parser.add_argument("--approval-mode", choices=["never", "on-request", "yolo"], default="yolo")
+    eval_parser.add_argument("--session-mode", choices=["normal", "plan"], default="normal")
     eval_parser.add_argument("--approvals-reviewer", choices=["user", "auto_review"], default="user")
     eval_parser.add_argument("--sandbox-mode", choices=["none", "container", "native"], default="none")
     eval_parser.add_argument("--profile", default="tiny-coder", help="Profile to run, e.g. tiny-coder or tiny-pi.")
@@ -214,6 +256,17 @@ def build_parser() -> argparse.ArgumentParser:
     evolve_accept = evolve_subparsers.add_parser("accept", help="Accept a reviewed candidate.")
     evolve_accept.add_argument("candidate_id")
 
+    agent_parser = subparsers.add_parser("agent", help="Run machine-readable agent transports.")
+    agent_subparsers = agent_parser.add_subparsers(dest="agent_command")
+    stdio_parser = agent_subparsers.add_parser("stdio", help="Serve a JSON-RPC session over stdin/stdout.")
+    stdio_parser.add_argument("--workspace", default=".")
+    stdio_parser.add_argument("--provider", choices=DEFAULT_PROVIDER_REGISTRY.kinds(), default="fake")
+    stdio_parser.add_argument("--model")
+    stdio_parser.add_argument("--profile", default="tiny-coder")
+    stdio_parser.add_argument("--approval-mode", choices=["never", "on-request", "yolo"], default="yolo")
+    stdio_parser.add_argument("--session-mode", choices=["normal", "plan"], default="normal")
+    stdio_parser.add_argument("--protocol", choices=["tinyagent", "acp"], default="tinyagent")
+
     return parser
 
 
@@ -228,6 +281,58 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command is None:
         parser.print_help()
+        return 0
+
+    if args.command == "install":
+        home = ProductHome.from_env()
+        manager = UpdateManager(home, current_version="0.0.0", install_kind="standalone")
+        try:
+            status = manager.apply(channel=args.channel, manifest_source=args.manifest, force_managed=True)
+            shims = install_shims(home, args.bin_dir)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"install error: {exc}")
+            return 1
+        payload = {"status": status.to_json_dict(), "shims": [str(path) for path in shims]}
+        if args.json:
+            print(json.dumps(payload, sort_keys=True))
+        else:
+            print(f"installed tinyagent {status.active_version or status.latest_version}")
+            for path in shims:
+                print(f"shim: {path}")
+        return 0
+
+    if args.command == "version":
+        home = ProductHome.from_env()
+        payload = version_payload(home)
+        if args.json:
+            print(json.dumps(payload, sort_keys=True))
+        else:
+            print(f"tinyagent {payload['version']}")
+            print(f"channel: {payload['channel']}")
+            print(f"install_kind: {payload['install_kind']}")
+            print(f"home: {payload['home']}")
+        return 0
+
+    if args.command == "update":
+        manager = UpdateManager(ProductHome.from_env())
+        try:
+            if args.update_command == "status":
+                status = manager.status()
+            elif args.update_command == "check":
+                status = manager.check(channel=args.channel, manifest_source=args.manifest)
+            elif args.update_command == "apply":
+                status = manager.apply(channel=args.channel, manifest_source=args.manifest, force_managed=args.force_managed)
+            elif args.update_command == "rollback":
+                status = manager.rollback()
+            else:
+                parser.error("update requires a subcommand")
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"update error: {exc}")
+            return 1
+        if getattr(args, "json", False):
+            print(json.dumps(status.to_json_dict(), sort_keys=True))
+        else:
+            print(render_update_status(status), end="")
         return 0
 
     if args.command == "config":
@@ -312,7 +417,9 @@ def main(argv: list[str] | None = None) -> int:
                     print("No conversations.")
                     return 0
                 for conversation in rows:
-                    print(f"{conversation['conversation_id']}\t{conversation['status']}\t{conversation['turn_count']}\t{conversation['title']}")
+                    print(
+                        f"{conversation['conversation_id']}\t{conversation['status']}\t{conversation['turn_count']}\t{conversation['title']}"
+                    )
                 return 0
             if args.conversations_command == "show":
                 conversation = store.load(args.conversation_id)
@@ -389,9 +496,10 @@ def main(argv: list[str] | None = None) -> int:
             ),
             approval_handler=_approval_handler_for(args.approval_mode, args.approvals_reviewer, model),
             stream=args.stream != "off",
-            event_sink=_stream_sink(args.stream, debug_level),
+            event_sink=_stream_sink(args.stream, debug_level, output_format=args.output_format),
             workspace_mode=args.workspace_mode,
             approval_mode=args.approval_mode,
+            session_mode=args.session_mode,
             sandbox_mode=args.sandbox_mode,
         )
         cancel_token = CancelToken()
@@ -420,6 +528,7 @@ def main(argv: list[str] | None = None) -> int:
                     cancel_token=cancel_token,
                     workspace_mode=args.workspace_mode,
                     approval_mode=args.approval_mode,
+                    session_mode=args.session_mode,
                     sandbox_mode=args.sandbox_mode,
                 )
         except RunCancelled:
@@ -440,11 +549,31 @@ def main(argv: list[str] | None = None) -> int:
             if state.cancelled:
                 return 130
             return 1 if state.failed else 0
+        status = "cancelled" if state.cancelled else "failed" if state.failed else "completed"
+        if args.output_format == "json":
+            print(
+                json.dumps(
+                    {
+                        "run_id": state.run_id,
+                        "conversation_id": conversation_id or "",
+                        "output_dir": str(state.output_dir),
+                        "status": status,
+                        "final_output": state.final_output,
+                        "usage": _usage_summary(state),
+                        "failure": state.failure_reason if state.failed else "",
+                        "cancel_reason": state.cancel_reason if state.cancelled else "",
+                    },
+                    sort_keys=True,
+                )
+            )
+            if state.cancelled:
+                return 130
+            return 1 if state.failed else 0
         print(f"run_id: {state.run_id}")
         if conversation_id:
             print(f"conversation_id: {conversation_id}")
         print(f"output_dir: {state.output_dir}")
-        print(f"status: {'cancelled' if state.cancelled else 'failed' if state.failed else 'completed'}")
+        print(f"status: {status}")
         if state.cancelled:
             print(f"cancellation: {state.cancel_reason or 'cancelled'}")
             return 130
@@ -486,6 +615,7 @@ def main(argv: list[str] | None = None) -> int:
                 debug_level=debug_level,
                 workspace_mode=args.workspace_mode,
                 approval_mode=args.approval_mode,
+                session_mode=args.session_mode,
                 approvals_reviewer=args.approvals_reviewer,
                 sandbox_mode=args.sandbox_mode,
                 profile=args.profile,
@@ -495,7 +625,11 @@ def main(argv: list[str] | None = None) -> int:
         except (ProviderError, ValueError) as exc:
             print(f"serve error: {exc}")
             return 1
-        print(f"serving tinyagent runtime on http://{args.host}:{server.server_port}")
+        url = f"http://{args.host}:{server.server_port}"
+        if args.print_json:
+            print(json.dumps({"host": args.host, "port": server.server_port, "url": url}), flush=True)
+        else:
+            print(f"serving tinyagent runtime on {url}", flush=True)
         try:
             server.serve_forever()
         except KeyboardInterrupt:
@@ -503,6 +637,17 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             server.server_close()
         return 0
+
+    if args.command == "tui":
+        return _run_tui_launcher(
+            server=args.server,
+            workspace=args.workspace,
+            provider=args.provider,
+            model=args.model,
+            profile=args.profile,
+            approval_mode=args.approval_mode,
+            task=" ".join(args.task).strip(),
+        )
 
     if args.command == "eval":
         try:
@@ -540,6 +685,7 @@ def main(argv: list[str] | None = None) -> int:
                     cancel_token=cancel_token,
                     workspace_mode=args.workspace_mode,
                     approval_mode=args.approval_mode,
+                    session_mode=args.session_mode,
                     approvals_reviewer=args.approvals_reviewer,
                     sandbox_mode=args.sandbox_mode,
                 )
@@ -618,6 +764,11 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         parser.error("memory subcommand required")
 
+    if args.command == "agent":
+        if args.agent_command == "stdio":
+            return _main_agent_stdio(args)
+        parser.error("agent subcommand required")
+
     if args.command == "evolve":
         workspace = Path(args.workspace).expanduser().resolve()
         try:
@@ -645,6 +796,212 @@ def main(argv: list[str] | None = None) -> int:
 
     parser.error(f"unknown command '{args.command}'")
     return 2
+
+
+class _JsonRpcEventSink:
+    def __init__(self, *, protocol: str) -> None:
+        self.protocol = protocol
+
+    def emit(self, event: Event) -> None:
+        _write_jsonrpc(
+            {
+                "jsonrpc": "2.0",
+                "method": "session.event",
+                "params": {
+                    "protocol": self.protocol,
+                    "event": event.to_json_dict(),
+                },
+            }
+        )
+
+
+def _main_agent_stdio(args: argparse.Namespace) -> int:
+    session_id = f"session_{uuid4().hex}"
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError as exc:
+            _write_jsonrpc(_jsonrpc_error(None, -32700, f"parse error: {exc.msg}"))
+            continue
+        response = _handle_agent_stdio_request(request, args, session_id)
+        _write_jsonrpc(response)
+    return 0
+
+
+def _handle_agent_stdio_request(request: dict[str, object], args: argparse.Namespace, session_id: str) -> dict[str, object]:
+    request_id = request.get("id")
+    method = str(request.get("method") or "")
+    params = request.get("params") if isinstance(request.get("params"), dict) else {}
+    if method == "session.start":
+        return _jsonrpc_result(
+            request_id,
+            {
+                "session_id": session_id,
+                "protocol": args.protocol,
+                "capabilities": {
+                    "prompt": True,
+                    "cancel": True,
+                    "approval_resolve": True,
+                    "event_notifications": True,
+                },
+            },
+        )
+    if method == "session.cancel":
+        return _jsonrpc_result(request_id, {"cancelled": False, "reason": "stdio prototype runs prompts synchronously"})
+    if method == "approval.resolve":
+        return _jsonrpc_result(request_id, {"resolved": False, "reason": "no pending approval in stdio prototype"})
+    if method != "session.prompt":
+        return _jsonrpc_error(request_id, -32601, f"method not found: {method}")
+    task = str(params.get("task") or params.get("prompt") or "").strip()
+    if not task:
+        return _jsonrpc_error(request_id, -32602, "session.prompt requires params.task or params.prompt")
+    try:
+        model = _model_for(args.provider, task, model_name=args.model, reasoning_json=None)
+        profile = profile_for(args.profile)
+        workspace = Path(args.workspace).expanduser().resolve()
+        run_id = str(params.get("run_id") or f"run_stdio_{uuid4().hex}")
+        output_dir = workspace / ".tinyagent" / "runs" / run_id
+        kernel = Kernel(
+            model=model,
+            profile=profile,
+            tools=default_tools(),
+            policy=default_policy(),
+            resources=ResourceLoader(ResourceLoaderConfig(memory_enabled=False)).load(
+                workspace,
+                runtime_capabilities=profile.runtime_capabilities,
+            ),
+            approval_handler=None,
+            stream=True,
+            event_sink=_JsonRpcEventSink(protocol=args.protocol),
+            workspace_mode="current",
+            approval_mode=args.approval_mode,
+            session_mode=args.session_mode,
+        )
+        state = kernel.run(task, workspace=workspace, run_id=run_id, output_dir=output_dir)
+    except (OSError, ValueError, ProviderError) as exc:
+        return _jsonrpc_error(request_id, -32000, str(exc))
+    status = "cancelled" if state.cancelled else "failed" if state.failed else "completed"
+    return _jsonrpc_result(
+        request_id,
+        {
+            "session_id": session_id,
+            "run_id": state.run_id,
+            "status": status,
+            "output_dir": str(state.output_dir),
+            "final_output": state.final_output,
+        },
+    )
+
+
+def _jsonrpc_result(request_id: object, result: dict[str, object]) -> dict[str, object]:
+    return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
+
+def _jsonrpc_error(request_id: object, code: int, message: str) -> dict[str, object]:
+    return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+
+
+def _usage_summary(state: RunState) -> dict[str, int]:
+    input_tokens = 0
+    output_tokens = 0
+    total_tokens = 0
+    latency_ms = 0
+    usage_events = 0
+    for event in state.events:
+        if event.type != "model.usage":
+            continue
+        usage_events += 1
+        data = event.data
+        input_value = int(data.get("input_tokens") or data.get("prompt_tokens") or 0)
+        output_value = int(data.get("output_tokens") or data.get("completion_tokens") or 0)
+        input_tokens += input_value
+        output_tokens += output_value
+        total_tokens += int(data.get("total_tokens") or input_value + output_value)
+        latency_ms += int(data.get("latency_ms") or 0)
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "model_calls": usage_events or state.model_call_count,
+        "latency_ms": latency_ms,
+    }
+
+
+def _write_jsonrpc(payload: dict[str, object]) -> None:
+    print(json.dumps(payload, sort_keys=True), flush=True)
+
+
+def main_tui(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    parser = argparse.ArgumentParser(prog="tinyagent-tui", description="Launch the tinyagent terminal UI.")
+    parser.add_argument("task", nargs="*", help="Optional task to start after the TUI connects.")
+    parser.add_argument("--server", help="Connect to an existing tinyagent server.")
+    parser.add_argument("--workspace", default=".")
+    parser.add_argument("--provider", choices=DEFAULT_PROVIDER_REGISTRY.kinds(), default="fake")
+    parser.add_argument("--model")
+    parser.add_argument("--profile")
+    parser.add_argument("--approval-mode", choices=["never", "on-request", "yolo"], default="on-request")
+    args = parser.parse_args(argv)
+    return _run_tui_launcher(
+        server=args.server,
+        workspace=args.workspace,
+        provider=args.provider,
+        model=args.model,
+        profile=args.profile,
+        approval_mode=args.approval_mode,
+        task=" ".join(args.task).strip(),
+    )
+
+
+def _run_tui_launcher(
+    *,
+    server: str | None,
+    workspace: str,
+    provider: str,
+    model: str | None,
+    profile: str | None,
+    approval_mode: str,
+    task: str = "",
+) -> int:
+    bun = shutil.which("bun")
+    if bun is None:
+        print("tui error: Bun is required to run the OpenTUI client. Install Bun, then retry `tinyagent tui`.")
+        return 1
+    source_tui_root = Path(__file__).resolve().parents[1] / "tui"
+    packaged_tui_root = Path(__file__).resolve().parent / "tui"
+    if source_tui_root.exists():
+        tui_root = source_tui_root
+        entrypoint = tui_root / "src" / "main.ts"
+    else:
+        tui_root = packaged_tui_root
+        entrypoint = tui_root / "dist" / "main.js"
+        if not entrypoint.exists():
+            entrypoint = tui_root / "src" / "main.ts"
+    if not entrypoint.exists():
+        print(f"tui error: TUI package not found at {tui_root}")
+        return 1
+    cmd = [bun, str(entrypoint.relative_to(tui_root))]
+    if server:
+        cmd.extend(["--server", server])
+    else:
+        resolved_workspace = str(Path(workspace).expanduser().resolve())
+        cmd.extend(["--workspace", resolved_workspace, "--provider", provider])
+    if model:
+        cmd.extend(["--model", model])
+    if profile:
+        cmd.extend(["--profile", profile])
+    if approval_mode:
+        cmd.extend(["--approval-mode", approval_mode])
+    if task:
+        cmd.append(task)
+    try:
+        return subprocess.run(cmd, cwd=tui_root, check=False).returncode
+    except OSError as exc:
+        print(f"tui error: {exc}")
+        return 1
 
 
 def _main_eval_compare(argv: list[str]) -> int:
@@ -701,13 +1058,7 @@ def _has_cli_option(argv: list[str], option: str) -> bool:
 def _looks_like_run_id(path: Path) -> bool:
     value = str(path)
     candidate = Path(value).expanduser()
-    return (
-        not candidate.exists()
-        and not candidate.is_absolute()
-        and "/" not in value
-        and "\\" not in value
-        and not value.startswith(".")
-    )
+    return not candidate.exists() and not candidate.is_absolute() and "/" not in value and "\\" not in value and not value.startswith(".")
 
 
 def _is_existing_path(path: Path) -> bool:
@@ -750,9 +1101,9 @@ def _debug_level(level: int | None) -> int:
     return level
 
 
-def _stream_sink(mode: str, debug_level: int):
+def _stream_sink(mode: str, debug_level: int, *, output_format: str = "text"):
     if mode == "text":
-        return ConsoleTextSink(sys.stdout)
+        return ConsoleTextSink(sys.stderr if output_format == "json" else sys.stdout)
     if mode == "jsonl":
         return JsonlStreamSink(sys.stdout, debug_level=debug_level)
     return None

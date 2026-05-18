@@ -69,11 +69,7 @@ class OpenAIResponsesConfig:
     @classmethod
     def codex_from_env(cls, env: Mapping[str, str] | None = None) -> OpenAIResponsesConfig:
         values = os.environ if env is None else env
-        base_url = (
-            values.get("TINYAGENT_CODEX_BASE_URL")
-            or values.get("TINYAGENT_MODEL_BASE_URL")
-            or DEFAULT_CODEX_RESPONSES_BASE_URL
-        )
+        base_url = values.get("TINYAGENT_CODEX_BASE_URL") or values.get("TINYAGENT_MODEL_BASE_URL") or DEFAULT_CODEX_RESPONSES_BASE_URL
         model = values.get("TINYAGENT_CODEX_MODEL_NAME") or values.get("TINYAGENT_MODEL_NAME")
         if not model:
             raise ProviderError("TINYAGENT_MODEL_NAME is required for openai-codex provider.")
@@ -97,13 +93,10 @@ class OpenAIResponsesConfig:
         shared = _shared_config_from_env(values)
         if shared["reasoning"] is not None:
             raise ProviderError("TINYAGENT_MODEL_REASONING_JSON is not supported by open-responses provider.")
-        unsupported_keys = sorted(
-            key for key in shared["extra_body"] if key in {"conversation", "previous_response_id", "reasoning"}
-        )
+        unsupported_keys = sorted(key for key in shared["extra_body"] if key in {"conversation", "previous_response_id", "reasoning"})
         if unsupported_keys:
             raise ProviderError(
-                "open-responses provider is stateless by default and cannot use unsupported fields: "
-                + ", ".join(unsupported_keys)
+                "open-responses provider is stateless by default and cannot use unsupported fields: " + ", ".join(unsupported_keys)
             )
         return cls(
             base_url=base_url,
@@ -708,8 +701,7 @@ def _codex_token_from_auth_file(values: Mapping[str, str]) -> str:
     auth_path = _codex_auth_path(values)
     if auth_path is None or not auth_path.is_file():
         raise ProviderError(
-            "TINYAGENT_CODEX_BEARER_TOKEN, TINYAGENT_CODEX_AUTH_COMMAND, or a Codex auth.json file "
-            "is required for openai-codex provider."
+            "TINYAGENT_CODEX_BEARER_TOKEN, TINYAGENT_CODEX_AUTH_COMMAND, or a Codex auth.json file is required for openai-codex provider."
         )
     try:
         payload = json.loads(auth_path.read_text())

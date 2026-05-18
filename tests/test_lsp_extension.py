@@ -241,11 +241,7 @@ def test_lsp_config_merge_does_not_disable_when_workspace_has_no_lsp_table(tmp_p
     home_config = tmp_path / "home.toml"
     workspace_config = tmp_path / "workspace.toml"
     home_config.write_text(
-        "[extensions.lsp]\n"
-        "enabled = true\n"
-        "[extensions.lsp.servers.python]\n"
-        'command = ["pyright"]\n'
-        'extensions = [".py"]\n'
+        '[extensions.lsp]\nenabled = true\n[extensions.lsp.servers.python]\ncommand = ["pyright"]\nextensions = [".py"]\n'
     )
     workspace_config.write_text("[mcp.github]\nenabled = false\n")
 

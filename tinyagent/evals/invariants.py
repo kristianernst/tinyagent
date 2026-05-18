@@ -181,9 +181,7 @@ def _check_tool_calls(events: Sequence[Event], failures: list[str]) -> None:
     terminal_without_start: dict[str, Event] = {}
     blocked_seen: set[str] = set()
     output_snapshots = {
-        _tool_call_key(event): event.seq
-        for event in events
-        if event.type == "tool.execution.output.snapshot" and _tool_call_key(event)
+        _tool_call_key(event): event.seq for event in events if event.type == "tool.execution.output.snapshot" and _tool_call_key(event)
     }
     for event in events:
         tool_call_id = _string(event.data.get("tool_call_id"))

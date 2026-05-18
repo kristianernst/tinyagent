@@ -235,9 +235,7 @@ def test_eval_comparison_runs_fake_variants_and_writes_metadata(tmp_path) -> Non
     suite = _write_suite(tmp_path)
     baseline = tmp_path / "baseline.toml"
     contextfs = tmp_path / "contextfs.toml"
-    baseline.write_text(
-        'provider = "fake"\nmodel = "baseline"\nvisible_tools = ["read_file", "search_code", "apply_patch", "shell"]\n'
-    )
+    baseline.write_text('provider = "fake"\nmodel = "baseline"\nvisible_tools = ["read_file", "search_code", "apply_patch", "shell"]\n')
     contextfs.write_text(
         'provider = "fake"\n'
         'model = "contextfs"\n'
@@ -351,11 +349,7 @@ def test_eval_comparison_can_run_tiny_pi_variant_with_resources(tmp_path) -> Non
     )
 
     result = comparison.variants[0].results[0]
-    events = [
-        json.loads(line)
-        for line in (Path(result.run_path) / "events.jsonl").read_text().splitlines()
-        if line
-    ]
+    events = [json.loads(line) for line in (Path(result.run_path) / "events.jsonl").read_text().splitlines() if line]
     started = next(event for event in events if event["type"] == "run.started")
     context = next(event for event in events if event["type"] == "context.built")
 
@@ -679,11 +673,7 @@ def test_eval_comparison_rejects_unsupported_config_fields(tmp_path) -> None:
 def test_eval_config_accepts_default_profile_placeholders(tmp_path) -> None:
     config = tmp_path / "variant.toml"
     config.write_text(
-        'provider = "fake"\n'
-        'profile = "tiny-coder"\n'
-        'profile_variant = "default"\n'
-        'context_policy = "dynamic-v1"\n'
-        'tool_surface = "default"\n'
+        'provider = "fake"\nprofile = "tiny-coder"\nprofile_variant = "default"\ncontext_policy = "dynamic-v1"\ntool_surface = "default"\n'
     )
 
     variant = VariantSpec.parse(f"baseline={config}")
@@ -697,11 +687,7 @@ def test_eval_config_accepts_default_profile_placeholders(tmp_path) -> None:
 def test_eval_config_accepts_tiny_pi_profile_placeholders(tmp_path) -> None:
     config = tmp_path / "variant.toml"
     config.write_text(
-        'provider = "fake"\n'
-        'profile = "tiny-pi"\n'
-        'profile_variant = "minimal"\n'
-        'context_policy = "pi-v1"\n'
-        'tool_surface = "pi-minimal"\n'
+        'provider = "fake"\nprofile = "tiny-pi"\nprofile_variant = "minimal"\ncontext_policy = "pi-v1"\ntool_surface = "pi-minimal"\n'
     )
 
     variant = VariantSpec.parse(f"pi={config}")

@@ -143,9 +143,7 @@ def write_model_request_artifacts(
         f"model-request-logical-{call_index:04d}.json",
         {
             "provider": provider,
-            "conversation_state": (
-                state.model_conversation_state.to_json_dict() if state.model_conversation_state is not None else None
-            ),
+            "conversation_state": (state.model_conversation_state.to_json_dict() if state.model_conversation_state is not None else None),
             "messages": [_message_dict(message) for message in messages],
             "tools": [_tool_dict(tool) for tool in tools],
         },
@@ -171,9 +169,7 @@ def write_context_report_artifact(
             "budget": budget,
             "model_capabilities": model_capabilities.to_json_dict() if model_capabilities is not None else None,
             "context_plan": (
-                built_context.context_plan.to_json_dict()
-                if getattr(built_context, "context_plan", None) is not None
-                else None
+                built_context.context_plan.to_json_dict() if getattr(built_context, "context_plan", None) is not None else None
             ),
             "contextfs_index_path": built_context.contextfs_index_path,
             "included": [
@@ -226,9 +222,7 @@ def write_model_response_artifact(
             "content": response.content,
             "finish_reason": response.finish_reason,
             "tool_calls": [_tool_call_dict(call) for call in response.tool_calls],
-            "conversation_state": (
-                response.conversation_state.to_json_dict() if response.conversation_state is not None else None
-            ),
+            "conversation_state": (response.conversation_state.to_json_dict() if response.conversation_state is not None else None),
             "raw": response.raw,
         },
         kind="model_response",
@@ -261,9 +255,7 @@ def _metrics(state: RunState) -> dict[str, Any]:
         "output_dir": str(state.output_dir),
         "turn_count": state.turn_count,
         "model_call_count": state.model_call_count,
-        "model_conversation_state": (
-            state.model_conversation_state.to_json_dict() if state.model_conversation_state is not None else None
-        ),
+        "model_conversation_state": (state.model_conversation_state.to_json_dict() if state.model_conversation_state is not None else None),
         "tool_call_count": state.tool_call_count,
         "event_count": state.seq,
         "durable_event_count": len(state.events),
@@ -281,6 +273,7 @@ def _metrics(state: RunState) -> dict[str, Any]:
         "workspace_effective_mode": envelope.effective_mode if envelope else "current",
         "workspace_allowed_roots": [str(root) for root in envelope.allowed_roots] if envelope else [str(state.workspace.root)],
         "approval_mode": state.approval_mode,
+        "session_mode": state.session_mode,
         "sandbox_mode": envelope.sandbox_mode if envelope else "none",
         "sandbox_backend": envelope.sandbox_backend if envelope else "none",
         "network_mode": envelope.network_mode if envelope else "deny",

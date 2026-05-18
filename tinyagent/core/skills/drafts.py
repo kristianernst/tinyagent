@@ -158,7 +158,9 @@ def eval_draft(
             {
                 "suite_path": str(suite_path),
                 "output_dir": str(output_dir),
-                "variants": [{"name": run.variant_name, "results": [result.to_json_dict() for result in run.results]} for run in comparison.variants],
+                "variants": [
+                    {"name": run.variant_name, "results": [result.to_json_dict() for result in run.results]} for run in comparison.variants
+                ],
             },
             indent=2,
             sort_keys=True,
@@ -259,7 +261,9 @@ def _source_summary(
             "hidden_artifacts_skipped": hidden_artifacts,
         },
         "changed_paths": _changed_files(root / "final.diff"),
-        "verification": [{"cmd": _sanitize_text(cmd), "returncode": _command_returncode(record, cmd)} for cmd in verification_commands[:10]],
+        "verification": [
+            {"cmd": _sanitize_text(cmd), "returncode": _command_returncode(record, cmd)} for cmd in verification_commands[:10]
+        ],
         "metrics": {
             "duration_seconds": record.duration_seconds,
             "turn_count": record.turn_count,

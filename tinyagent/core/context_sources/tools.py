@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import time
 
-from tinyagent.core.contracts import ToolRuntime
 from tinyagent.core.context_sources.registry import ContextRegistry, context_registry_for_state
+from tinyagent.core.contracts import ToolRuntime
 from tinyagent.core.output import write_text_artifact
 from tinyagent.core.path_safety import safe_artifact_name
 from tinyagent.core.state import RunState, ToolCall, ToolResult
@@ -19,8 +19,7 @@ class ContextSearchTool:
     schema = {
         "name": "context_search",
         "description": (
-            "Search dynamic context sources such as ContextFS, conversation history, "
-            "past runs, skills, and indexed workspace content."
+            "Search dynamic context sources such as ContextFS, conversation history, past runs, skills, and indexed workspace content."
         ),
         "parameters": {
             "type": "object",
@@ -148,8 +147,7 @@ class ContextReadTool:
             return error_result(self.name, call, exc)
 
         numbered = "\n".join(
-            f"{line_number}: {line}"
-            for line_number, line in enumerate(chunk.content.splitlines(), start=chunk.start_line or 1)
+            f"{line_number}: {line}" for line_number, line in enumerate(chunk.content.splitlines(), start=chunk.start_line or 1)
         )
         lines = [
             f"Ref: {chunk.ref}",

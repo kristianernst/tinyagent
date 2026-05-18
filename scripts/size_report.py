@@ -114,7 +114,7 @@ def _group_stats(root: Path, *, exclude: set[str] | None = None) -> list[GroupSt
         "tinyagent-app": [],
         "tinyagent-cli": [],
         "tinyagent-evals": [],
-        "chatui": [],
+        "tui": [],
         "tests": [],
         "docs": [],
         "repo-scripts": [],
@@ -161,8 +161,8 @@ def _group_for(path: str) -> str:
         return "tinyagent-evals"
     if path == "tinyagent/cli.py":
         return "tinyagent-cli"
-    if path.startswith("chatui/"):
-        return "chatui"
+    if path.startswith("tui/"):
+        return "tui"
     if path.startswith("tests/"):
         return "tests"
     if path.startswith("docs/"):

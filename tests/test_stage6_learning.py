@@ -45,13 +45,13 @@ def test_skill_draft_generation_install_and_reject_from_successful_run(tmp_path)
     )
     state = Kernel(
         model=FakeModelProvider(
-                [
-                    ModelResponse(tool_calls=(ToolCall(name="apply_patch", args={"patch": patch}),)),
-                    ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": f"{sys.executable} -m pytest --version"}),)),
-                    ModelResponse(tool_calls=(ToolCall(name="read_file", args={"path": "hello.txt"}),)),
-                    ModelResponse(content="Updated hello.txt. Verification passed with python -m pytest --version.", finish_reason="stop"),
-                ]
-            ),
+            [
+                ModelResponse(tool_calls=(ToolCall(name="apply_patch", args={"patch": patch}),)),
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": f"{sys.executable} -m pytest --version"}),)),
+                ModelResponse(tool_calls=(ToolCall(name="read_file", args={"path": "hello.txt"}),)),
+                ModelResponse(content="Updated hello.txt. Verification passed with python -m pytest --version.", finish_reason="stop"),
+            ]
+        ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
         policy=WorkspaceShellPolicy(),
@@ -202,10 +202,14 @@ def test_memory_files_are_explicit_and_optional_context_source(tmp_path) -> None
     assert (tmp_path / ".tinyagent" / "memory" / "project.md").read_text() == "Remember the websocket decision.\n"
     assert "memory:project" in searched.output
     assert "websocket decision" in read.output
-    assert ResourceLoader(ResourceLoaderConfig(memory_enabled=True)).load(
-        tmp_path,
-        runtime_capabilities=DEFAULT_RUNTIME_CAPABILITIES,
-    ).context_sources
+    assert (
+        ResourceLoader(ResourceLoaderConfig(memory_enabled=True))
+        .load(
+            tmp_path,
+            runtime_capabilities=DEFAULT_RUNTIME_CAPABILITIES,
+        )
+        .context_sources
+    )
     assert (
         ResourceLoader(ResourceLoaderConfig(memory_enabled=True))
         .load(tmp_path, runtime_capabilities=TINY_PI_RUNTIME_CAPABILITIES)

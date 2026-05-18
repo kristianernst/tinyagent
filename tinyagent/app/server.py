@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
 import threading
 from collections.abc import Callable
 from http import HTTPStatus
@@ -13,17 +12,27 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from tinyagent.app.product import ProductHome, WorkspaceRecord, WorkspaceStore
+from tinyagent.app.update import UpdateManager
 from tinyagent.core.contracts import ModelProvider
 from tinyagent.core.index import WorkspaceIndexManager
 from tinyagent.core.models import ProviderError
 from tinyagent.core.providers.factory import ProviderSpec, provider_for
-from tinyagent.core.state import ApprovalMode
+from tinyagent.core.state import ApprovalMode, SessionMode
 from tinyagent.core.workspace import SandboxModeInput, WorkspaceMode
 from tinyagent.extensions.lsp import load_lsp_config
 from tinyagent.extensions.mcp import load_mcp_config
 from tinyagent.runtime.conversation import ConversationStore
 from tinyagent.runtime.protocol_v1 import V1_RUN_START_KEYS, error_response, health_response, openapi_spec, run_object
-from tinyagent.runtime.server import RunController, RuntimeConfig, RuntimeHandler, UnsupportedMediaType, _conversation_id_for_run
+from tinyagent.runtime.server import (
+    RunController,
+    RuntimeConfig,
+    RuntimeHandler,
+    UnsupportedMediaType,
+    _conversation_id_for_run,
+    validate_approval_mode,
+    validate_session_mode,
+)
+from tinyagent.runtime.workspace_surface import git_status_response, workspace_files_response
 
 
 class ProductRuntimeController:
@@ -36,6 +45,7 @@ class ProductRuntimeController:
         debug_level: int = 0,
         workspace_mode: WorkspaceMode = "current",
         approval_mode: ApprovalMode = "yolo",
+        session_mode: SessionMode = "normal",
         approvals_reviewer: str = "user",
         sandbox_mode: SandboxModeInput = "none",
         profile: str = "tiny-coder",
@@ -44,12 +54,14 @@ class ProductRuntimeController:
         memory_enabled: bool = False,
     ) -> None:
         home.ensure()
+        self.home = home
         self.store = WorkspaceStore(home)
         self.provider_factory = provider_factory
         self.stream = stream
         self.debug_level = debug_level
         self.workspace_mode = workspace_mode
         self.approval_mode = approval_mode
+        self.session_mode = session_mode
         self.approvals_reviewer = approvals_reviewer
         self.sandbox_mode = sandbox_mode
         self.profile = profile
@@ -64,6 +76,18 @@ class ProductRuntimeController:
 
     def register_workspace(self, root: Path, *, name: str | None = None) -> dict[str, Any]:
         return self.store.register(root, name=name).to_json_dict()
+
+    def update_status(self) -> dict[str, Any]:
+        return UpdateManager(self.home).auto_check_if_configured().to_json_dict()
+
+    def update_check(self, *, channel: str | None = None, manifest_source: str | None = None) -> dict[str, Any]:
+        return UpdateManager(self.home).check(channel=channel, manifest_source=manifest_source).to_json_dict()
+
+    def update_apply(self, *, channel: str | None = None, manifest_source: str | None = None) -> dict[str, Any]:
+        return UpdateManager(self.home).apply(channel=channel, manifest_source=manifest_source).to_json_dict()
+
+    def update_rollback(self) -> dict[str, Any]:
+        return UpdateManager(self.home).rollback().to_json_dict()
 
     def controller_for_workspace(self, workspace_id: str) -> RunController:
         with self._lock:
@@ -95,6 +119,7 @@ class ProductRuntimeController:
                 debug_level=self.debug_level,
                 workspace_mode=self.workspace_mode,
                 approval_mode=self.approval_mode,
+                session_mode=self.session_mode,
                 approvals_reviewer=self.approvals_reviewer,
                 sandbox_mode=self.sandbox_mode,
                 profile=self.profile if self.profile_override else record.default_profile,
@@ -233,7 +258,8 @@ class ProductRuntimeHandler(RuntimeHandler):
                     controller.start_run(
                         task,
                         run_id=body.get("run_id"),
-                        approval_mode=str(body.get("approval_mode") or controller.config.approval_mode),
+                        approval_mode=validate_approval_mode(body.get("approval_mode"), controller.config.approval_mode),
+                        session_mode=validate_session_mode(body.get("session_mode"), controller.config.session_mode),
                         approvals_reviewer=str(body.get("approvals_reviewer") or controller.config.approvals_reviewer),
                         profile=str(body.get("profile") or controller.config.profile),
                     ),
@@ -250,7 +276,8 @@ class ProductRuntimeHandler(RuntimeHandler):
                     run_id=body.get("run_id"),
                     turn_id=body.get("turn_id"),
                     parent_turn_id=body.get("parent_turn_id"),
-                    approval_mode=str(body.get("approval_mode") or controller.config.approval_mode),
+                    approval_mode=validate_approval_mode(body.get("approval_mode"), controller.config.approval_mode),
+                    session_mode=validate_session_mode(body.get("session_mode"), controller.config.session_mode),
                     approvals_reviewer=str(body.get("approvals_reviewer") or controller.config.approvals_reviewer),
                     profile=str(body.get("profile") or controller.config.profile),
                 )
@@ -296,7 +323,10 @@ class ProductRuntimeHandler(RuntimeHandler):
                 self._json(HTTPStatus.OK, health_response())
                 return
             if parts == ["openapi.json"]:
-                self._json(HTTPStatus.OK, openapi_spec())
+                self._json(HTTPStatus.OK, openapi_spec(product=True))
+                return
+            if parts in (["update"], ["update", "status"]):
+                self._json(HTTPStatus.OK, self.server.product.update_status())
                 return
             if parts == ["workspaces"]:
                 self._json(HTTPStatus.OK, {"items": self.server.product.workspaces()})
@@ -304,10 +334,44 @@ class ProductRuntimeHandler(RuntimeHandler):
             if len(parts) == 2 and parts[0] == "workspaces":
                 self._json(HTTPStatus.OK, {"workspace": self.server.product.store.load(parts[1]).to_json_dict()})
                 return
+            if len(parts) == 3 and parts[0] == "workspaces" and parts[2] == "files":
+                controller = self.server.product.controller_for_workspace(parts[1])
+                self._json(HTTPStatus.OK, workspace_files_response(controller.config.workspace))
+                return
+            if len(parts) == 4 and parts[0] == "workspaces" and parts[2:] == ["git", "status"]:
+                controller = self.server.product.controller_for_workspace(parts[1])
+                self._json(HTTPStatus.OK, git_status_response(controller.config.workspace))
+                return
+            if parts == ["conversations"]:
+                controller = self.server.product.controller_for_workspace(_require_workspace_id(_workspace_id(parsed.query)))
+                conversations = (
+                    controller.config.conversation_store.list(workspace=controller.config.workspace)
+                    if controller.config.conversation_store is not None
+                    else []
+                )
+                self._json(HTTPStatus.OK, {"items": conversations})
+                return
+            if len(parts) == 3 and parts[0] == "conversations" and parts[2] == "turns":
+                controller = self.server.product.controller_for_workspace(_require_workspace_id(_workspace_id(parsed.query)))
+                if controller.config.conversation_store is None:
+                    self._v1_error(HTTPStatus.NOT_FOUND, "conversation_store_missing", "conversation store is not configured")
+                    return
+                controller.config.conversation_store.load(parts[1])
+                turns = controller.config.conversation_store.turns(parts[1])
+                self._json(HTTPStatus.OK, {"conversation_id": parts[1], "items": turns, "turns": turns})
+                return
             if parts == ["runs"]:
                 workspace_id = _require_workspace_id(_workspace_id(parsed.query))
                 controller = self.server.product.controller_for_workspace(workspace_id)
                 self._json(HTTPStatus.OK, {"items": [run_object(run, workspace_id=workspace_id) for run in controller.store.list_runs()]})
+                return
+            if parts == ["skills", "drafts"]:
+                controller = self.server.product.controller_for_workspace(_require_workspace_id(_workspace_id(parsed.query)))
+                self._json(HTTPStatus.OK, controller.skill_drafts())
+                return
+            if len(parts) == 3 and parts[:2] == ["skills", "drafts"]:
+                controller = self.server.product.controller_for_workspace(_require_workspace_id(_workspace_id(parsed.query)))
+                self._json(HTTPStatus.OK, controller.show_skill_draft(parts[2]))
                 return
             if len(parts) >= 2 and parts[0] == "runs":
                 self._v1_run_get(parts[1], parts[2:], parsed.query)
@@ -359,6 +423,29 @@ class ProductRuntimeHandler(RuntimeHandler):
                 name = str(name_value).strip() if name_value else None
                 self._json(HTTPStatus.CREATED, {"workspace": self.server.product.register_workspace(Path(root), name=name)})
                 return
+            if parts == ["update", "check"]:
+                manifest_source = body.get("manifest_source") or body.get("manifest")
+                self._json(
+                    HTTPStatus.OK,
+                    self.server.product.update_check(
+                        channel=str(body.get("channel")) if body.get("channel") else None,
+                        manifest_source=str(manifest_source) if manifest_source else None,
+                    ),
+                )
+                return
+            if parts == ["update", "apply"]:
+                manifest_source = body.get("manifest_source") or body.get("manifest")
+                self._json(
+                    HTTPStatus.OK,
+                    self.server.product.update_apply(
+                        channel=str(body.get("channel")) if body.get("channel") else None,
+                        manifest_source=str(manifest_source) if manifest_source else None,
+                    ),
+                )
+                return
+            if parts == ["update", "rollback"]:
+                self._json(HTTPStatus.OK, self.server.product.update_rollback())
+                return
             if parts == ["runs"]:
                 unsupported = sorted(set(body) - V1_RUN_START_KEYS)
                 if unsupported:
@@ -381,7 +468,8 @@ class ProductRuntimeHandler(RuntimeHandler):
                         run_id=body.get("run_id"),
                         turn_id=body.get("turn_id"),
                         parent_turn_id=body.get("parent_turn_id"),
-                        approval_mode=str(body.get("approval_mode") or controller.config.approval_mode),
+                        approval_mode=validate_approval_mode(body.get("approval_mode"), controller.config.approval_mode),
+                        session_mode=validate_session_mode(body.get("session_mode"), controller.config.session_mode),
                         approvals_reviewer=str(body.get("approvals_reviewer") or controller.config.approvals_reviewer),
                         profile=str(body.get("profile") or controller.config.profile),
                     )
@@ -389,7 +477,8 @@ class ProductRuntimeHandler(RuntimeHandler):
                     payload = controller.start_run(
                         task,
                         run_id=body.get("run_id"),
-                        approval_mode=str(body.get("approval_mode") or controller.config.approval_mode),
+                        approval_mode=validate_approval_mode(body.get("approval_mode"), controller.config.approval_mode),
+                        session_mode=validate_session_mode(body.get("session_mode"), controller.config.session_mode),
                         approvals_reviewer=str(body.get("approvals_reviewer") or controller.config.approvals_reviewer),
                         profile=str(body.get("profile") or controller.config.profile),
                     )
@@ -400,6 +489,36 @@ class ProductRuntimeHandler(RuntimeHandler):
                         "events_url": f"/v1/runs/{payload['run_id']}/events?workspace_id={workspace_id}",
                     },
                 )
+                return
+            if parts == ["evals"]:
+                workspace_id = _workspace_id(parsed.query) or str(body.get("workspace_id") or "")
+                controller = self.server.product.controller_for_workspace(_require_workspace_id(workspace_id))
+                self._json(
+                    HTTPStatus.CREATED,
+                    controller.eval_suite(
+                        str(body.get("suite_path") or ""),
+                        output_dir=str(body.get("output_dir")) if body.get("output_dir") else None,
+                        profile=str(body.get("profile")) if body.get("profile") else None,
+                        approval_mode=str(body.get("approval_mode")) if body.get("approval_mode") else None,
+                        session_mode=str(body.get("session_mode")) if body.get("session_mode") else None,
+                        approvals_reviewer=str(body.get("approvals_reviewer")) if body.get("approvals_reviewer") else None,
+                    ),
+                )
+                return
+            if parts == ["skills", "drafts"]:
+                workspace_id = _workspace_id(parsed.query) or str(body.get("workspace_id") or "")
+                controller = self.server.product.controller_for_workspace(_require_workspace_id(workspace_id))
+                self._json(HTTPStatus.CREATED, controller.create_skill_draft(str(body.get("run_id") or "")))
+                return
+            if len(parts) == 4 and parts[:2] == ["skills", "drafts"] and parts[3] == "install":
+                workspace_id = _workspace_id(parsed.query) or str(body.get("workspace_id") or "")
+                controller = self.server.product.controller_for_workspace(_require_workspace_id(workspace_id))
+                self._json(HTTPStatus.CREATED, controller.install_skill_draft(parts[2]))
+                return
+            if len(parts) == 4 and parts[:2] == ["skills", "drafts"] and parts[3] == "reject":
+                workspace_id = _workspace_id(parsed.query) or str(body.get("workspace_id") or "")
+                controller = self.server.product.controller_for_workspace(_require_workspace_id(workspace_id))
+                self._json(HTTPStatus.CREATED, controller.reject_skill_draft(parts[2]))
                 return
             if len(parts) == 3 and parts[0] == "runs" and parts[2] == "cancel":
                 workspace_id = _workspace_id(parsed.query) or str(body.get("workspace_id") or "")
@@ -425,6 +544,14 @@ class ProductRuntimeHandler(RuntimeHandler):
                     return
                 self._json(HTTPStatus.OK, {"resolved": True})
                 return
+            if len(parts) == 3 and parts[0] == "runs" and parts[2] == "fork":
+                if "output_dir" in body:
+                    self._v1_error(HTTPStatus.BAD_REQUEST, "bad_request", "custom fork output_dir is not supported by the HTTP API")
+                    return
+                workspace_id = _workspace_id(parsed.query) or str(body.get("workspace_id") or "")
+                controller = self.server.product.controller_for_run(parts[1], workspace_id=workspace_id)
+                self._json(HTTPStatus.CREATED, controller.fork(parts[1], str(body.get("at") or "")))
+                return
             self._v1_error(HTTPStatus.NOT_FOUND, "not_found", "Endpoint not found.")
         except FileNotFoundError as exc:
             self._v1_error(HTTPStatus.NOT_FOUND, _not_found_code(str(exc)), str(exc))
@@ -447,6 +574,7 @@ def create_product_runtime_server(
     debug_level: int = 0,
     workspace_mode: WorkspaceMode = "current",
     approval_mode: ApprovalMode = "yolo",
+    session_mode: SessionMode = "normal",
     approvals_reviewer: str = "user",
     sandbox_mode: SandboxModeInput = "none",
     profile: str = "tiny-coder",
@@ -463,6 +591,7 @@ def create_product_runtime_server(
         debug_level=debug_level,
         workspace_mode=workspace_mode,
         approval_mode=approval_mode,
+        session_mode=session_mode,
         approvals_reviewer=approvals_reviewer,
         sandbox_mode=sandbox_mode,
         profile=profile,
@@ -520,130 +649,3 @@ def _workspace_id_for_controller(product: ProductRuntimeController, controller: 
         if product.controller_for_workspace(record.workspace_id) is controller:
             return record.workspace_id
     return ""
-
-
-def workspace_files_response(workspace: Path) -> dict[str, Any]:
-    files = _git_lines(workspace, ["ls-files", "-co", "--exclude-standard"])
-    if files is None:
-        files = _walk_workspace_files(workspace)
-    return {"files": sorted(path for path in files if path and (workspace / path).is_file())}
-
-
-def git_status_response(workspace: Path) -> dict[str, Any]:
-    if _git_text(workspace, ["rev-parse", "--is-inside-work-tree"]) != "true":
-        return {"isRepo": False, "clean": True, "files": [], "diff": "", "diffTruncated": False}
-    branch = _git_text(workspace, ["branch", "--show-current"]) or _git_text(workspace, ["rev-parse", "--short", "HEAD"]) or ""
-    ahead, behind = _git_ahead_behind(workspace)
-    files = [_parse_status_line(line) for line in (_git_lines(workspace, ["status", "--porcelain=v1"]) or [])]
-    files = [file for file in files if file is not None]
-    diff_parts = [
-        _git_text(workspace, ["diff", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/"]) or "",
-        _git_text(workspace, ["diff", "--cached", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/"]) or "",
-    ]
-    diff = "\n".join(part for part in diff_parts if part).strip()
-    limit = 200_000
-    truncated = len(diff) > limit
-    if truncated:
-        diff = diff[:limit]
-    return {
-        "isRepo": True,
-        "branch": branch,
-        "ahead": ahead,
-        "behind": behind,
-        "clean": not files,
-        "files": files,
-        "diff": diff,
-        "diffTruncated": truncated,
-    }
-
-
-def _git_ahead_behind(workspace: Path) -> tuple[int, int]:
-    raw = _git_text(workspace, ["rev-list", "--left-right", "--count", "@{upstream}...HEAD"])
-    if not raw:
-        return 0, 0
-    parts = raw.split()
-    if len(parts) != 2:
-        return 0, 0
-    try:
-        behind, ahead = int(parts[0]), int(parts[1])
-    except ValueError:
-        return 0, 0
-    return ahead, behind
-
-
-def _parse_status_line(line: str) -> dict[str, Any] | None:
-    if len(line) < 4:
-        return None
-    code = line[:2]
-    path = line[3:].strip()
-    old_path = None
-    if " -> " in path:
-        old_path, path = path.split(" -> ", 1)
-    status = "unknown"
-    if "?" in code:
-        status = "untracked"
-    elif "R" in code:
-        status = "renamed"
-    elif "C" in code:
-        status = "copied"
-    elif "A" in code:
-        status = "added"
-    elif "D" in code:
-        status = "deleted"
-    elif "T" in code:
-        status = "typechange"
-    elif "M" in code:
-        status = "modified"
-    item: dict[str, Any] = {"path": _unquote_git_path(path), "status": status}
-    if old_path:
-        item["oldPath"] = _unquote_git_path(old_path)
-    return item
-
-
-def _unquote_git_path(path: str) -> str:
-    if len(path) >= 2 and path[0] == '"' and path[-1] == '"':
-        try:
-            return bytes(path[1:-1], "utf-8").decode("unicode_escape")
-        except UnicodeDecodeError:
-            return path[1:-1]
-    return path
-
-
-def _git_lines(workspace: Path, args: list[str]) -> list[str] | None:
-    raw = _git_text(workspace, args)
-    if raw is None:
-        return None
-    return [line for line in raw.splitlines() if line]
-
-
-def _git_text(workspace: Path, args: list[str]) -> str | None:
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(workspace), *args],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if result.returncode != 0:
-        return None
-    return result.stdout.rstrip("\n")
-
-
-def _walk_workspace_files(workspace: Path) -> list[str]:
-    ignored = {".git", ".tinyagent", "node_modules", "__pycache__", ".venv", "dist", "build"}
-    files: list[str] = []
-    for path in workspace.rglob("*"):
-        try:
-            rel = path.relative_to(workspace)
-        except ValueError:
-            continue
-        if any(part in ignored for part in rel.parts):
-            continue
-        if path.is_file():
-            files.append(rel.as_posix())
-        if len(files) >= 5000:
-            break
-    return files

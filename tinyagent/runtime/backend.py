@@ -24,6 +24,7 @@ class RunRequest:
     turn_id: str | None = None
     parent_turn_id: str | None = None
     approval_mode: str | None = None
+    session_mode: str | None = None
     approvals_reviewer: str | None = None
     profile: str | None = None
 
@@ -85,6 +86,7 @@ class LocalRunBackend:
                 turn_id=request.turn_id,
                 parent_turn_id=request.parent_turn_id,
                 approval_mode=request.approval_mode,
+                session_mode=request.session_mode,
                 approvals_reviewer=request.approvals_reviewer,
                 profile=request.profile,
             )
@@ -93,6 +95,7 @@ class LocalRunBackend:
                 request.task,
                 run_id=request.run_id,
                 approval_mode=request.approval_mode,
+                session_mode=request.session_mode,
                 approvals_reviewer=request.approvals_reviewer,
                 profile=request.profile,
             )
@@ -160,6 +163,7 @@ class HTTPRunBackend:
             "turn_id": request.turn_id,
             "parent_turn_id": request.parent_turn_id,
             "approval_mode": request.approval_mode,
+            "session_mode": request.session_mode,
             "approvals_reviewer": request.approvals_reviewer,
             "profile": request.profile,
         }

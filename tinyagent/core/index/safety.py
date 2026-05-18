@@ -68,7 +68,7 @@ def rg_exclude_globs() -> list[str]:
         globs.extend(["--glob", f"!**/{name}/**"])
     for name in sorted(SECRET_FILE_NAMES):
         globs.extend(["--glob", f"!**/{name}"])
-    globs.extend(["--glob", "!**/.env.*"])
+    globs.extend(["--glob", "!**/.env*"])
     return globs
 
 

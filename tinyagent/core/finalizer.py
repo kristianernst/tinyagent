@@ -44,6 +44,7 @@ def finalize_run(state: RunState, *, contextfs_enabled: bool) -> None:
         "workspace_mode": state.workspace_envelope.mode if state.workspace_envelope else None,
         "workspace_effective_mode": state.workspace_envelope.effective_mode if state.workspace_envelope else None,
         "approval_mode": state.approval_mode,
+        "session_mode": state.session_mode,
         "sandbox_mode": state.workspace_envelope.sandbox_mode if state.workspace_envelope else "none",
         "sandbox_backend": state.workspace_envelope.sandbox_backend if state.workspace_envelope else "none",
         "network_mode": state.workspace_envelope.network_mode if state.workspace_envelope else "deny",
@@ -70,10 +71,7 @@ def _finalize_message(state: RunState) -> None:
         state.finish("Run finished without explicit final output.")
     if not state.final_output:
         return
-    if any(
-        event.type == "model.message.completed" and event.data.get("output_path") == "final.md"
-        for event in state.events
-    ):
+    if any(event.type == "model.message.completed" and event.data.get("output_path") == "final.md" for event in state.events):
         return
     write_final_text(state)
     state.emit(

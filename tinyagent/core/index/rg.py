@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import selectors
 import shutil
-import os
 import subprocess
 import time
 from collections.abc import Sequence

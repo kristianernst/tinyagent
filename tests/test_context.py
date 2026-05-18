@@ -11,7 +11,17 @@ from tinyagent.core.models import FakeModelProvider
 from tinyagent.core.observations import Observation
 from tinyagent.core.policy import LocalPolicy
 from tinyagent.core.profiles import ApexCoderProfile
-from tinyagent.core.state import Message, ModelRequestContext, ModelResponse, PolicyDecision, RunState, ToolCall, ToolResult, ToolStep, Workspace
+from tinyagent.core.state import (
+    Message,
+    ModelRequestContext,
+    ModelResponse,
+    PolicyDecision,
+    RunState,
+    ToolCall,
+    ToolResult,
+    ToolStep,
+    Workspace,
+)
 from tinyagent.core.token_utils import estimate_tokens
 from tinyagent.core.tools import default_tools
 
@@ -327,28 +337,20 @@ def test_kernel_compacts_at_turn_boundary_and_uses_checkpoint(tmp_path, monkeypa
     types = [event.type for event in state.events]
     compact_started = types.index("compaction.started")
     hook_started = next(
-        index
-        for index, event in enumerate(state.events)
-        if event.type == "hook.started" and event.data["method"] == "before_compact"
+        index for index, event in enumerate(state.events) if event.type == "hook.started" and event.data["method"] == "before_compact"
     )
     hook_completed = next(
-        index
-        for index, event in enumerate(state.events)
-        if event.type == "hook.completed" and event.data["method"] == "before_compact"
+        index for index, event in enumerate(state.events) if event.type == "hook.completed" and event.data["method"] == "before_compact"
     )
     checkpoint_completed = types.index("checkpoint.completed")
     context_built_index = next(
-        index
-        for index, event_type in enumerate(types)
-        if index > checkpoint_completed and event_type == "context.built"
+        index for index, event_type in enumerate(types) if index > checkpoint_completed and event_type == "context.built"
     )
     context_report_index = next(
         index for index, event_type in enumerate(types) if index > context_built_index and event_type == "context.report.written"
     )
     model_started_index = next(
-        index
-        for index, event_type in enumerate(types)
-        if index > context_report_index and event_type == "model.call.started"
+        index for index, event_type in enumerate(types) if index > context_report_index and event_type == "model.call.started"
     )
     assert len(before_compact_seen_events) == 1
     assert before_compact_seen_events[0][-2:] == ["compaction.started", "hook.started"]

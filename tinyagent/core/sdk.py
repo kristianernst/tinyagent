@@ -17,7 +17,7 @@ from tinyagent.core.events import Event, EventSink
 from tinyagent.core.hooks import TinyHook
 from tinyagent.core.kernel import Kernel
 from tinyagent.core.profiles import ApexCoderProfile
-from tinyagent.core.run_control import CancelToken, RunCancelled
+from tinyagent.core.run_control import CancelToken
 from tinyagent.core.state import ApprovalMode, ApprovalRequest, ApprovalResolution, RunBudgets, RunState
 from tinyagent.core.workspace import SandboxModeInput, WorkspaceMode
 
@@ -52,7 +52,7 @@ class RunResult:
 
 
 class RunHandle:
-    def __init__(self, *, run_id: str, sink: "_QueueSink", task: asyncio.Task[RunState], cancel_token: CancelToken) -> None:
+    def __init__(self, *, run_id: str, sink: _QueueSink, task: asyncio.Task[RunState], cancel_token: CancelToken) -> None:
         self._run_id = run_id
         self._sink = sink
         self._task = task
@@ -129,7 +129,7 @@ class Agent:
         self.approval_handler = approval_handler
 
     @classmethod
-    def create(cls, **kwargs) -> "Agent":
+    def create(cls, **kwargs) -> Agent:
         return cls(**kwargs)
 
     async def start(self, prompt: str, *, run_id: str | None = None, output_dir: Path | None = None) -> RunHandle:
@@ -201,11 +201,7 @@ class AsyncApprovalHandlerAdapter:
             run_id=state.run_id,
             turn_id=state.current_turn_id,
             workspace=state.workspace.root,
-            original_workspace=(
-                state.workspace_envelope.original_root
-                if state.workspace_envelope is not None
-                else state.workspace.root
-            ),
+            original_workspace=(state.workspace_envelope.original_root if state.workspace_envelope is not None else state.workspace.root),
             current_step_id=state.current_step_id,
             cancel_reason=state.cancel_token.reason or self._cancel_token.reason or "",
         )
@@ -239,11 +235,7 @@ class _SyncApprovalHandlerAdapter:
             run_id=state.run_id,
             turn_id=state.current_turn_id,
             workspace=state.workspace.root,
-            original_workspace=(
-                state.workspace_envelope.original_root
-                if state.workspace_envelope is not None
-                else state.workspace.root
-            ),
+            original_workspace=(state.workspace_envelope.original_root if state.workspace_envelope is not None else state.workspace.root),
             current_step_id=state.current_step_id,
             cancel_reason=state.cancel_token.reason or "",
         )

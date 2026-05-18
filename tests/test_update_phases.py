@@ -151,7 +151,7 @@ def test_finish_gate_accepts_successful_inline_python_assertion_after_edit(tmp_p
         ]
     )
     verify_cmd = (
-        f"{sys.executable} -c \"from pathlib import Path; "
+        f'{sys.executable} -c "from pathlib import Path; '
         "assert Path('hello.py').read_text() == 'VALUE = 2\\\\n'; "
         "print('inline verification passed')\""
     )
@@ -230,10 +230,31 @@ def test_contextfs_recovery_files_expose_task_diff_observations_transcript_and_t
     state.emit("command.completed", {"cmd": f"{sys.executable} -m unittest discover -s .", "ok": True, "returncode": 0})
     state.observations.extend(
         [
-            Observation(kind="file_changed", subject="generated.txt", summary="generated.txt changed by shell.", refs=(delta,), data={"source": "workspace_delta"}),
-            Observation(kind="verification", subject="unittest", summary="Verification command passed.", data={"cmd": f"{sys.executable} -m unittest discover -s ."}),
-            Observation(kind="policy_block", subject="network", summary="Network command was blocked by policy.", data={"capability": "network", "source": "policy"}),
-            Observation(kind="sandbox_block", subject="filesystem", summary="Filesystem write was blocked by sandbox.", data={"capability": "filesystem", "source": "sandbox"}),
+            Observation(
+                kind="file_changed",
+                subject="generated.txt",
+                summary="generated.txt changed by shell.",
+                refs=(delta,),
+                data={"source": "workspace_delta"},
+            ),
+            Observation(
+                kind="verification",
+                subject="unittest",
+                summary="Verification command passed.",
+                data={"cmd": f"{sys.executable} -m unittest discover -s ."},
+            ),
+            Observation(
+                kind="policy_block",
+                subject="network",
+                summary="Network command was blocked by policy.",
+                data={"capability": "network", "source": "policy"},
+            ),
+            Observation(
+                kind="sandbox_block",
+                subject="filesystem",
+                summary="Filesystem write was blocked by sandbox.",
+                data={"capability": "filesystem", "source": "sandbox"},
+            ),
         ]
     )
     search_call = ToolCall(id="call_search", name="search_code", args={"query": "hello contextfs"})
@@ -339,7 +360,9 @@ def test_context_read_safely_allows_recovery_artifacts_but_not_raw_model_artifac
     ).run("context reader safety", workspace=tmp_path, run_id="run_context_reader_safety")
 
     state.output_dir.mkdir(parents=True, exist_ok=True)
-    context_report = next(event.data["path"] for event in state.events if event.type == "artifact.created" and event.data["kind"] == "context_report")
+    context_report = next(
+        event.data["path"] for event in state.events if event.type == "artifact.created" and event.data["kind"] == "context_report"
+    )
     reader = ContextReadTool()
 
     assert reader.run(ToolCall(name="context_read", args={"ref": "contextfs:context/INDEX.md"}), state).ok is True
@@ -413,7 +436,19 @@ def test_contextfs_sanitizes_transcript_observations_and_workspace_delta_artifac
     state = Kernel(
         model=FakeModelProvider(
             [
-                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": f"printf 'visible\\n' > created.txt && {sys.executable} -c \"open('big.bin', 'wb').write(b'x' * 1000001)\""}),)),
+                ModelResponse(
+                    tool_calls=(
+                        ToolCall(
+                            name="shell",
+                            args={
+                                "cmd": (
+                                    f"printf 'visible\\n' > created.txt && {sys.executable} -c "
+                                    "\"open('big.bin', 'wb').write(b'x' * 1000001)\""
+                                )
+                            },
+                        ),
+                    )
+                ),
                 ModelResponse(content="Done. Could not run verification in this environment.", finish_reason="stop"),
             ]
         ),
@@ -868,7 +903,9 @@ def test_workspace_delta_detects_shell_mutation_and_blocks_early_finish(tmp_path
     state = Kernel(
         model=FakeModelProvider(
             [
-                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": f"{sys.executable} -c \"open('generated.txt', 'w').write('x')\""}),)),
+                ModelResponse(
+                    tool_calls=(ToolCall(name="shell", args={"cmd": f"{sys.executable} -c \"open('generated.txt', 'w').write('x')\""}),)
+                ),
                 ModelResponse(content="done", finish_reason="stop"),
             ]
         ),
@@ -889,7 +926,9 @@ def test_workspace_delta_shell_mutation_read_file_inspection_can_finish(tmp_path
     state = Kernel(
         model=FakeModelProvider(
             [
-                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": f"{sys.executable} -c \"open('generated.txt', 'w').write('x')\""}),)),
+                ModelResponse(
+                    tool_calls=(ToolCall(name="shell", args={"cmd": f"{sys.executable} -c \"open('generated.txt', 'w').write('x')\""}),)
+                ),
                 ModelResponse(tool_calls=(ToolCall(name="read_file", args={"path": "generated.txt"}),)),
                 ModelResponse(content="Done. Could not run verification in this environment.", finish_reason="stop"),
             ]
@@ -953,7 +992,9 @@ def test_workspace_delta_detects_edit_to_existing_untracked_git_file(tmp_path) -
     state = Kernel(
         model=FakeModelProvider(
             [
-                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": f"{sys.executable} -c \"open('notes.txt', 'w').write('after')\""}),)),
+                ModelResponse(
+                    tool_calls=(ToolCall(name="shell", args={"cmd": f"{sys.executable} -c \"open('notes.txt', 'w').write('after')\""}),)
+                ),
                 ModelResponse(content="done", finish_reason="stop"),
             ]
         ),
@@ -985,7 +1026,9 @@ def test_workspace_delta_does_not_attribute_preexisting_dirty_git_files(tmp_path
     state = Kernel(
         model=FakeModelProvider(
             [
-                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": f"{sys.executable} -c \"open('new.txt', 'w').write('new after')\""}),)),
+                ModelResponse(
+                    tool_calls=(ToolCall(name="shell", args={"cmd": f"{sys.executable} -c \"open('new.txt', 'w').write('new after')\""}),)
+                ),
                 ModelResponse(content="done", finish_reason="stop"),
             ]
         ),
@@ -1200,7 +1243,9 @@ def test_workspace_delta_ignores_common_generated_artifacts(tmp_path) -> None:
     state = Kernel(
         model=FakeModelProvider(
             [
-                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": f"{sys.executable} -c \"open('.coverage', 'w').write('data')\""}),)),
+                ModelResponse(
+                    tool_calls=(ToolCall(name="shell", args={"cmd": f"{sys.executable} -c \"open('.coverage', 'w').write('data')\""}),)
+                ),
                 ModelResponse(content="done", finish_reason="stop"),
             ]
         ),
@@ -1290,7 +1335,13 @@ def test_failed_shell_mutation_still_requires_mutation_gates(tmp_path) -> None:
     state = Kernel(
         model=FakeModelProvider(
             [
-                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": f"{sys.executable} -c \"open('failed.txt', 'w').write('x'); raise SystemExit(1)\""}),)),
+                ModelResponse(
+                    tool_calls=(
+                        ToolCall(
+                            name="shell", args={"cmd": f"{sys.executable} -c \"open('failed.txt', 'w').write('x'); raise SystemExit(1)\""}
+                        ),
+                    )
+                ),
                 ModelResponse(content="Command failed.", finish_reason="stop"),
             ]
         ),
@@ -1498,7 +1549,7 @@ def test_contextfs_read_hints_quote_paths_with_spaces() -> None:
     hints = read_hints("/tmp/tiny agent/context/output file.txt", failure=True)
 
     assert hints[0] == "tail -120 '/tmp/tiny agent/context/output file.txt'"
-    assert hints[1] == 'rg "FAILED|ERROR|Traceback|AssertionError" \'/tmp/tiny agent/context/output file.txt\''
+    assert hints[1] == "rg \"FAILED|ERROR|Traceback|AssertionError\" '/tmp/tiny agent/context/output file.txt'"
 
 
 def test_policy_blocks_common_env_path_variants(tmp_path) -> None:
@@ -1748,7 +1799,12 @@ def test_policy_and_sandbox_denials_have_distinct_failure_dimensions(tmp_path) -
             )
 
     sandbox_state = Kernel(
-        model=FakeModelProvider([ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "printf x"}),)), ModelResponse(content="blocked", finish_reason="stop")]),
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(ToolCall(name="shell", args={"cmd": "printf x"}),)),
+                ModelResponse(content="blocked", finish_reason="stop"),
+            ]
+        ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
         policy=AllowAllPolicy(),
@@ -1759,7 +1815,9 @@ def test_policy_and_sandbox_denials_have_distinct_failure_dimensions(tmp_path) -
     sandbox_result = sandbox_state.tool_results[0]
     assert sandbox_result.failure_kind == "sandbox_blocked"
     assert sandbox_result.data["source"] == "sandbox"
-    assert any(observation.kind == "sandbox_block" and observation.data["source"] == "sandbox" for observation in sandbox_state.observations)
+    assert any(
+        observation.kind == "sandbox_block" and observation.data["source"] == "sandbox" for observation in sandbox_state.observations
+    )
 
 
 def test_approval_denial_preserves_original_capability(tmp_path) -> None:
@@ -1854,13 +1912,13 @@ def test_hook_mutated_tool_call_is_rechecked_by_policy(tmp_path) -> None:
 
     call = ToolCall(name="shell", args={"cmd": "git diff -- README.md"})
     state = Kernel(
-            model=FakeModelProvider(
-                [
-                    ModelResponse(tool_calls=(call,)),
-                    ModelResponse(content="Network command was denied by policy.", finish_reason="stop"),
-                    ModelResponse(content="Network command was denied by policy.", finish_reason="stop"),
-                ]
-            ),
+        model=FakeModelProvider(
+            [
+                ModelResponse(tool_calls=(call,)),
+                ModelResponse(content="Network command was denied by policy.", finish_reason="stop"),
+                ModelResponse(content="Network command was denied by policy.", finish_reason="stop"),
+            ]
+        ),
         profile=ApexCoderProfile(),
         tools=default_tools(),
         policy=workspace_shell_policy(),

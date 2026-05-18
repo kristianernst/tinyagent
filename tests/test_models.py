@@ -17,8 +17,8 @@ from tinyagent.core.models import (
 )
 from tinyagent.core.policy import default_policy
 from tinyagent.core.profiles import ApexCoderProfile
-from tinyagent.core.providers.factory import ProviderRegistry, ProviderSpec, provider_for
 from tinyagent.core.providers.anthropic import AnthropicMessagesConfig, AnthropicMessagesProvider, parse_message
+from tinyagent.core.providers.factory import ProviderRegistry, ProviderSpec, provider_for
 from tinyagent.core.providers.gemini import (
     GeminiGenerateContentConfig,
     GeminiGenerateContentProvider,

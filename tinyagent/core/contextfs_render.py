@@ -58,7 +58,7 @@ class ContextFileSpec:
     section: str
     title: str
     description: str
-    render: Callable[["RunState"], str]
+    render: Callable[[RunState], str]
     include_in_index: bool = True
     static_allowed: bool = True
 
@@ -76,7 +76,7 @@ class RenderedContextFile:
 class ContextRenderHelpers:
     context_ref: Callable[[str | Path], str]
     safe_recovery_artifact_ref: Callable[[object], str | None]
-    tool_artifact_refs: Callable[["ToolStep"], tuple[str, ...]]
+    tool_artifact_refs: Callable[[ToolStep], tuple[str, ...]]
     safe_transcript_refs: Callable[[tuple[str, ...]], str]
     sanitize_value: Callable[[str], str]
     sanitize_data: Callable[[Any], Any]
@@ -170,7 +170,7 @@ def static_context_file_specs(helpers: ContextRenderHelpers) -> tuple[ContextFil
     )
 
 
-def render_task(state: "RunState") -> str:
+def render_task(state: RunState) -> str:
     return "\n".join(
         [
             "# Task",
@@ -186,7 +186,7 @@ def render_task(state: "RunState") -> str:
     )
 
 
-def render_repo_state(state: "RunState", helpers: ContextRenderHelpers) -> str:
+def render_repo_state(state: RunState, helpers: ContextRenderHelpers) -> str:
     del state
     return "\n".join(
         [
@@ -204,7 +204,7 @@ def render_repo_state(state: "RunState", helpers: ContextRenderHelpers) -> str:
     )
 
 
-def render_last_failure(state: "RunState", helpers: ContextRenderHelpers) -> str:
+def render_last_failure(state: RunState, helpers: ContextRenderHelpers) -> str:
     for step in reversed(state.tool_steps):
         if step.result.ok:
             continue
@@ -230,14 +230,14 @@ def render_last_failure(state: "RunState", helpers: ContextRenderHelpers) -> str
     return "# Last Failure\n\nNo failing tool result yet.\n"
 
 
-def render_compacted_history(state: "RunState", helpers: ContextRenderHelpers) -> str:
+def render_compacted_history(state: RunState, helpers: ContextRenderHelpers) -> str:
     if state.context_checkpoint.strip():
         artifact = f"\n\nCheckpoint artifact: {state.context_checkpoint_artifact}" if state.context_checkpoint_artifact else ""
         return f"# Compacted History\n\n{helpers.sanitize_value(state.context_checkpoint).strip()}{helpers.sanitize_value(artifact)}\n"
     return "# Compacted History\n\nNo compaction checkpoint yet.\n"
 
 
-def render_observations(state: "RunState", helpers: ContextRenderHelpers) -> str:
+def render_observations(state: RunState, helpers: ContextRenderHelpers) -> str:
     lines = ["# Observations", ""]
     if not state.observations:
         lines.append("No observations recorded yet.")
@@ -259,7 +259,7 @@ def render_observations(state: "RunState", helpers: ContextRenderHelpers) -> str
     return "\n".join(lines) + "\n"
 
 
-def render_transcript(state: "RunState", helpers: ContextRenderHelpers) -> str:
+def render_transcript(state: RunState, helpers: ContextRenderHelpers) -> str:
     lines = ["# Transcript", ""]
     if not state.transcript.items:
         lines.append("No transcript items recorded yet.")
@@ -283,7 +283,7 @@ def render_transcript(state: "RunState", helpers: ContextRenderHelpers) -> str:
     return "\n".join(lines) + "\n"
 
 
-def render_tool_docs(state: "RunState", helpers: ContextRenderHelpers) -> tuple[RenderedContextFile, ...]:
+def render_tool_docs(state: RunState, helpers: ContextRenderHelpers) -> tuple[RenderedContextFile, ...]:
     files: list[RenderedContextFile] = []
     lines = ["# Tool Context", ""]
     by_tool: dict[str, list[str]] = {}
@@ -308,7 +308,7 @@ def render_tool_docs(state: "RunState", helpers: ContextRenderHelpers) -> tuple[
     return tuple(files)
 
 
-def render_diff_docs(state: "RunState", helpers: ContextRenderHelpers) -> tuple[RenderedContextFile, ...]:
+def render_diff_docs(state: RunState, helpers: ContextRenderHelpers) -> tuple[RenderedContextFile, ...]:
     files: list[RenderedContextFile] = []
     lines = ["# ContextFS Diffs", "", f"- {helpers.context_ref('context/current_diff.patch')}: latest aggregate workspace diff."]
     seen: set[str] = set()
@@ -326,7 +326,7 @@ def render_diff_docs(state: "RunState", helpers: ContextRenderHelpers) -> tuple[
 
 
 def render_context_index(
-    state: "RunState",
+    state: RunState,
     entries: Sequence[ContextIndexEntry],
     helpers: ContextRenderHelpers,
 ) -> str:
@@ -376,6 +376,6 @@ def render_context_index(
     return "\n".join(lines)
 
 
-def _safe_tool_artifacts(step: "ToolStep", helpers: ContextRenderHelpers) -> tuple[str, ...]:
+def _safe_tool_artifacts(step: ToolStep, helpers: ContextRenderHelpers) -> tuple[str, ...]:
     refs = (helpers.safe_recovery_artifact_ref(ref) for ref in helpers.tool_artifact_refs(step))
     return tuple(dict.fromkeys(ref for ref in refs if ref))

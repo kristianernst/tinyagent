@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 
 from tinyagent.core.contracts import Tool
-from tinyagent.evals.runner import run_eval_suite
 from tinyagent.core.events import LIVE_ONLY_EVENT_TYPES, MemoryEventSink, load_events_jsonl
 from tinyagent.core.kernel import Kernel
 from tinyagent.core.model_stream import assemble_model_deltas
@@ -17,6 +16,7 @@ from tinyagent.core.profiles import profile_for
 from tinyagent.core.providers.openai_compat import OpenAICompatibleProvider
 from tinyagent.core.state import Message, RunState, Workspace
 from tinyagent.core.tools import default_tools
+from tinyagent.evals.runner import run_eval_suite
 
 pytestmark = pytest.mark.integration
 
@@ -149,11 +149,7 @@ def test_real_openai_compatible_tiny_pi_tool_use_e2e(tmp_path) -> None:
 def _provider_or_skip() -> OpenAICompatibleProvider:
     if os.environ.get("TINYAGENT_RUN_INTEGRATION") != "1":
         pytest.skip("set TINYAGENT_RUN_INTEGRATION=1 to run live endpoint integration tests")
-    missing = [
-        name
-        for name in ("TINYAGENT_MODEL_BASE_URL", "TINYAGENT_MODEL_API_KEY", "TINYAGENT_MODEL_NAME")
-        if not os.environ.get(name)
-    ]
+    missing = [name for name in ("TINYAGENT_MODEL_BASE_URL", "TINYAGENT_MODEL_API_KEY", "TINYAGENT_MODEL_NAME") if not os.environ.get(name)]
     if missing:
         pytest.skip(f"missing live endpoint env vars: {', '.join(missing)}")
     return OpenAICompatibleProvider.from_env()

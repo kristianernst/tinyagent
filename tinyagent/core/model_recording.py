@@ -68,10 +68,7 @@ def record_model_tool_calls(
                 },
                 visibility="user",
             )
-        transcript_recorded = any(
-            item.kind == "tool_call" and item.tool_call_id == call.id
-            for item in state.transcript.items
-        )
+        transcript_recorded = any(item.kind == "tool_call" and item.tool_call_id == call.id for item in state.transcript.items)
         if not transcript_recorded:
             state.transcript.record_tool_call(
                 item_id=f"transcript-tool-call-{len(state.transcript.items) + 1:04d}",

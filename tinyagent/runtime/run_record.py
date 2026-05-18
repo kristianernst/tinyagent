@@ -56,6 +56,10 @@ class RunRecord:
     task: str = ""
     status: str = "unknown"
     failure_reason: str = ""
+    workspace_mode: str = ""
+    approval_mode: str = ""
+    session_mode: str = "normal"
+    sandbox_mode: str = ""
     final_output_path: str = "final.md"
     final_output_tokens: int = 0
     final_diff_path: str = "final.diff"
@@ -103,6 +107,10 @@ def load_run_record(run_path: Path) -> RunRecord:
         task=str(metrics.get("task") or task),
         status=status,
         failure_reason=failure_reason,
+        workspace_mode=str(metrics.get("workspace_mode") or (started.data.get("workspace_mode") if started else "") or ""),
+        approval_mode=str(metrics.get("approval_mode") or (started.data.get("approval_mode") if started else "") or ""),
+        session_mode=str(metrics.get("session_mode") or (started.data.get("session_mode") if started else "") or "normal"),
+        sandbox_mode=str(metrics.get("sandbox_mode") or (started.data.get("sandbox_mode") if started else "") or ""),
         final_output_path=str(metrics.get("final_output_path") or "final.md"),
         final_output_tokens=int(metrics.get("final_output_tokens") or 0),
         final_diff_tokens=final_diff_tokens,

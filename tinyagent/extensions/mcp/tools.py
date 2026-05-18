@@ -6,8 +6,8 @@ import json
 import time
 from collections.abc import Mapping
 
-from tinyagent.core.contracts import ToolRuntime
 from tinyagent.core.contextfs import write_context_tool_output
+from tinyagent.core.contracts import ToolRuntime
 from tinyagent.core.state import RunState, ToolCall, ToolResult
 from tinyagent.core.token_utils import estimate_tokens, fits_token_budget
 from tinyagent.core.tools.core import error_result, visible_output

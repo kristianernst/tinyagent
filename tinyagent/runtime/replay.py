@@ -71,8 +71,7 @@ def _event_detail(event: Event) -> str:
             ]
             artifact_text = " ".join(str(path) for path in artifacts if path)
             return (
-                f"provider={data.get('provider')} messages={data.get('message_count')} "
-                f"tools={data.get('tool_count')} {artifact_text}"
+                f"provider={data.get('provider')} messages={data.get('message_count')} tools={data.get('tool_count')} {artifact_text}"
             ).strip()
         case "model.call.completed":
             return (

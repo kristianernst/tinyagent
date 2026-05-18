@@ -256,9 +256,7 @@ def _write_git_diff_artifact(
         dirty_summary = "Tracked paths already dirty before this tool call; full diff redacted:\n" + "\n".join(redacted_dirty_paths) + "\n"
     before_fingerprints = before_fingerprints or {}
     untracked_diff = "".join(
-        _git_untracked_diff(state, path, existed_before=path in before_fingerprints)
-        for path in paths
-        if not _git_path_tracked(state, path)
+        _git_untracked_diff(state, path, existed_before=path in before_fingerprints) for path in paths if not _git_path_tracked(state, path)
     )
     content = join_diff_parts(content, dirty_summary, untracked_diff)
     if not content.strip():

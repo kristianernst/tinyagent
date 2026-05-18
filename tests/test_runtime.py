@@ -15,7 +15,7 @@ import tinyagent.cli as cli
 from tinyagent.app.product import ProductHome, WorkspaceStore
 from tinyagent.app.server import create_product_runtime_server
 from tinyagent.core.model_stream import ModelDelta
-from tinyagent.core.state import Message, ModelRequestContext, ModelResponse, RunState, ToolCall
+from tinyagent.core.state import Message, ModelRequestContext, ModelResponse, ToolCall
 from tinyagent.runtime.conversation import ConversationStore
 from tinyagent.runtime.server import RunController, RuntimeConfig, RuntimeHTTPServer, create_runtime_server
 
@@ -67,6 +67,7 @@ def test_runtime_api_accepts_tiny_pi_profile(tmp_path) -> None:
 
 
 def test_runtime_v1_single_workspace_run_events_artifacts_and_schema(tmp_path) -> None:
+    (tmp_path / "surface.txt").write_text("surface\n")
     with _server(tmp_path) as base:
         health = _request(base, "GET", "/v1/health")
         assert health["healthy"] is True
@@ -77,17 +78,40 @@ def test_runtime_v1_single_workspace_run_events_artifacts_and_schema(tmp_path) -
         assert "Event" in openapi["components"]["schemas"]
         assert "Artifact" in openapi["components"]["schemas"]
         assert "Approval" in openapi["components"]["schemas"]
+        assert "WorkspaceFiles" in openapi["components"]["schemas"]
+        assert "GitSnapshot" in openapi["components"]["schemas"]
+        assert "ConversationList" in openapi["components"]["schemas"]
+        assert "RunForkResponse" in openapi["components"]["schemas"]
+        assert "EvalRunResponse" in openapi["components"]["schemas"]
+        assert "SkillDraft" in openapi["components"]["schemas"]
         assert "ErrorResponse" in openapi["components"]["schemas"]
+        assert "/v1/workspaces/{workspace_id}/files" in openapi["paths"]
+        assert "/v1/workspaces/{workspace_id}/git/status" in openapi["paths"]
+        assert "/v1/conversations" in openapi["paths"]
+        assert "/v1/runs/{run_id}/fork" in openapi["paths"]
+        assert "/v1/evals" in openapi["paths"]
+        assert "/v1/skills/drafts" in openapi["paths"]
+        fork_schema = openapi["paths"]["/v1/runs/{run_id}/fork"]["post"]["requestBody"]["content"]["application/json"]["schema"]
+        assert fork_schema["$ref"] == "#/components/schemas/RunForkRequest"
+        assert openapi["components"]["schemas"]["RunForkRequest"]["required"] == ["at"]
         event_stream = openapi["paths"]["/v1/runs/{run_id}/events"]["get"]["responses"]["200"]["content"]["text/event-stream"]
         assert event_stream["x-itemSchema"]["$ref"] == "#/components/schemas/Event"
 
-        created = _request(base, "POST", "/v1/runs", {"task": "v1 single", "run_id": "run_v1_single"})
+        files = _request(base, "GET", "/v1/workspaces/default/files")["files"]
+        assert "surface.txt" in files
+        git = _request(base, "GET", "/v1/workspaces/default/git/status")
+        assert git["isRepo"] is False
+        assert git["clean"] is True
+
+        created = _request(base, "POST", "/v1/runs", {"task": "v1 single", "run_id": "run_v1_single", "session_mode": "plan"})
         assert created["run"]["id"] == "run_v1_single"
+        assert created["run"]["session_mode"] == "plan"
         assert created["events_url"] == "/v1/runs/run_v1_single/events"
         _wait_for_status(base, "run_v1_single", "completed")
 
         run = _request(base, "GET", "/v1/runs/run_v1_single")["run"]
         assert run["workspace_id"] == ""
+        assert run["session_mode"] == "plan"
         assert run["links"]["events"] == "/v1/runs/run_v1_single/events"
 
         events = _request(base, "GET", "/v1/runs/run_v1_single/events.jsonl")
@@ -96,6 +120,8 @@ def test_runtime_v1_single_workspace_run_events_artifacts_and_schema(tmp_path) -
 
         artifacts = _request(base, "GET", "/v1/runs/run_v1_single/artifacts")
         assert any(item["path"] == "final.md" for item in artifacts["items"])
+        fork = _request(base, "POST", "/v1/runs/run_v1_single/fork", {"at": "1"})
+        assert fork["fork_dir"].endswith("run_v1_single-fork-0001")
         hidden = _request_error(
             base,
             "GET",
@@ -120,6 +146,11 @@ def test_runtime_v1_single_workspace_run_events_artifacts_and_schema(tmp_path) -
         _wait_for_status(base, "run_v1_single_conversation", "completed")
         turn_events = _request(base, "GET", "/v1/runs/run_v1_single_conversation/events.jsonl")
         assert turn_events["items"][0]["conversation_id"] == "conv_v1_single"
+        conversations = _request(base, "GET", "/v1/conversations")["items"]
+        assert conversations[0]["conversation_id"] == "conv_v1_single"
+        turns = _request(base, "GET", "/v1/conversations/conv_v1_single/turns")
+        assert turns["conversation_id"] == "conv_v1_single"
+        assert any(turn["turn_id"] == "turn_v1_single" for turn in turns["items"])
 
 
 def test_runtime_v1_single_workspace_errors_use_shared_shape(tmp_path) -> None:
@@ -134,6 +165,22 @@ def test_runtime_v1_single_workspace_errors_use_shared_shape(tmp_path) -> None:
         assert approvals["error"]["code"] == "run_not_found"
         artifacts = _request_error(base, "GET", "/v1/runs/missing/artifacts", expected=404)
         assert artifacts["error"]["code"] == "run_not_found"
+        bad_workspace = _request_error(base, "POST", "/v1/runs", {"workspace_id": "wrong", "task": "nope"}, expected=404)
+        assert bad_workspace["error"]["code"] == "workspace_not_found"
+        bad_mode = _request_error(base, "POST", "/v1/runs", {"task": "nope", "session_mode": "invalid"}, expected=400)
+        assert bad_mode["error"]["code"] == "bad_request"
+        bad_cancel_workspace = _request_error(base, "POST", "/v1/runs/missing/cancel?workspace_id=wrong", {}, expected=404)
+        assert bad_cancel_workspace["error"]["code"] == "workspace_not_found"
+        bad_approval_workspace = _request_error(
+            base,
+            "POST",
+            "/v1/runs/missing/approvals/approval_missing/resolve?workspace_id=wrong",
+            {"decision": "approved"},
+            expected=404,
+        )
+        assert bad_approval_workspace["error"]["code"] == "workspace_not_found"
+        bad_fork_workspace = _request_error(base, "POST", "/v1/runs/missing/fork?workspace_id=wrong", {"at": "1"}, expected=404)
+        assert bad_fork_workspace["error"]["code"] == "workspace_not_found"
 
 
 def test_runtime_rejects_browser_simple_post_content_type(tmp_path) -> None:
@@ -401,18 +448,27 @@ def test_product_runtime_reports_workspace_files_and_git_status(tmp_path) -> Non
     workspace.mkdir()
     (workspace / "README.md").write_text("initial\n")
     (workspace / "deleted.md").write_text("delete me\n")
+    (workspace / ".env").write_text("TOKEN=before\n")
+    (workspace / ".tinyagent").mkdir()
+    (workspace / ".tinyagent" / "trace.txt").write_text("internal before\n")
     (workspace / "notes").mkdir()
     (workspace / "notes" / "todo.md").write_text("todo\n")
     for args in [
         ["init"],
         ["config", "user.email", "tinyagent@example.test"],
         ["config", "user.name", "Tinyagent Tests"],
-        ["add", "README.md", "deleted.md"],
+        ["add", "README.md", "deleted.md", ".env", ".tinyagent/trace.txt"],
         ["commit", "-m", "initial"],
     ]:
         subprocess.run(["git", *args], cwd=workspace, check=True, capture_output=True, text=True)
     (workspace / "README.md").write_text("changed\n")
     (workspace / "deleted.md").unlink()
+    (workspace / ".env").write_text("TOKEN=super-secret-value\n")
+    (workspace / ".envrc").write_text("export TOKEN=envrc-secret\n")
+    (workspace / ".tinyagent" / "trace.txt").write_text("internal secret value\n")
+    (workspace / ".npmrc").write_text("//registry.example.test/:_authToken=npm-secret\n")
+    (workspace / ".ssh").mkdir()
+    (workspace / ".ssh" / "config").write_text("Host internal\n  HostName secret.example.test\n")
 
     record = WorkspaceStore(home).register(workspace, name="Workspace")
     server = create_product_runtime_server(home, port=0, provider="fake", stream=True)
@@ -424,15 +480,31 @@ def test_product_runtime_reports_workspace_files_and_git_status(tmp_path) -> Non
         assert "README.md" in files
         assert "notes/todo.md" in files
         assert "deleted.md" not in files
+        assert ".env" not in files
+        assert ".envrc" not in files
+        assert ".npmrc" not in files
+        assert ".tinyagent/trace.txt" not in files
+        assert ".ssh/config" not in files
+        v1_files = _request(base, "GET", f"/v1/workspaces/{record.workspace_id}/files")["files"]
+        assert v1_files == files
 
         git = _request(base, "GET", f"/api/git/status?workspace_id={record.workspace_id}")
         assert git["isRepo"] is True
         assert git["clean"] is False
-        assert git["diffTruncated"] is False
+        assert git["diffTruncated"] is True
+        assert git["omittedFiles"] == 5
         assert {"path": "README.md", "status": "modified"} in git["files"]
         assert {"path": "deleted.md", "status": "deleted"} in git["files"]
+        assert all(not item["path"].startswith((".env", ".npmrc", ".tinyagent/", ".ssh/")) for item in git["files"])
         assert "diff --git a/README.md b/README.md" in git["diff"]
         assert "+changed" in git["diff"]
+        assert "super-secret-value" not in git["diff"]
+        assert "envrc-secret" not in git["diff"]
+        assert "internal secret value" not in git["diff"]
+        assert "npm-secret" not in git["diff"]
+        assert "secret.example.test" not in git["diff"]
+        v1_git = _request(base, "GET", f"/v1/workspaces/{record.workspace_id}/git/status")
+        assert v1_git == git
     finally:
         server.shutdown()
         server.server_close()
@@ -443,6 +515,10 @@ def test_product_runtime_v1_workspace_run_events_artifacts_and_errors(tmp_path) 
     home = ProductHome(tmp_path / "home")
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    eval_case = workspace / "evals" / "smoke" / "read-file"
+    (eval_case / "files").mkdir(parents=True)
+    (eval_case / "files" / "hello.txt").write_text("hello\n")
+    (eval_case / "task.json").write_text(json.dumps({"id": "read-file", "task": "Inspect hello.txt and return done."}))
     record = WorkspaceStore(home).register(workspace, name="Workspace")
     server = create_product_runtime_server(home, port=0, provider="fake", stream=True)
     base = f"127.0.0.1:{server.server_port}"
@@ -452,6 +528,15 @@ def test_product_runtime_v1_workspace_run_events_artifacts_and_errors(tmp_path) 
         health = _request(base, "GET", "/v1/health")
         assert health["healthy"] is True
         assert health["schema_version"] == 1
+        assert health["version"] == "0.1.0a0"
+
+        openapi = _request(base, "GET", "/v1/openapi.json")
+        assert "UpdateStatus" in openapi["components"]["schemas"]
+        assert "/v1/update" in openapi["paths"]
+
+        update = _request(base, "GET", "/v1/update")
+        assert update["channel"] == "alpha"
+        assert update["current_version"] == "0.1.0a0"
 
         workspaces = _request(base, "GET", "/v1/workspaces")
         assert workspaces["items"][0]["workspace_id"] == record.workspace_id
@@ -460,14 +545,16 @@ def test_product_runtime_v1_workspace_run_events_artifacts_and_errors(tmp_path) 
             base,
             "POST",
             "/v1/runs",
-            {"workspace_id": record.workspace_id, "task": "v1 smoke", "run_id": "run_v1_smoke"},
+            {"workspace_id": record.workspace_id, "task": "v1 smoke", "run_id": "run_v1_smoke", "session_mode": "plan"},
         )
         assert created["run"]["id"] == "run_v1_smoke"
+        assert created["run"]["session_mode"] == "plan"
         assert created["events_url"] == f"/v1/runs/run_v1_smoke/events?workspace_id={record.workspace_id}"
         _wait_for_status(base, "run_v1_smoke", "completed", workspace_id=record.workspace_id)
 
         run = _request(base, "GET", f"/v1/runs/run_v1_smoke?workspace_id={record.workspace_id}")["run"]
         assert run["workspace_id"] == record.workspace_id
+        assert run["session_mode"] == "plan"
         assert run["links"]["events"] == f"/v1/runs/run_v1_smoke/events?workspace_id={record.workspace_id}"
 
         events = _request(base, "GET", f"/v1/runs/run_v1_smoke/events.json?workspace_id={record.workspace_id}")
@@ -478,12 +565,40 @@ def test_product_runtime_v1_workspace_run_events_artifacts_and_errors(tmp_path) 
 
         artifacts = _request(base, "GET", f"/v1/runs/run_v1_smoke/artifacts?workspace_id={record.workspace_id}")
         assert any(item["path"] == "final.md" for item in artifacts["items"])
+        fork = _request(
+            base,
+            "POST",
+            f"/v1/runs/run_v1_smoke/fork?workspace_id={record.workspace_id}",
+            {"at": "1"},
+        )
+        assert fork["fork_dir"].endswith("run_v1_smoke-fork-0001")
         assert not any(
             item["path"].startswith(("artifacts/model-request", "artifacts/model-response", "artifacts/context", "context/"))
             for item in artifacts["items"]
         )
         final = _wait_for_artifact(base, "run_v1_smoke", f"final.md?workspace_id={record.workspace_id}", prefix="/v1")
         assert b"Fake run finished: v1 smoke" in final
+        eval_result = _request(base, "POST", "/v1/evals", {"workspace_id": record.workspace_id, "suite_path": "evals/smoke"})
+        assert eval_result["total"] == 1
+        assert eval_result["passed"] == 1
+        assert eval_result["results"][0]["case_id"] == "read-file"
+        assert "Tinyagent Eval Report" in eval_result["report"]
+        drafted = _request(base, "POST", "/v1/skills/drafts", {"workspace_id": record.workspace_id, "run_id": "run_v1_smoke"})
+        draft_id = drafted["draft"]["draft_id"]
+        assert drafted["draft"]["source_run_id"] == "run_v1_smoke"
+        drafts = _request(base, "GET", f"/v1/skills/drafts?workspace_id={record.workspace_id}")
+        assert any(item["draft_id"] == draft_id for item in drafts["items"])
+        shown = _request(base, "GET", f"/v1/skills/drafts/{draft_id}?workspace_id={record.workspace_id}")
+        assert "learned-v1-smoke" in shown["markdown"]
+        assert "run_v1_smoke" in shown["markdown"]
+        bad_mode = _request_error(
+            base,
+            "POST",
+            "/v1/runs",
+            {"workspace_id": record.workspace_id, "task": "nope", "session_mode": "invalid"},
+            expected=400,
+        )
+        assert bad_mode["error"]["code"] == "bad_request"
         for hidden_path in [
             "artifacts/model-request-0001.json",
             "artifacts/model-response-0001.json",
@@ -557,6 +672,11 @@ def test_product_runtime_v1_can_start_conversation_run(tmp_path) -> None:
 
         events = _request(base, "GET", f"/v1/runs/run_v1_conversation/events.jsonl?workspace_id={record.workspace_id}")
         assert events["items"][0]["conversation_id"] == "conv_v1"
+        conversations = _request(base, "GET", f"/v1/conversations?workspace_id={record.workspace_id}")["items"]
+        assert conversations[0]["conversation_id"] == "conv_v1"
+        turns = _request(base, "GET", f"/v1/conversations/conv_v1/turns?workspace_id={record.workspace_id}")
+        assert turns["conversation_id"] == "conv_v1"
+        assert any(turn["turn_id"] == "turn_v1" for turn in turns["items"])
     finally:
         server.shutdown()
         server.server_close()
@@ -634,9 +754,7 @@ def test_runtime_default_sse_redacts_context_read_paths(tmp_path) -> None:
         events = _sse(base, "/api/runs/run_context_read_surface/events")
 
         completed = next(
-            event
-            for event in events
-            if event["type"] == "tool.execution.completed" and event["data"].get("tool") == "context_read"
+            event for event in events if event["type"] == "tool.execution.completed" and event["data"].get("tool") == "context_read"
         )
         payload = json.dumps(completed)
         assert "context/" not in payload
@@ -723,6 +841,7 @@ def test_runtime_completed_runs_are_not_cancellable_and_fork_output_dir_is_rejec
 
 def test_runtime_rejects_concurrent_duplicate_run_ids(tmp_path) -> None:
     with _server(tmp_path) as base:
+
         def start() -> tuple[bool, dict]:
             try:
                 return True, _request(base, "POST", "/api/runs", {"task": "sleep please", "run_id": "run_duplicate"})

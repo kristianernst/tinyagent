@@ -91,19 +91,11 @@ def _step_mutated_workspace(step: object) -> bool:
 
 
 def _failed_same_shell_command_count(state: RunState, cmd: str) -> int:
-    return sum(
-        1
-        for step in state.tool_steps
-        if step.call.name == "shell" and _normalized_cmd(step.call) == cmd and not step.result.ok
-    )
+    return sum(1 for step in state.tool_steps if step.call.name == "shell" and _normalized_cmd(step.call) == cmd and not step.result.ok)
 
 
 def _same_successful_read_count(state: RunState, cmd: str) -> int:
-    return sum(
-        1
-        for step in state.tool_steps
-        if step.call.name == "shell" and _normalized_cmd(step.call) == cmd and step.result.ok
-    )
+    return sum(1 for step in state.tool_steps if step.call.name == "shell" and _normalized_cmd(step.call) == cmd and step.result.ok)
 
 
 def _failed_same_patch_count(state: RunState, patch: str) -> int:

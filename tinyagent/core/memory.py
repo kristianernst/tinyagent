@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from tinyagent.core.context_sources.types import ContextChunk, ContextRef
 from tinyagent.core.context_sources.builtin import _read_text_chunk
+from tinyagent.core.context_sources.types import ContextChunk, ContextRef
 from tinyagent.core.state import RunState
 
 MEMORY_DIR = Path(".tinyagent") / "memory"

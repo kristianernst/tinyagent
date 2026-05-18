@@ -220,19 +220,11 @@ def _event_count(events: list[dict[str, Any]], event_type: str) -> int:
 
 
 def _tool_count(events: list[dict[str, Any]], tool_name: str) -> int:
-    return sum(
-        1
-        for event in events
-        if event.get("type") == "tool.execution.completed" and event.get("data", {}).get("tool") == tool_name
-    )
+    return sum(1 for event in events if event.get("type") == "tool.execution.completed" and event.get("data", {}).get("tool") == tool_name)
 
 
 def _max_context_tokens(events: list[dict[str, Any]]) -> int:
-    values = [
-        int(event.get("data", {}).get("token_estimate") or 0)
-        for event in events
-        if event.get("type") == "context.built"
-    ]
+    values = [int(event.get("data", {}).get("token_estimate") or 0) for event in events if event.get("type") == "context.built"]
     return max(values, default=0)
 
 

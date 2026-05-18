@@ -12,7 +12,7 @@ from tinyagent.core.contracts import Tool
 from tinyagent.core.events import LIVE_ONLY_EVENT_TYPES, MemoryEventSink, load_events_jsonl
 from tinyagent.core.kernel import Kernel
 from tinyagent.core.providers.openai_compat import OpenAICompatibleConfig, OpenAICompatibleProvider
-from tinyagent.core.state import Message, RunBudgets, RunState, ToolStep, Workspace
+from tinyagent.core.state import Message, RunBudgets, RunState, ToolStep
 from tinyagent.core.tools import default_tools
 from tinyagent.evals.runner import run_eval_suite
 
@@ -96,10 +96,7 @@ def test_live_model_streamed_tool_call_protocol(tmp_path) -> None:
     _assert_successful_tool_use(durable_events, tool="read_file")
     assert LIVE_ONLY_EVENT_TYPES.isdisjoint(event.type for event in durable_events)
     assert any(event.type == "model.tool_call.args.delta" for event in sink.events)
-    assert any(
-        event.type == "model.tool_call.assembly.completed" and event.data.get("tool") == "read_file"
-        for event in sink.events
-    )
+    assert any(event.type == "model.tool_call.assembly.completed" and event.data.get("tool") == "read_file" for event in sink.events)
 
 
 def test_live_model_write_file_protocol_mutates_workspace(tmp_path) -> None:
@@ -169,11 +166,7 @@ def test_live_model_eval_suite_captures_protocol_outputs(tmp_path) -> None:
 def _provider_or_skip() -> OpenAICompatibleProvider:
     if os.environ.get("TINYAGENT_RUN_INTEGRATION") != "1":
         pytest.skip("set TINYAGENT_RUN_INTEGRATION=1 to run live endpoint integration tests")
-    missing = [
-        name
-        for name in ("TINYAGENT_MODEL_BASE_URL", "TINYAGENT_MODEL_API_KEY", "TINYAGENT_MODEL_NAME")
-        if not os.environ.get(name)
-    ]
+    missing = [name for name in ("TINYAGENT_MODEL_BASE_URL", "TINYAGENT_MODEL_API_KEY", "TINYAGENT_MODEL_NAME") if not os.environ.get(name)]
     if missing:
         pytest.skip(f"missing live endpoint env vars: {', '.join(missing)}")
 

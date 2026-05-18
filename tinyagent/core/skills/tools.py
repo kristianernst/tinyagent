@@ -56,7 +56,7 @@ class ListSkillsTool:
                     f"  id: {ref.id}",
                     f"  description: {ref.description}",
                     f"  tags: {tag_text}",
-                    f"  load: load_skill({{\"name_or_id\":\"{ref.name}\"}})",
+                    f'  load: load_skill({{"name_or_id":"{ref.name}"}})',
                 ]
             )
             if ref.warnings:

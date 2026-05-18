@@ -1,0 +1,19 @@
+{
+  "name": "tinyagent-tui",
+  "version": "0.1.0-alpha.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "tinyagent-tui": "./src/main.ts"
+  },
+  "scripts": {
+    "start": "bun src/main.ts",
+    "build": "bun build src/main.ts --target bun --outdir dist",
+    "test": "bun test",
+    "schema": "uv run python ../scripts/export_surface_schema.py > src/protocol/schema.generated.json"
+  },
+  "dependencies": {
+    "@opentui/core": "^0.1.11"
+  },
+  "devDependencies": {}
+}

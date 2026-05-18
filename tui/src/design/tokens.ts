@@ -1,0 +1,30 @@
+export const color = {
+  bg: "#0b0f14",
+  surface: "#11161c",
+  surface2: "#161c23",
+  border: "#22303a",
+  borderFocus: "#58a6ff",
+  text: "#e6edf3",
+  muted: "#8b949e",
+  subtle: "#6e7681",
+  blue: "#58a6ff",
+  cyan: "#56d6a4",
+  green: "#2ea043",
+  yellow: "#e3b341",
+  orange: "#f0883e",
+  red: "#f85149",
+  pink: "#ff6b9a",
+  purple: "#a371f7",
+} as const;
+
+export const semantic = {
+  thinking: color.yellow,
+  planning: color.purple,
+  reading: color.blue,
+  searching: color.cyan,
+  editing: color.orange,
+  success: color.green,
+  danger: color.red,
+  approval: color.orange,
+  muted: color.muted,
+} as const;

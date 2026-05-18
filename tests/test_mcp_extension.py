@@ -207,9 +207,7 @@ def test_mcp_large_loaded_schema_gets_context_artifact(tmp_path) -> None:
 
 
 def test_mcp_extension_adds_tools_and_context_source_to_default_kernel(tmp_path) -> None:
-    client = InMemoryMcpClient(
-        tools=[McpToolInfo(server="github", name="search_issues", description="Search GitHub issues")]
-    )
+    client = InMemoryMcpClient(tools=[McpToolInfo(server="github", name="search_issues", description="Search GitHub issues")])
     state = Kernel(
         model=FakeModelProvider([ModelResponse(content="done")]),
         profile=ApexCoderProfile(),

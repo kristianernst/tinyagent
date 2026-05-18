@@ -39,6 +39,22 @@ class ProductHome:
     def version_path(self) -> Path:
         return self.root / "version.json"
 
+    @property
+    def install_receipt_path(self) -> Path:
+        return self.root / "install.json"
+
+    @property
+    def versions_dir(self) -> Path:
+        return self.root / "versions"
+
+    @property
+    def current_path(self) -> Path:
+        return self.root / "current"
+
+    @property
+    def updates_dir(self) -> Path:
+        return self.root / "updates"
+
     def ensure(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         if not self.version_path.exists():
@@ -207,8 +223,10 @@ def render_doctor(home: ProductHome, *, workspace: Path, provider: str, port: in
 
     resolved_workspace = workspace.expanduser().resolve()
     ok = _check(lines, "workspace", resolved_workspace.is_dir(), str(resolved_workspace)) and ok
-    for tool in ("rg", "git", "python3", "python", "sed"):
+    for tool in ("rg", "git", "sed"):
         ok = _check(lines, f"tool {tool}", shutil.which(tool) is not None) and ok
+    python_tool = "python3" if shutil.which("python3") is not None else "python" if shutil.which("python") is not None else ""
+    ok = _check(lines, "tool python", bool(python_tool), python_tool or "python3 or python") and ok
     ok = _check(lines, f"port {port}", _port_available(port)) and ok
 
     if provider in {"openai-compatible", "openai-responses"}:

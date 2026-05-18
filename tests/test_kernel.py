@@ -43,6 +43,7 @@ from tinyagent.core.state import (
     ToolResult,
     Workspace,
 )
+from tinyagent.core.tools import ApplyPatchTool, ShellTool
 from tinyagent.evals.invariants import check_event_invariants
 from tinyagent.runtime.replay import render_timeline
 
@@ -333,36 +334,37 @@ def test_kernel_dispatches_model_policy_tool_then_finishes_from_content(tmp_path
     assert [result.tool_name for result in state.tool_results] == ["noop"]
     assert state.tool_results[0].call_id == noop_call.id
     types = event_types(state)
-    assert_subsequence(types, [
-        "run.started",
-        "workspace.opened",
-        "workspace.boundary",
-        "turn.started",
-        "context.built",
-        "model.call.started",
-        "step.started",
-        "model.tool_call.assembly.started",
-        "model.tool_call.assembly.completed",
-        "model.call.completed",
-        "step.completed",
-        "policy.evaluated",
-        "tool.execution.started",
-        "tool.execution.completed",
-        "step.completed",
-        "context.built",
-        "model.call.started",
-        "model.call.completed",
-        "model.message.completed",
-        "diff.finalized",
-        "turn.completed",
-        "run.completed",
-    ])
+    assert_subsequence(
+        types,
+        [
+            "run.started",
+            "workspace.opened",
+            "workspace.boundary",
+            "turn.started",
+            "context.built",
+            "model.call.started",
+            "step.started",
+            "model.tool_call.assembly.started",
+            "model.tool_call.assembly.completed",
+            "model.call.completed",
+            "step.completed",
+            "policy.evaluated",
+            "tool.execution.started",
+            "tool.execution.completed",
+            "step.completed",
+            "context.built",
+            "model.call.started",
+            "model.call.completed",
+            "model.message.completed",
+            "diff.finalized",
+            "turn.completed",
+            "run.completed",
+        ],
+    )
     assert (state.output_dir / "events.jsonl").exists()
     assert (state.output_dir / "final.md").read_text() == "# Final output\n\ndone\n"
     message = next(
-        event
-        for event in state.events
-        if event.type == "model.message.completed" and event.data.get("output_path") == "final.md"
+        event for event in state.events if event.type == "model.message.completed" and event.data.get("output_path") == "final.md"
     )
     assert message.data["output_path"] == "final.md"
     assert message.artifact_refs == []
@@ -517,9 +519,7 @@ def test_kernel_max_tool_call_failure_is_evented(tmp_path) -> None:
     assert len(blocked) == 1
     assert blocked[0].data["reason"] == "Run exceeded max_tool_calls budget."
     terminal = [
-        event
-        for event in state.events
-        if event.type == "tool.execution.failed" and event.data.get("data", {}).get("budget_exceeded")
+        event for event in state.events if event.type == "tool.execution.failed" and event.data.get("data", {}).get("budget_exceeded")
     ]
     assert len(terminal) == 1
     assert check_event_invariants(state.events) == []
@@ -766,6 +766,136 @@ def test_approval_mode_yolo_bypasses_policy_enforcement(tmp_path) -> None:
     assert decision.data["kind"] == "allow"
     assert decision.data["matched_rule"] == "approval_mode:yolo:allow"
     assert len([event for event in state.events if event.type == "tool.execution.completed"]) == 1
+
+
+def test_session_mode_plan_blocks_mutation_even_with_yolo(tmp_path) -> None:
+    patch = "*** Begin Patch\n*** Add File: planned.txt\n+nope\n*** End Patch"
+    call = ToolCall(name="apply_patch", args={"patch": patch})
+    model = StaticModel([ModelResponse(tool_calls=[call]), ModelResponse(content="plan done", finish_reason="stop")])
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[ApplyPatchTool()],
+        policy=AllowAllPolicy(),
+        approval_mode="yolo",
+        session_mode="plan",
+    )
+
+    state = kernel.run("plan should not mutate", workspace=tmp_path)
+
+    assert not (tmp_path / "planned.txt").exists()
+    decision = next(event for event in state.events if event.type == "policy.evaluated")
+    assert decision.data["kind"] == "deny"
+    assert decision.data["matched_rule"] == "session_mode:plan:block_mutation"
+    assert "patch.applied" not in event_types(state)
+    started = next(event for event in state.events if event.type == "run.started")
+    assert started.data["session_mode"] == "plan"
+
+
+def test_session_mode_plan_blocks_shell_writes_but_allows_read_only_shell(tmp_path) -> None:
+    calls = [
+        ToolCall(name="shell", args={"cmd": "pwd"}),
+        ToolCall(name="shell", args={"cmd": "echo nope>planned.txt"}),
+    ]
+    model = StaticModel([ModelResponse(tool_calls=calls), ModelResponse(content="plan done", finish_reason="stop")])
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[ShellTool()],
+        policy=AllowAllPolicy(),
+        approval_mode="yolo",
+        session_mode="plan",
+    )
+
+    state = kernel.run("plan shell", workspace=tmp_path)
+
+    assert not (tmp_path / "planned.txt").exists()
+    decisions = [event.data for event in state.events if event.type == "policy.evaluated"]
+    assert decisions[0]["kind"] == "allow"
+    assert decisions[1]["kind"] == "deny"
+    assert decisions[1]["matched_rule"] == "session_mode:plan:block_shell_write"
+
+
+def test_session_mode_plan_denies_unknown_shell_commands_without_approval(tmp_path) -> None:
+    call = ToolCall(name="shell", args={"cmd": "python -c 'print(1)'"})
+    model = StaticModel([ModelResponse(tool_calls=[call]), ModelResponse(content="plan done", finish_reason="stop")])
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[ShellTool()],
+        policy=AllowAllPolicy(),
+        approval_mode="yolo",
+        session_mode="plan",
+    )
+
+    state = kernel.run("plan shell", workspace=tmp_path)
+
+    decision = next(event.data for event in state.events if event.type == "policy.evaluated")
+    assert decision["kind"] == "deny"
+    assert decision["matched_rule"] == "session_mode:plan:block_unknown_shell"
+    assert "approval.requested" not in event_types(state)
+
+
+def test_session_mode_plan_denies_sed_write_scripts(tmp_path) -> None:
+    (tmp_path / "input.txt").write_text("hello\n")
+    call = ToolCall(name="shell", args={"cmd": "sed -n '1w out.txt' input.txt"})
+    model = StaticModel([ModelResponse(tool_calls=[call]), ModelResponse(content="plan done", finish_reason="stop")])
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[ShellTool()],
+        policy=AllowAllPolicy(),
+        approval_mode="yolo",
+        session_mode="plan",
+    )
+
+    state = kernel.run("plan shell", workspace=tmp_path)
+
+    assert not (tmp_path / "out.txt").exists()
+    decision = next(event.data for event in state.events if event.type == "policy.evaluated")
+    assert decision["kind"] == "deny"
+    assert decision["matched_rule"] == "session_mode:plan:block_unknown_shell"
+
+
+def test_session_mode_plan_denies_mutating_find_expressions(tmp_path) -> None:
+    (tmp_path / "planned.txt").write_text("nope\n")
+    call = ToolCall(name="shell", args={"cmd": "find . -name planned.txt -delete"})
+    model = StaticModel([ModelResponse(tool_calls=[call]), ModelResponse(content="plan done", finish_reason="stop")])
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[ShellTool()],
+        policy=AllowAllPolicy(),
+        approval_mode="yolo",
+        session_mode="plan",
+    )
+
+    state = kernel.run("plan shell", workspace=tmp_path)
+
+    assert (tmp_path / "planned.txt").exists()
+    decision = next(event.data for event in state.events if event.type == "policy.evaluated")
+    assert decision["kind"] == "deny"
+    assert decision["matched_rule"] == "session_mode:plan:block_find_mutation"
+
+
+def test_session_mode_plan_denies_git_diff_output_files(tmp_path) -> None:
+    call = ToolCall(name="shell", args={"cmd": "git diff --output audit.diff"})
+    model = StaticModel([ModelResponse(tool_calls=[call]), ModelResponse(content="plan done", finish_reason="stop")])
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[ShellTool()],
+        policy=AllowAllPolicy(),
+        approval_mode="yolo",
+        session_mode="plan",
+    )
+
+    state = kernel.run("plan shell", workspace=tmp_path)
+
+    assert not (tmp_path / "audit.diff").exists()
+    decision = next(event.data for event in state.events if event.type == "policy.evaluated")
+    assert decision["kind"] == "deny"
+    assert decision["matched_rule"] == "session_mode:plan:block_git_output"
 
 
 def test_on_request_auto_review_approves_with_selected_model(tmp_path) -> None:
@@ -1460,12 +1590,10 @@ def test_streaming_reasoning_visibility_distinguishes_visible_and_private(tmp_pa
     assert state.final_output == "done"
     assert not any(event.type == "model.reasoning.delta" for event in state.events)
     visible = next(event for event in sink.events if event.type == "model.reasoning.delta" and event.data.get("delta") == "visible thought")
-    safe_summary = [
-        event for event in sink.events if event.type == "model.reasoning.delta" and event.data.get("delta") == "safe summary"
-    ][0]
-    private_summary = [
-        event for event in sink.events if event.type == "model.reasoning.delta" and not event.data.get("delta")
-    ][0]
+    safe_summary = [event for event in sink.events if event.type == "model.reasoning.delta" and event.data.get("delta") == "safe summary"][
+        0
+    ]
+    private_summary = [event for event in sink.events if event.type == "model.reasoning.delta" and not event.data.get("delta")][0]
     encrypted = next(event for event in sink.events if event.type == "reasoning.encrypted")
     assert visible.visibility == "user"
     assert visible.data["delta"] == "visible thought"
@@ -1520,9 +1648,7 @@ def test_streaming_tool_arguments_are_buffered_before_tool_execution(tmp_path) -
     assert state.model_call_count == 2
     assert state.tool_results == [ToolResult(tool_name="noop", output="ok", call_id="call_1")]
     tool_events = [
-        event.type
-        for event in state.events
-        if event.type in {"policy.evaluated", "tool.execution.started", "tool.execution.completed"}
+        event.type for event in state.events if event.type in {"policy.evaluated", "tool.execution.started", "tool.execution.completed"}
     ]
     assert tool_events == [
         "policy.evaluated",
@@ -1538,26 +1664,21 @@ def test_streaming_tool_arguments_are_buffered_before_tool_execution(tmp_path) -
     assert len(sink_completed_assembly) == 1
     assert sink_completed_assembly[0].data["model_call_id"] == "model-call-0001"
     model_completed = [
-        event
-        for event in state.events
-        if event.type == "model.call.completed" and event.data["model_call_id"] == "model-call-0001"
+        event for event in state.events if event.type == "model.call.completed" and event.data["model_call_id"] == "model-call-0001"
     ][0]
     policy_evaluated = [event for event in state.events if event.type == "policy.evaluated"][0]
     sink_tool_started = [event for event in sink.events if event.type == "tool.execution.started"][0]
     assert arg_delta_events[-1].seq < sink_completed_assembly[0].seq < sink_tool_started.seq
     assert sink_completed_assembly[0].seq < model_completed.seq < policy_evaluated.seq < sink_tool_started.seq
-    completed_assembly_events = [
-        event for event in state.events if event.type == "model.tool_call.assembly.completed"
-    ]
+    completed_assembly_events = [event for event in state.events if event.type == "model.tool_call.assembly.completed"]
     assert len(completed_assembly_events) == 1
     tool_requested = completed_assembly_events[0]
     assert tool_requested.data["tool_call_id"] == "call_1"
     assert tool_requested.data["args"] == {}
     transcript_tool_calls = [item for item in state.transcript.items if item.kind == "tool_call"]
-    assert [
-        (item.turn_id, item.model_call_id, item.tool_call_id, item.tool_name, item.data["args"])
-        for item in transcript_tool_calls
-    ] == [("turn-0001", "model-call-0001", "call_1", "noop", {})]
+    assert [(item.turn_id, item.model_call_id, item.tool_call_id, item.tool_name, item.data["args"]) for item in transcript_tool_calls] == [
+        ("turn-0001", "model-call-0001", "call_1", "noop", {})
+    ]
     transcript_tool_results = [item for item in state.transcript.items if item.kind == "tool_result"]
     assert [(item.turn_id, item.tool_call_id, item.tool_name, item.data["ok"]) for item in transcript_tool_results] == [
         ("turn-0001", "call_1", "noop", True)
@@ -1586,14 +1707,10 @@ def test_model_tool_call_recording_keeps_streamed_event_and_records_transcript(t
         model_call_index=1,
     )
 
-    completed_assembly_events = [
-        event for event in state.events if event.type == "model.tool_call.assembly.completed"
-    ]
+    completed_assembly_events = [event for event in state.events if event.type == "model.tool_call.assembly.completed"]
     assert len(completed_assembly_events) == 1
     transcript_tool_calls = [item for item in state.transcript.items if item.kind == "tool_call"]
-    assert [(item.tool_call_id, item.tool_name, item.data["args"]) for item in transcript_tool_calls] == [
-        ("call_1", "noop", {"value": 1})
-    ]
+    assert [(item.tool_call_id, item.tool_name, item.data["args"]) for item in transcript_tool_calls] == [("call_1", "noop", {"value": 1})]
 
 
 def test_reused_tool_call_id_across_model_calls_fails_before_dispatch(tmp_path) -> None:
@@ -1666,9 +1783,7 @@ def test_streamed_tool_call_completed_args_are_bounded_in_events(tmp_path) -> No
 
     state = kernel.run("stream a large tool argument", workspace=tmp_path)
 
-    completed_assembly = [
-        event for event in state.events if event.type == "model.tool_call.assembly.completed"
-    ][0]
+    completed_assembly = [event for event in state.events if event.type == "model.tool_call.assembly.completed"][0]
     assert completed_assembly.data["args"]["_truncated"] is True
     assert completed_assembly.data["args"]["json_tokens"] > 1_000
     arg_delta = [event for event in sink.events if event.type == "model.tool_call.args.delta"][0]
@@ -1678,11 +1793,7 @@ def test_streamed_tool_call_completed_args_are_bounded_in_events(tmp_path) -> No
     assert "delta" not in arg_delta.data
     assert "delta_preview" not in arg_delta.data
     assert large_value not in json.dumps(arg_delta.data)
-    response_event = [
-        event
-        for event in state.events
-        if event.type == "model.call.completed" and event.data["tool_call_count"] == 1
-    ][0]
+    response_event = [event for event in state.events if event.type == "model.call.completed" and event.data["tool_call_count"] == 1][0]
     response = json.loads((state.output_dir / response_event.data["response_artifact"]).read_text())
     assert response["tool_calls"] == [{"id": "call_1", "name": "noop", "args": {"payload": large_value}}]
 
@@ -1781,14 +1892,11 @@ def test_cancelled_tool_preserves_completed_steps_and_finalizes_without_completi
         "tool.execution.started",
         "tool.execution.cancelled",
     ]
-    cancel_transcript = [
-        item for item in state.transcript.items if item.kind == "tool_result" and item.tool_call_id == cancel_call.id
-    ][0]
+    cancel_transcript = [item for item in state.transcript.items if item.kind == "tool_result" and item.tool_call_id == cancel_call.id][0]
     assert cancel_transcript.data["ok"] is False
     assert cancel_transcript.data["failure_kind"] is None
     assert not any(
-        event.data.get("tool_call_id") == cancel_call.id
-        and event.type in {"tool.execution.completed", "tool.execution.failed"}
+        event.data.get("tool_call_id") == cancel_call.id and event.type in {"tool.execution.completed", "tool.execution.failed"}
         for event in state.events
     )
     assert check_event_invariants(state.events) == []
@@ -2037,13 +2145,7 @@ def test_console_text_sink_renders_selected_live_events_and_closes_lines() -> No
     for event in events:
         sink.emit(event)
 
-    assert output.getvalue() == (
-        "answer\n"
-        "[reasoning] safe summary\n"
-        "[tool] shell: pytest -q\n"
-        "[ok] shell completed, 3 tokens\n"
-        "done\n"
-    )
+    assert output.getvalue() == ("answer\n[reasoning] safe summary\n[tool] shell: pytest -q\n[ok] shell completed, 3 tokens\ndone\n")
 
 
 def test_run_state_emit_uses_one_sequence_for_durable_and_live_events(tmp_path) -> None:

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-from concurrent.futures import ThreadPoolExecutor
+import re
+import shlex
 from collections.abc import Iterable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -58,6 +60,7 @@ from tinyagent.core.state import (
     PolicyDecision,
     RunBudgets,
     RunState,
+    SessionMode,
     ToolCall,
     ToolResult,
 )
@@ -70,6 +73,13 @@ from tinyagent.core.tool_recording import (
 from tinyagent.core.tools.builtins.shell import shell_preflight
 from tinyagent.core.workspace import SandboxModeInput, WorkspaceMode, prepare_workspace
 from tinyagent.core.workspace_delta import WorkspaceDeltaObserver
+
+_PLAN_BLOCKED_TOOLS = frozenset({"apply_patch", "str_replace_edit", "write_file", "todo_write"})
+_PLAN_SHELL_WRITE_PATTERN = re.compile(r">|\b(?:tee|touch|mkdir|rm|mv|cp)\b|sed\s+-i")
+_PLAN_SHELL_CONTROL_PATTERN = re.compile(r"[;&|`<>]|\$\(")
+_PLAN_ALLOWED_SHELL_COMMANDS = frozenset({"pwd", "ls", "rg", "cat", "head", "tail", "wc", "find"})
+_PLAN_ALLOWED_GIT_SUBCOMMANDS = frozenset({"status", "diff", "log", "show", "ls-files"})
+_PLAN_FIND_MUTATING_TOKENS = frozenset({"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fls"})
 
 
 class Kernel:
@@ -88,6 +98,7 @@ class Kernel:
         stream: bool = False,
         event_sink: EventSink | None = None,
         approval_mode: ApprovalMode = "yolo",
+        session_mode: SessionMode = "normal",
         workspace_mode: WorkspaceMode = "auto",
         sandbox_mode: SandboxModeInput = "none",
         hooks: Sequence[TinyHook] = (),
@@ -104,9 +115,7 @@ class Kernel:
         extension_host = ExtensionHost((*loaded_extensions, *explicit_extensions))
         if runtime.skills:
             base_skill_sources = (
-                default_skill_sources()
-                if resources is None or resources.skill_sources is None
-                else resources.skill_sources
+                default_skill_sources() if resources is None or resources.skill_sources is None else resources.skill_sources
             )
         else:
             base_skill_sources = ()
@@ -141,6 +150,7 @@ class Kernel:
         self.stream = stream
         self.event_sink = event_sink
         self.approval_mode = approval_mode
+        self.session_mode = session_mode
         self.workspace_mode = workspace_mode
         self.sandbox_mode = sandbox_mode
         self.hooks = (*tuple(hooks), *extension_host.hooks())
@@ -163,6 +173,7 @@ class Kernel:
         cancel_token: CancelToken | None = None,
         workspace_mode: WorkspaceMode | None = None,
         approval_mode: ApprovalMode | None = None,
+        session_mode: SessionMode | None = None,
         sandbox_mode: SandboxModeInput | None = None,
         parent_run_id: str | None = None,
         parent_event_id: str | None = None,
@@ -200,6 +211,7 @@ class Kernel:
         state.context_registry = self.context_registry
         state.model_spec = model_spec(self.model).to_json_dict()
         state.approval_mode = approval_mode or self.approval_mode
+        state.session_mode = session_mode or self.session_mode
         state.status = "running"
         if cancel_token is not None:
             state.cancel_token = cancel_token
@@ -232,6 +244,7 @@ class Kernel:
                         state.workspace_envelope.mode if state.workspace_envelope else (workspace_mode or self.workspace_mode)
                     ),
                     "approval_mode": state.approval_mode,
+                    "session_mode": state.session_mode,
                     "sandbox_mode": (
                         state.workspace_envelope.sandbox_mode if state.workspace_envelope else (sandbox_mode or self.sandbox_mode)
                     ),
@@ -443,11 +456,7 @@ class Kernel:
                     visibility="user",
                 )
                 step_status = (
-                    "idle_timeout"
-                    if event_type == "model.idle_timeout"
-                    else "timeout"
-                    if event_type == "model.timeout"
-                    else "failed"
+                    "idle_timeout" if event_type == "model.idle_timeout" else "timeout" if event_type == "model.timeout" else "failed"
                 )
                 state.finish_step(step_status)
                 state.fail(f"Model provider error: {exc}")
@@ -503,9 +512,7 @@ class Kernel:
                     "finish_reason": response.finish_reason,
                     "response_artifact": response_artifact,
                     "streamed": bool(response.raw.get("streamed")),
-                    "conversation_state": (
-                        response.conversation_state.to_json_dict() if response.conversation_state is not None else None
-                    ),
+                    "conversation_state": (response.conversation_state.to_json_dict() if response.conversation_state is not None else None),
                 },
             )
             state.finish_step("completed", data={"provider": self.model.name})
@@ -947,6 +954,18 @@ class Kernel:
             state.request_cancel(str(result.data.get("reason") or state.cancel_reason or "cancelled"))
 
     def _policy_decision(self, state: RunState, call: ToolCall) -> PolicyDecision:
+        if state.session_mode == "plan":
+            plan_decision = _plan_mode_decision(call)
+            if plan_decision is not None:
+                return plan_decision
+            decision = self.policy.evaluate(call, state)
+            if decision.kind == "needs_approval":
+                return PolicyDecision.deny(
+                    "plan mode blocks actions that require approval",
+                    matched_rule="session_mode:plan:block_approval_required",
+                    permission=decision.permission,
+                )
+            return decision
         if state.approval_mode == "yolo":
             return PolicyDecision.allow(
                 "approval-mode=yolo bypasses policy enforcement",
@@ -1128,6 +1147,67 @@ class Kernel:
         before_finish = getattr(self.profile, "before_finish", None)
         decision = before_finish(state, response) if callable(before_finish) else FinishDecision.allowed()
         return self.hook_runner.before_finish(state, response, decision)
+
+
+def _plan_mode_decision(call: ToolCall) -> PolicyDecision | None:
+    if call.name in _PLAN_BLOCKED_TOOLS:
+        return PolicyDecision.deny(
+            "plan mode blocks workspace mutation tools",
+            matched_rule="session_mode:plan:block_mutation",
+            permission="session_mode",
+        )
+    if call.name == "shell":
+        cmd = str(call.args.get("cmd") or "")
+        if _PLAN_SHELL_WRITE_PATTERN.search(cmd):
+            return PolicyDecision.deny(
+                "plan mode blocks shell commands that look like file mutations",
+                matched_rule="session_mode:plan:block_shell_write",
+                permission="session_mode",
+            )
+        if _PLAN_SHELL_CONTROL_PATTERN.search(cmd):
+            return PolicyDecision.deny(
+                "plan mode only allows a single read-only shell command",
+                matched_rule="session_mode:plan:block_shell_control",
+                permission="session_mode",
+            )
+        try:
+            words = shlex.split(cmd)
+        except ValueError:
+            return PolicyDecision.deny(
+                "plan mode blocks unparsable shell commands",
+                matched_rule="session_mode:plan:block_shell_parse_error",
+                permission="session_mode",
+            )
+        if not words:
+            return PolicyDecision.deny("Shell command is required.", matched_rule="shell.required", permission="bash")
+        command = Path(words[0]).name
+        if command == "git":
+            subcommand = words[1] if len(words) > 1 else ""
+            if any(word == "--output" or word.startswith("--output=") for word in words[1:]):
+                return PolicyDecision.deny(
+                    "plan mode blocks git shell commands that write output files",
+                    matched_rule="session_mode:plan:block_git_output",
+                    permission="session_mode",
+                )
+            if subcommand in _PLAN_ALLOWED_GIT_SUBCOMMANDS:
+                return None
+        elif command == "find":
+            if any(word in _PLAN_FIND_MUTATING_TOKENS or word.startswith(("-exec", "-ok")) for word in words[1:]):
+                return PolicyDecision.deny(
+                    "plan mode blocks mutating find expressions",
+                    matched_rule="session_mode:plan:block_find_mutation",
+                    permission="session_mode",
+                )
+            return None
+        elif command in _PLAN_ALLOWED_SHELL_COMMANDS:
+            return None
+        return PolicyDecision.deny(
+            "plan mode allows only read-only shell inspection commands",
+            matched_rule="session_mode:plan:block_unknown_shell",
+            permission="session_mode",
+        )
+    return None
+
 
 def _blocked_result_data(decision: PolicyDecision) -> dict[str, object]:
     capability = decision.permission or "unknown"
