@@ -110,6 +110,7 @@ def install_draft(
         shutil.rmtree(target)
     target.mkdir()
     shutil.copy2(draft_dir / "SKILL.md", target / "SKILL.md")
+    _record_install_review(draft_dir, target)
     return target
 
 
@@ -167,6 +168,7 @@ def eval_draft(
         )
         + "\n"
     )
+    _record_eval_evidence(draft_dir, suite_path=suite_path, output_dir=output_dir, comparison=comparison)
     return comparison
 
 
@@ -274,6 +276,9 @@ def _source_summary(
         "tools": sorted({call.tool for call in record.tool_calls if call.tool}),
         "commands": [_sanitize_text(command) for command in commands[:20]],
         "included_debug_artifacts": bool(debug_artifacts),
+        "review_gate": _review_gate(draft_id),
+        "eval_evidence": [],
+        "install_evidence": None,
     }
     if debug_artifacts:
         summary["debug_artifacts"] = {
@@ -347,8 +352,114 @@ def _draft_status(draft_id: str, skill_name: str, record: RunRecord) -> dict[str
         "status": "draft",
         "source_run_id": record.run_id,
         "auto_installed": False,
+        "review_gate": _review_gate(draft_id),
+        "eval_evidence": [],
+        "install_evidence": None,
         "created_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
     }
+
+
+def _review_gate(draft_id: str) -> dict[str, object]:
+    return {
+        "required": True,
+        "auto_install": False,
+        "install_command": f"tinyagent skills install-draft {draft_id}",
+    }
+
+
+def _record_eval_evidence(draft_dir: Path, *, suite_path: Path, output_dir: Path, comparison) -> None:
+    evidence = {
+        "created_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "suite_path": _redact_path(str(suite_path.expanduser().resolve())),
+        "output_dir": _redact_path(str(output_dir.expanduser().resolve())),
+        "comparison_json": _redact_path(str((output_dir / "comparison.json").expanduser().resolve())),
+        "variants": [
+            {
+                "name": run.variant_name,
+                "total": len(run.results),
+                "passed": sum(1 for result in run.results if result.success),
+            }
+            for run in comparison.variants
+        ],
+    }
+    _update_draft_records(draft_dir, status="evaluated", eval_evidence=evidence)
+
+
+def _record_install_review(draft_dir: Path, target: Path) -> None:
+    evidence = {
+        "created_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "reviewed_by": "user_command",
+        "installed_path": _redact_path(str(target.expanduser().resolve())),
+    }
+    _update_draft_records(draft_dir, status="installed", install_evidence=evidence)
+
+
+def _update_draft_records(
+    draft_dir: Path,
+    *,
+    status: str,
+    eval_evidence: dict[str, object] | None = None,
+    install_evidence: dict[str, object] | None = None,
+) -> None:
+    _append_review_log(draft_dir, status=status, eval_evidence=eval_evidence, install_evidence=install_evidence)
+    for name in ("source-run.json", "status.json"):
+        path = _draft_metadata_path(draft_dir, name)
+        if path is None:
+            continue
+        if not path.exists():
+            continue
+        try:
+            record = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        record["status"] = status
+        if eval_evidence is not None:
+            existing = record.get("eval_evidence")
+            record["eval_evidence"] = [*(existing if isinstance(existing, list) else []), eval_evidence]
+        if install_evidence is not None:
+            record["install_evidence"] = install_evidence
+        try:
+            path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+        except OSError:
+            continue
+
+
+def _append_review_log(
+    draft_dir: Path,
+    *,
+    status: str,
+    eval_evidence: dict[str, object] | None,
+    install_evidence: dict[str, object] | None,
+) -> None:
+    payload: dict[str, object] = {
+        "created_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "status": status,
+    }
+    if eval_evidence is not None:
+        payload["eval_evidence"] = eval_evidence
+    if install_evidence is not None:
+        payload["install_evidence"] = install_evidence
+    path = _draft_metadata_path(draft_dir, "review-evidence.jsonl")
+    if path is None:
+        return
+    try:
+        with path.open("a") as file:
+            file.write(json.dumps(payload, sort_keys=True) + "\n")
+    except OSError:
+        return
+
+
+def _draft_metadata_path(draft_dir: Path, name: str) -> Path | None:
+    path = draft_dir / name
+    if path.is_symlink():
+        return None
+    try:
+        path.resolve().relative_to(draft_dir.resolve())
+    except ValueError:
+        return None
+    return path
 
 
 def _draft_dir(draft_id: str, *, workspace: Path, drafts_dir: Path | None) -> Path:

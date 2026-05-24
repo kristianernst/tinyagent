@@ -73,12 +73,17 @@ def test_skill_draft_generation_install_and_reject_from_successful_run(tmp_path)
     assert source["inputs"]["event_count"] > 0
     assert any(path.startswith("artifacts/model-request") for path in source["inputs"]["hidden_artifacts_skipped"])
     assert status["auto_installed"] is False
+    assert source["review_gate"]["required"] is True
+    assert status["review_gate"]["auto_install"] is False
     assert source["included_debug_artifacts"] is False
     assert "debug_artifacts" not in source
     assert "## Verification" in show_draft(draft.draft_id, workspace=workspace)
     assert (installed / "SKILL.md").exists()
     assert not (installed / "source-run.json").exists()
     assert not (installed / "eval-plan.md").exists()
+    installed_status = json.loads((draft.path / "status.json").read_text())
+    assert installed_status["status"] == "installed"
+    assert installed_status["install_evidence"]["reviewed_by"] == "user_command"
     assert rejected.parent.name == "rejected"
     assert [item.draft_id for item in list_drafts(workspace=workspace)] == [draft.draft_id]
 
@@ -88,89 +93,7 @@ def test_skill_draft_eval_writes_comparison_artifacts(tmp_path) -> None:
 
     workspace = tmp_path / "repo"
     workspace.mkdir()
-    run = workspace / ".tinyagent" / "runs" / "run_done"
-    run.mkdir(parents=True)
-    (run / "events.jsonl").write_text(
-        json.dumps(
-            {
-                "id": "evt_1",
-                "seq": 1,
-                "type": "run.started",
-                "time": "2026-05-08T00:00:00Z",
-                "run_id": "run_done",
-                "turn_id": None,
-                "item_id": None,
-                "parent_item_id": None,
-                "source": "tinyagent",
-                "visibility": "debug",
-                "durability": "event_log",
-                "data": {"task": "inspect hello"},
-                "artifact_refs": [],
-            },
-            sort_keys=True,
-        )
-        + "\n"
-        + json.dumps(
-            {
-                "id": "evt_2",
-                "seq": 2,
-                "type": "artifact.finalization.started",
-                "time": "2026-05-08T00:00:01Z",
-                "run_id": "run_done",
-                "turn_id": None,
-                "item_id": None,
-                "parent_item_id": None,
-                "source": "tinyagent",
-                "visibility": "debug",
-                "durability": "event_log",
-                "data": {},
-                "artifact_refs": [],
-            },
-            sort_keys=True,
-        )
-        + "\n"
-        + json.dumps(
-            {
-                "id": "evt_3",
-                "seq": 3,
-                "type": "artifact.finalization.completed",
-                "time": "2026-05-08T00:00:02Z",
-                "run_id": "run_done",
-                "turn_id": None,
-                "item_id": None,
-                "parent_item_id": None,
-                "source": "tinyagent",
-                "visibility": "debug",
-                "durability": "event_log",
-                "data": {},
-                "artifact_refs": [],
-            },
-            sort_keys=True,
-        )
-        + "\n"
-        + json.dumps(
-            {
-                "id": "evt_4",
-                "seq": 4,
-                "type": "run.completed",
-                "time": "2026-05-08T00:00:03Z",
-                "run_id": "run_done",
-                "turn_id": None,
-                "item_id": None,
-                "parent_item_id": None,
-                "source": "tinyagent",
-                "visibility": "debug",
-                "durability": "event_log",
-                "data": {"status": "completed"},
-                "artifact_refs": [],
-            },
-            sort_keys=True,
-        )
-        + "\n"
-    )
-    (run / "metrics.json").write_text('{"run_id":"run_done","status":"completed","task":"inspect hello"}\n')
-    (run / "final.md").write_text("done\n")
-    (run / "final.diff").write_text("")
+    run = _write_completed_run(workspace, "run_done", task="inspect hello")
     draft = draft_from_run(run, workspace=workspace)
     suite = _write_stage6_suite(tmp_path)
 
@@ -187,6 +110,48 @@ def test_skill_draft_eval_writes_comparison_artifacts(tmp_path) -> None:
 
     assert [run.variant_name for run in comparison.variants] == ["baseline", "draft"]
     assert (tmp_path / "draft-eval" / "comparison.md").exists()
+    source = json.loads((draft.path / "source-run.json").read_text())
+    status = json.loads((draft.path / "status.json").read_text())
+    assert source["status"] == "evaluated"
+    assert source["eval_evidence"][0]["variants"][0]["name"] == "baseline"
+    assert status["eval_evidence"][0]["comparison_json"].endswith("comparison.json")
+
+
+def test_skill_draft_install_evidence_is_best_effort_for_malformed_status(tmp_path) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    run = _write_completed_run(workspace, "run_done", task="inspect hello")
+    draft = draft_from_run(run, workspace=workspace)
+    (draft.path / "status.json").write_text("{bad json")
+
+    installed = install_draft(draft.draft_id, workspace=workspace)
+
+    assert (installed / "SKILL.md").exists()
+    evidence = [json.loads(line) for line in (draft.path / "review-evidence.jsonl").read_text().splitlines()]
+    assert evidence[-1]["status"] == "installed"
+    assert evidence[-1]["install_evidence"]["reviewed_by"] == "user_command"
+
+
+def test_skill_draft_install_evidence_skips_symlinked_metadata(tmp_path) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    run = _write_completed_run(workspace, "run_done", task="inspect hello")
+    draft = draft_from_run(run, workspace=workspace)
+    outside_status = tmp_path / "outside-status.json"
+    outside_status.write_text('{"status":"keep"}\n')
+    outside_log = tmp_path / "outside-review-log.jsonl"
+    (draft.path / "status.json").unlink()
+    (draft.path / "review-evidence.jsonl").unlink(missing_ok=True)
+    (draft.path / "status.json").symlink_to(outside_status)
+    (draft.path / "review-evidence.jsonl").symlink_to(outside_log)
+
+    installed = install_draft(draft.draft_id, workspace=workspace)
+    source = json.loads((draft.path / "source-run.json").read_text())
+
+    assert (installed / "SKILL.md").exists()
+    assert outside_status.read_text() == '{"status":"keep"}\n'
+    assert not outside_log.exists()
+    assert source["install_evidence"]["reviewed_by"] == "user_command"
 
 
 def test_memory_files_are_explicit_and_optional_context_source(tmp_path) -> None:
@@ -269,3 +234,45 @@ def _write_stage6_suite(tmp_path: Path) -> Path:
     case.mkdir(parents=True)
     (case / "task.json").write_text(json.dumps({"id": "noop", "task": "Return done.", "setup_git": False}))
     return suite
+
+
+def _write_completed_run(workspace: Path, run_id: str, *, task: str) -> Path:
+    run = workspace / ".tinyagent" / "runs" / run_id
+    run.mkdir(parents=True)
+    events = [
+        {
+            "id": "evt_1",
+            "seq": 1,
+            "type": "run.started",
+            "time": "2026-05-08T00:00:00Z",
+            "run_id": run_id,
+            "turn_id": None,
+            "item_id": None,
+            "parent_item_id": None,
+            "source": "tinyagent",
+            "visibility": "debug",
+            "durability": "event_log",
+            "data": {"task": task},
+            "artifact_refs": [],
+        },
+        {
+            "id": "evt_2",
+            "seq": 2,
+            "type": "run.completed",
+            "time": "2026-05-08T00:00:03Z",
+            "run_id": run_id,
+            "turn_id": None,
+            "item_id": None,
+            "parent_item_id": None,
+            "source": "tinyagent",
+            "visibility": "debug",
+            "durability": "event_log",
+            "data": {"status": "completed"},
+            "artifact_refs": [],
+        },
+    ]
+    (run / "events.jsonl").write_text("".join(json.dumps(event, sort_keys=True) + "\n" for event in events))
+    (run / "metrics.json").write_text(json.dumps({"run_id": run_id, "status": "completed", "task": task}) + "\n")
+    (run / "final.md").write_text("done\n")
+    (run / "final.diff").write_text("")
+    return run
