@@ -12,6 +12,7 @@ import pytest
 from tinyagent.core.context import BuiltContext, ContextConfig, estimate_messages_tokens, estimate_tools_tokens
 from tinyagent.core.context_sources import ContextReadTool
 from tinyagent.core.contextfs import read_hints, refresh_contextfs
+from tinyagent.core.execution import build_execution_envelope
 from tinyagent.core.kernel import Kernel
 from tinyagent.core.models import FakeModelProvider
 from tinyagent.core.observations import Observation
@@ -23,6 +24,7 @@ from tinyagent.core.sdk import Agent
 from tinyagent.core.state import Message, ModelResponse, PolicyDecision, RunBudgets, RunState, ToolCall, ToolResult, ToolStep, Workspace
 from tinyagent.core.token_utils import estimate_tokens
 from tinyagent.core.tools import ShellTool, default_tools
+from tinyagent.core.workspace import WorkspaceEnvelope
 from tinyagent.core.workspace_delta import WorkspaceDeltaObserver
 from tinyagent.evals.metrics import evaluate_thresholds, extract_run_metrics
 from tinyagent.runtime.run_graph import fork_run
@@ -1684,6 +1686,40 @@ def test_container_sandbox_mode_records_enforced_backend(tmp_path, monkeypatch) 
     assert preflight.data["scope"] == "host-preflight-for-container"
 
 
+def test_native_sandbox_mode_fails_setup_until_backend_exists(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("tinyagent.core.workspace.detect_native_backend", lambda: None)
+    kernel = Kernel(
+        model=FakeModelProvider([ModelResponse(content="done", finish_reason="stop")]),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=workspace_shell_policy(),
+        sandbox_mode="native",
+    )
+
+    with pytest.raises(ValueError, match="requires a supported native sandbox backend"):
+        kernel.run("use native sandbox", workspace=tmp_path, run_id="run_native_sandbox")
+
+
+def test_native_sandbox_mode_records_enforced_backend(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("tinyagent.core.workspace.detect_native_backend", lambda: "seatbelt")
+    state = Kernel(
+        model=FakeModelProvider([ModelResponse(content="done", finish_reason="stop")]),
+        profile=ApexCoderProfile(),
+        tools=default_tools(),
+        policy=workspace_shell_policy(),
+        sandbox_mode="native",
+    ).run("use native sandbox", workspace=tmp_path, run_id="run_native_sandbox")
+
+    boundary = next(event for event in state.events if event.type == "workspace.boundary")
+    assert boundary.data["sandbox_mode"] == "native"
+    assert boundary.data["sandbox_backend"] == "seatbelt"
+    assert boundary.data["network_mode"] == "deny"
+    assert boundary.data["sandbox_enforced"] is True
+    preflight = next(event for event in state.events if event.type == "shell.preflight.completed")
+    assert preflight.data["authoritative"] is False
+    assert preflight.data["scope"] == "host-preflight-for-native-sandbox"
+
+
 def test_shell_execution_envelope_exposes_sandbox_contract(tmp_path) -> None:
     state = RunState.create("contract", Workspace(tmp_path), run_id="run_shell_contract")
     result = ShellTool().run(ToolCall(name="shell", args={"cmd": "printf ok"}), state)
@@ -1696,6 +1732,29 @@ def test_shell_execution_envelope_exposes_sandbox_contract(tmp_path) -> None:
     assert envelope["sandbox_backend"] == "none"
     assert envelope["sandbox_enforced"] is False
     assert "escalation_hint" in envelope
+
+
+def test_shell_execution_envelope_exposes_native_sandbox_contract(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("tinyagent.core.execution.native_backend_version", lambda backend: "sandbox-exec" if backend == "seatbelt" else "")
+    state = RunState.create("contract", Workspace(tmp_path), run_id="run_native_contract")
+    state.workspace_envelope = WorkspaceEnvelope(
+        root=tmp_path,
+        original_root=tmp_path,
+        mode="current",
+        effective_mode="current",
+        allowed_roots=(tmp_path,),
+        sandbox_mode="native",
+        sandbox_backend="seatbelt",
+        network_mode="deny",
+        sandbox_enforced=True,
+    )
+
+    envelope = build_execution_envelope(state, timeout_seconds=10).to_json_dict()
+    assert envelope["sandbox_backend"] == "seatbelt"
+    assert envelope["sandbox_backend_version"] == "sandbox-exec"
+    assert envelope["sandbox_enforced"] is True
+    assert envelope["container_image"] == ""
+    assert "Native shell sandbox is active" in envelope["escalation_hint"]
 
 
 def test_shell_container_sandbox_wraps_process_with_isolated_home_and_network(tmp_path) -> None:
@@ -1732,6 +1791,48 @@ def test_shell_container_sandbox_wraps_process_with_isolated_home_and_network(tm
     assert "HOME=/home/tinyagent" in argv
     assert "git config --global --add safe.directory /workspace" in argv[-1]
     assert argv[-1].endswith("printf ok")
+
+
+def test_shell_native_sandbox_wraps_process_with_seatbelt_profile(tmp_path) -> None:
+    from tinyagent.core.tools.builtins.shell import _popen_command
+
+    envelope = SimpleNamespace(
+        sandbox_enforced=True,
+        sandbox_backend="seatbelt",
+        cwd=tmp_path,
+        read_roots=(tmp_path,),
+        writable_roots=(tmp_path, tmp_path / "home"),
+        denied_paths=(tmp_path / ".tinyagent" / "runs" / "run" / "artifacts",),
+        network_mode="deny",
+    )
+
+    launch = _popen_command("printf ok", envelope, "call/one")
+    argv = launch.args
+
+    assert launch.shell is False
+    assert argv[:2] == ["sandbox-exec", "-p"]
+    assert argv[-3:] == ["/bin/sh", "-c", "printf ok"]
+    assert "(deny network*)" in argv[2]
+    assert "(allow file-read*)" not in argv[2]
+    assert f'(allow file-read* (subpath "{tmp_path.resolve()}"))' in argv[2]
+    assert str(tmp_path) in argv[2]
+
+
+def test_native_backend_detection_requires_seatbelt_probe(monkeypatch) -> None:
+    import tinyagent.core.native_sandbox as native_sandbox
+
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(returncode=1)
+
+    monkeypatch.setattr(native_sandbox.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(native_sandbox.shutil, "which", lambda name: "/usr/bin/sandbox-exec" if name == "sandbox-exec" else None)
+    monkeypatch.setattr(native_sandbox.subprocess, "run", fake_run)
+
+    assert native_sandbox.detect_native_backend() is None
+    assert calls
 
 
 def test_shell_container_timeout_kills_cidfile_container(tmp_path, monkeypatch) -> None:

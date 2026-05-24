@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Literal
 
 from tinyagent.core.container_sandbox import default_container_image, detect_container_backend
+from tinyagent.core.native_sandbox import detect_native_backend
 
 WorkspaceMode = Literal["auto", "worktree", "current"]
 SandboxMode = Literal["none", "container", "native"]
@@ -130,7 +131,11 @@ def prepare_workspace(
         sandbox_backend = detected_backend
         sandbox_enforced = True
     elif sandbox_mode == "native":
-        raise ValueError("sandbox-mode=native requires a native sandbox backend; no backend is configured yet")
+        detected_backend = detect_native_backend()
+        if detected_backend is None:
+            raise ValueError("sandbox-mode=native requires a supported native sandbox backend; none was detected")
+        sandbox_backend = detected_backend
+        sandbox_enforced = True
 
     use_worktree = mode == "worktree" or (mode == "auto" and dirty.is_git_repo and dirty.has_head and dirty.clean)
     if use_worktree:
