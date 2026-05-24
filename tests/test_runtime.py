@@ -94,6 +94,19 @@ def test_runtime_v1_single_workspace_run_events_artifacts_and_schema(tmp_path) -
         fork_schema = openapi["paths"]["/v1/runs/{run_id}/fork"]["post"]["requestBody"]["content"]["application/json"]["schema"]
         assert fork_schema["$ref"] == "#/components/schemas/RunForkRequest"
         assert openapi["components"]["schemas"]["RunForkRequest"]["required"] == ["at"]
+        assert openapi["components"]["schemas"]["StartRunRequest"]["properties"]["permission_profile"]["enum"] == [
+            "read-only",
+            "workspace-write",
+            "contained-yolo",
+            "danger-full-access",
+        ]
+        assert openapi["components"]["schemas"]["Run"]["properties"]["permission_profile"]["enum"] == [
+            "read-only",
+            "workspace-write",
+            "contained-yolo",
+            "danger-full-access",
+            "",
+        ]
         event_stream = openapi["paths"]["/v1/runs/{run_id}/events"]["get"]["responses"]["200"]["content"]["text/event-stream"]
         assert event_stream["x-itemSchema"]["$ref"] == "#/components/schemas/Event"
 
@@ -103,19 +116,31 @@ def test_runtime_v1_single_workspace_run_events_artifacts_and_schema(tmp_path) -
         assert git["isRepo"] is False
         assert git["clean"] is True
 
-        created = _request(base, "POST", "/v1/runs", {"task": "v1 single", "run_id": "run_v1_single", "session_mode": "plan"})
+        created = _request(
+            base,
+            "POST",
+            "/v1/runs",
+            {"task": "v1 single", "run_id": "run_v1_single", "session_mode": "plan", "permission_profile": "read-only"},
+        )
         assert created["run"]["id"] == "run_v1_single"
         assert created["run"]["session_mode"] == "plan"
+        assert created["run"]["permission_profile"] == "read-only"
+        assert created["run"]["approval_mode"] == "never"
+        assert created["run"]["workspace_mode"] == "current"
+        assert created["run"]["sandbox_mode"] == "none"
         assert created["events_url"] == "/v1/runs/run_v1_single/events"
         _wait_for_status(base, "run_v1_single", "completed")
 
         run = _request(base, "GET", "/v1/runs/run_v1_single")["run"]
         assert run["workspace_id"] == ""
         assert run["session_mode"] == "plan"
+        assert run["permission_profile"] == "read-only"
+        assert run["approval_mode"] == "never"
         assert run["links"]["events"] == "/v1/runs/run_v1_single/events"
 
         events = _request(base, "GET", "/v1/runs/run_v1_single/events.jsonl")
         assert events["items"][0]["workspace_id"] == ""
+        assert events["items"][0]["data"]["permission_profile"] == "read-only"
         assert any(event["type"] == "run.completed" for event in events["items"])
 
         artifacts = _request(base, "GET", "/v1/runs/run_v1_single/artifacts")
@@ -169,6 +194,29 @@ def test_runtime_v1_single_workspace_errors_use_shared_shape(tmp_path) -> None:
         assert bad_workspace["error"]["code"] == "workspace_not_found"
         bad_mode = _request_error(base, "POST", "/v1/runs", {"task": "nope", "session_mode": "invalid"}, expected=400)
         assert bad_mode["error"]["code"] == "bad_request"
+        bad_permission = _request_error(base, "POST", "/v1/runs", {"task": "nope", "permission_profile": "missing"}, expected=400)
+        assert bad_permission["error"]["code"] == "permission_profile_error"
+        bad_empty_permission = _request_error(base, "POST", "/v1/runs", {"task": "nope", "permission_profile": ""}, expected=400)
+        assert bad_empty_permission["error"]["code"] == "permission_profile_error"
+        bad_named_permission = _request_error(
+            base,
+            "POST",
+            "/v1/runs",
+            {"task": "nope", "run_id": "run_retry_permission_profile", "permission_profile": "approval"},
+            expected=400,
+        )
+        assert bad_named_permission["error"]["code"] == "permission_profile_error"
+        retry = _request(base, "POST", "/v1/runs", {"task": "retry", "run_id": "run_retry_permission_profile"})
+        assert retry["run"]["id"] == "run_retry_permission_profile"
+        _wait_for_status(base, "run_retry_permission_profile", "completed")
+        bad_confusing_permission = _request_error(
+            base,
+            "POST",
+            "/v1/runs",
+            {"task": "nope", "permission_profile": "already exists"},
+            expected=400,
+        )
+        assert bad_confusing_permission["error"]["code"] == "permission_profile_error"
         bad_cancel_workspace = _request_error(base, "POST", "/v1/runs/missing/cancel?workspace_id=wrong", {}, expected=404)
         assert bad_cancel_workspace["error"]["code"] == "workspace_not_found"
         bad_approval_workspace = _request_error(

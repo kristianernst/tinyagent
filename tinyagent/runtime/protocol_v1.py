@@ -6,6 +6,7 @@ from typing import Any
 from uuid import uuid4
 
 from tinyagent import __version__
+from tinyagent.core.permission_profiles import PERMISSION_PROFILE_NAMES
 
 SCHEMA_VERSION = 1
 
@@ -16,6 +17,7 @@ V1_RUN_START_KEYS = frozenset(
         "run_id",
         "approval_mode",
         "approvals_reviewer",
+        "permission_profile",
         "session_mode",
         "profile",
         "conversation_id",
@@ -69,6 +71,7 @@ def run_object(summary: dict[str, Any], *, workspace_id: str | None = None) -> d
         "approval_mode": summary.get("approval_mode") or "",
         "session_mode": summary.get("session_mode") or "normal",
         "approvals_reviewer": summary.get("approvals_reviewer") or "",
+        "permission_profile": summary.get("permission_profile") or "",
         "sandbox_mode": summary.get("sandbox_mode") or "",
         "event_count": summary.get("event_count") or 0,
         "artifact_count": summary.get("artifact_count") or 0,
@@ -374,6 +377,7 @@ def _schemas() -> dict[str, Any]:
                         "approval_mode": {"type": "string"},
                         "session_mode": {"type": "string"},
                         "approvals_reviewer": {"type": "string"},
+                        "permission_profile": {"type": "string", "enum": list(PERMISSION_PROFILE_NAMES)},
                         "profile": {"type": "string"},
                         "conversation_id": {"type": "string"},
                         "turn_id": {"type": "string"},
@@ -400,6 +404,7 @@ def _schemas() -> dict[str, Any]:
                         "approval_mode": {"type": "string"},
                         "session_mode": {"type": "string"},
                         "approvals_reviewer": {"type": "string"},
+                        "permission_profile": {"type": "string", "enum": [*PERMISSION_PROFILE_NAMES, ""]},
                         "sandbox_mode": {"type": "string"},
                         "event_count": {"type": "integer"},
                         "artifact_count": {"type": "integer"},

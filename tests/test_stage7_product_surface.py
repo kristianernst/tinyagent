@@ -26,7 +26,7 @@ def test_local_run_backend_exposes_protocol_compatible_run_events_and_artifacts(
 
     backend: RunBackend = LocalRunBackend(_controller(tmp_path, [ModelResponse(content="backend done", finish_reason="stop")]))
 
-    handle = backend.start_run(RunRequest(task="backend task", run_id="run_backend"))
+    handle = backend.start_run(RunRequest(task="backend task", run_id="run_backend", permission_profile="read-only"))
     for _ in range(100):
         events = list(backend.events("run_backend"))
         if events and events[-1].type == "run.completed":
@@ -39,10 +39,19 @@ def test_local_run_backend_exposes_protocol_compatible_run_events_and_artifacts(
     assert isinstance(handle, BackendRunHandle)
     assert handle.run_id == "run_backend"
     assert run["run_id"] == "run_backend"
+    assert run["permission_profile"] == "read-only"
+    assert run["approval_mode"] == "never"
     assert run["links"]["events"] == "/v1/runs/run_backend/events"
     assert events[-1].type == "run.completed"
     assert any(isinstance(item, ArtifactInfo) and item.path == "final.md" and item.kind == "run_output" for item in artifacts)
     assert b"backend done" in backend.fetch_artifact("run_backend", "final.md")
+
+
+def test_run_request_preserves_profile_positional_slot() -> None:
+    request = RunRequest("task", None, None, None, None, None, None, None, None, "tiny-pi")
+
+    assert request.profile == "tiny-pi"
+    assert request.permission_profile is None
 
 
 def test_local_run_backend_keeps_shell_output_artifacts_private_by_default(tmp_path) -> None:
@@ -86,7 +95,7 @@ def test_http_run_backend_matches_local_protocol_for_events_and_artifacts(tmp_pa
     thread.start()
     try:
         backend = HTTPRunBackend(f"http://127.0.0.1:{server.server_port}")
-        handle = backend.start_run(RunRequest(task="backend task", run_id="run_http_backend"))
+        handle = backend.start_run(RunRequest(task="backend task", run_id="run_http_backend", permission_profile="read-only"))
         for _ in range(100):
             events = list(backend.events("run_http_backend"))
             if events and events[-1].type == "run.completed":
@@ -96,7 +105,10 @@ def test_http_run_backend_matches_local_protocol_for_events_and_artifacts(tmp_pa
         artifacts = backend.artifacts("run_http_backend")
 
         assert handle.events_url == "/v1/runs/run_http_backend/events"
-        assert backend.get_run("run_http_backend")["run_id"] == "run_http_backend"
+        run = backend.get_run("run_http_backend")
+        assert run["run_id"] == "run_http_backend"
+        assert run["permission_profile"] == "read-only"
+        assert run["approval_mode"] == "never"
         assert events[-1].type == "run.completed"
         assert any(item.path == "final.md" for item in artifacts)
         assert b"http backend done" in backend.fetch_artifact("run_http_backend", "final.md")
