@@ -888,6 +888,9 @@ class Kernel:
             self._record_blocked_tool_call(state, call, result)
             return
 
+        self._execute_allowed_tool_call(state, call, tool)
+
+    def _execute_allowed_tool_call(self, state: RunState, call: ToolCall, tool: Tool) -> None:
         tool_execution_id = f"tool-exec-{call.id}"
         self._record_mutation_event(state, "workspace.mutation.planned", call)
         self._record_mutation_event(state, "workspace.mutation.started", call)
