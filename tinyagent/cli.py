@@ -44,6 +44,7 @@ from tinyagent.evals.runner import (
     run_eval_suite,
 )
 from tinyagent.evals.variants import VariantSpec
+from tinyagent.extensions.workspace_snapshot import create_workspace_snapshot, restore_workspace_snapshot
 from tinyagent.runtime.conversation import ConversationStore
 from tinyagent.runtime.replay import replay_run
 from tinyagent.runtime.run_graph import fork_run
@@ -154,6 +155,19 @@ def build_parser() -> argparse.ArgumentParser:
     fork_parser.add_argument("run_path", type=Path, help="Run directory or events.jsonl path.")
     fork_parser.add_argument("--at", required=True, help="Event id or sequence to fork from.")
     fork_parser.add_argument("--output-dir", type=Path)
+
+    snapshot_parser = subparsers.add_parser("snapshot", help="Create or restore opt-in workspace snapshots.")
+    snapshot_subparsers = snapshot_parser.add_subparsers(dest="snapshot_command")
+    snapshot_create = snapshot_subparsers.add_parser("create", help="Create a workspace snapshot for explicit paths.")
+    snapshot_create.add_argument("paths", nargs="+")
+    snapshot_create.add_argument("--workspace", default=".")
+    snapshot_create.add_argument("--snapshot-root", type=Path)
+    snapshot_create.add_argument("--label", default="manual")
+    snapshot_create.add_argument("--json", action="store_true")
+    snapshot_restore = snapshot_subparsers.add_parser("restore", help="Restore a workspace snapshot manifest.")
+    snapshot_restore.add_argument("manifest", type=Path)
+    snapshot_restore.add_argument("--workspace", default=".")
+    snapshot_restore.add_argument("--json", action="store_true")
 
     serve_parser = subparsers.add_parser("serve", help="Serve live and recorded runs over HTTP.")
     serve_parser.add_argument("--workspace", help="Register an initial workspace before serving.")
@@ -441,6 +455,33 @@ def main(argv: list[str] | None = None) -> int:
             print(f"conversations error: {exc}")
             return 1
         parser.error("conversations requires a subcommand")
+
+    if args.command == "snapshot":
+        try:
+            if args.snapshot_command == "create":
+                workspace = Path(args.workspace).expanduser().resolve()
+                snapshot_root = args.snapshot_root or workspace / ".tinyagent" / "snapshots" / f"snapshot-{uuid4().hex[:12]}"
+                result = create_workspace_snapshot(workspace, snapshot_root, args.paths, label=args.label)
+                payload = result.to_json_dict()
+                if args.json:
+                    print(json.dumps(payload, sort_keys=True))
+                else:
+                    print(f"snapshot_manifest: {result.manifest_path}")
+                    print(f"paths: {len(result.paths)}")
+                return 0
+            if args.snapshot_command == "restore":
+                result = restore_workspace_snapshot(Path(args.workspace).expanduser().resolve(), args.manifest)
+                payload = result.to_json_dict()
+                if args.json:
+                    print(json.dumps(payload, sort_keys=True))
+                else:
+                    print(f"restored: {len(result.restored)}")
+                    print(f"deleted: {len(result.deleted)}")
+                return 0
+        except (OSError, ValueError, json.JSONDecodeError, TypeError) as exc:
+            print(f"snapshot error: {exc}")
+            return 1
+        parser.error("snapshot requires a subcommand")
 
     product_workspace_record = None
     try:

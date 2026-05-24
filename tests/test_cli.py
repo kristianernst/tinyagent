@@ -48,6 +48,25 @@ def test_tinyagent_serve_help_exits_successfully(capsys) -> None:
     assert "--stream" in captured.out
 
 
+def test_tinyagent_snapshot_create_and_restore(tmp_path, capsys) -> None:
+    (tmp_path / "note.txt").write_text("before\n")
+
+    create_code = main(["snapshot", "create", "--workspace", str(tmp_path), "--json", "note.txt", "created.txt"])
+    created = json.loads(capsys.readouterr().out)
+    (tmp_path / "note.txt").write_text("after\n")
+    (tmp_path / "created.txt").write_text("new\n")
+
+    restore_code = main(["snapshot", "restore", "--workspace", str(tmp_path), "--json", created["manifest_path"]])
+    restored = json.loads(capsys.readouterr().out)
+
+    assert create_code == 0
+    assert restore_code == 0
+    assert restored["restored"] == ["note.txt"]
+    assert restored["deleted"] == ["created.txt"]
+    assert (tmp_path / "note.txt").read_text() == "before\n"
+    assert not (tmp_path / "created.txt").exists()
+
+
 def test_tinyagent_serve_uses_runtime_server_options(tmp_path, capsys, monkeypatch) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("TINYAGENT_HOME", str(home))
