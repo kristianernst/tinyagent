@@ -48,6 +48,7 @@ class ProductRuntimeController:
         session_mode: SessionMode = "normal",
         approvals_reviewer: str = "user",
         sandbox_mode: SandboxModeInput = "none",
+        permission_profile: str | None = None,
         profile: str = "tiny-coder",
         profile_override: bool = False,
         todo_memory_enabled: bool = False,
@@ -64,6 +65,7 @@ class ProductRuntimeController:
         self.session_mode = session_mode
         self.approvals_reviewer = approvals_reviewer
         self.sandbox_mode = sandbox_mode
+        self.permission_profile = permission_profile
         self.profile = profile
         self.profile_override = profile_override
         self.todo_memory_enabled = todo_memory_enabled
@@ -122,6 +124,7 @@ class ProductRuntimeController:
                 session_mode=self.session_mode,
                 approvals_reviewer=self.approvals_reviewer,
                 sandbox_mode=self.sandbox_mode,
+                permission_profile=self.permission_profile,
                 profile=self.profile if self.profile_override else record.default_profile,
                 conversation_store=ConversationStore(workspace_root_path / "conversations"),
                 workspace_index_manager=WorkspaceIndexManager.for_workspace_id(
@@ -577,6 +580,7 @@ def create_product_runtime_server(
     session_mode: SessionMode = "normal",
     approvals_reviewer: str = "user",
     sandbox_mode: SandboxModeInput = "none",
+    permission_profile: str | None = None,
     profile: str = "tiny-coder",
     profile_override: bool = False,
     todo_memory_enabled: bool = False,
@@ -594,6 +598,7 @@ def create_product_runtime_server(
         session_mode=session_mode,
         approvals_reviewer=approvals_reviewer,
         sandbox_mode=sandbox_mode,
+        permission_profile=permission_profile,
         profile=profile,
         profile_override=profile_override or profile != "tiny-coder",
         todo_memory_enabled=todo_memory_enabled,

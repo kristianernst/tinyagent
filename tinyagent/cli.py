@@ -25,6 +25,7 @@ from tinyagent.core.ids import validate_run_id
 from tinyagent.core.kernel import Kernel
 from tinyagent.core.memory import MemoryStore
 from tinyagent.core.models import ProviderError
+from tinyagent.core.permission_profiles import PERMISSION_PROFILE_NAMES, permission_profile_for
 from tinyagent.core.policy import default_policy
 from tinyagent.core.profiles import profile_for
 from tinyagent.core.providers.factory import DEFAULT_PROVIDER_REGISTRY, ProviderSpec, provider_for
@@ -92,6 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--session-mode", choices=["normal", "plan"], default="normal")
     run_parser.add_argument("--approvals-reviewer", choices=["user", "auto_review"], default="user")
     run_parser.add_argument("--sandbox-mode", choices=["none", "container", "native"], default="none")
+    run_parser.add_argument("--permission-profile", choices=PERMISSION_PROFILE_NAMES)
     run_parser.add_argument("--profile", help="Profile to run, e.g. tiny-coder or tiny-pi.")
     run_parser.add_argument("--memory", action="store_true", help="Enable explicit file-backed memory context.")
     run_parser.add_argument("--reasoning-json", help="JSON object passed as the provider's top-level reasoning parameter.")
@@ -171,6 +173,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--session-mode", choices=["normal", "plan"], default="normal")
     serve_parser.add_argument("--approvals-reviewer", choices=["user", "auto_review"], default="user")
     serve_parser.add_argument("--sandbox-mode", choices=["none", "container", "native"], default="none")
+    serve_parser.add_argument("--permission-profile", choices=PERMISSION_PROFILE_NAMES)
     serve_parser.add_argument("--profile", default="tiny-coder", help="Default runtime profile.")
     serve_parser.add_argument("--memory", action="store_true", help="Enable explicit file-backed memory context.")
     serve_parser.add_argument("--print-json", action="store_true", help="Print machine-readable server metadata before serving.")
@@ -196,6 +199,7 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument("--session-mode", choices=["normal", "plan"], default="normal")
     eval_parser.add_argument("--approvals-reviewer", choices=["user", "auto_review"], default="user")
     eval_parser.add_argument("--sandbox-mode", choices=["none", "container", "native"], default="none")
+    eval_parser.add_argument("--permission-profile", choices=PERMISSION_PROFILE_NAMES)
     eval_parser.add_argument("--profile", default="tiny-coder", help="Profile to run, e.g. tiny-coder or tiny-pi.")
     eval_parser.add_argument("--memory", action="store_true", help="Enable explicit file-backed memory context.")
     eval_parser.add_argument(
@@ -485,22 +489,29 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as exc:
             print(f"run error: {exc}")
             return 1
+        workspace_mode, approval_mode, sandbox_mode, policy, permission_profile, enforce_policy_in_yolo, deny_yolo_approvals = _security_settings(
+            args,
+            argv,
+        )
         kernel = Kernel(
             model=model,
             profile=profile,
             tools=default_tools(),
-            policy=default_policy(),
+            policy=policy,
             resources=ResourceLoader(ResourceLoaderConfig(memory_enabled=args.memory)).load(
                 Path(args.workspace),
                 runtime_capabilities=profile.runtime_capabilities,
             ),
-            approval_handler=_approval_handler_for(args.approval_mode, args.approvals_reviewer, model),
+            approval_handler=_approval_handler_for(approval_mode, args.approvals_reviewer, model),
             stream=args.stream != "off",
             event_sink=_stream_sink(args.stream, debug_level, output_format=args.output_format),
-            workspace_mode=args.workspace_mode,
-            approval_mode=args.approval_mode,
+            workspace_mode=workspace_mode,
+            approval_mode=approval_mode,
             session_mode=args.session_mode,
-            sandbox_mode=args.sandbox_mode,
+            sandbox_mode=sandbox_mode,
+            permission_profile=permission_profile,
+            enforce_policy_in_yolo=enforce_policy_in_yolo,
+            deny_yolo_approvals=deny_yolo_approvals,
         )
         cancel_token = CancelToken()
         state: RunState | None = None
@@ -526,10 +537,10 @@ def main(argv: list[str] | None = None) -> int:
                     run_id=args.run_id,
                     output_dir=args.output_dir,
                     cancel_token=cancel_token,
-                    workspace_mode=args.workspace_mode,
-                    approval_mode=args.approval_mode,
+                    workspace_mode=workspace_mode,
+                    approval_mode=approval_mode,
                     session_mode=args.session_mode,
-                    sandbox_mode=args.sandbox_mode,
+                    sandbox_mode=sandbox_mode,
                 )
         except RunCancelled:
             print("run cancelled: sigint")
@@ -604,6 +615,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "serve":
         try:
             debug_level = _debug_level(args.debug)
+            workspace_mode, approval_mode, sandbox_mode, _policy, permission_profile, _enforce_policy_in_yolo, _deny_yolo_approvals = (
+                _security_settings(args, argv)
+            )
             server = create_product_runtime_server(
                 ProductHome.from_env(),
                 host=args.host,
@@ -613,11 +627,12 @@ def main(argv: list[str] | None = None) -> int:
                 reasoning=_parse_reasoning_json(args.reasoning_json),
                 stream=args.stream,
                 debug_level=debug_level,
-                workspace_mode=args.workspace_mode,
-                approval_mode=args.approval_mode,
+                workspace_mode=workspace_mode,
+                approval_mode=approval_mode,
                 session_mode=args.session_mode,
                 approvals_reviewer=args.approvals_reviewer,
-                sandbox_mode=args.sandbox_mode,
+                sandbox_mode=sandbox_mode,
+                permission_profile=permission_profile,
                 profile=args.profile,
                 profile_override=_has_cli_option(argv, "--profile"),
                 memory_enabled=args.memory,
@@ -664,6 +679,9 @@ def main(argv: list[str] | None = None) -> int:
                 except ValueError as exc:
                     print(f"eval error: {exc}")
                     return 1
+                workspace_mode, approval_mode, sandbox_mode, policy, permission_profile, enforce_policy_in_yolo, deny_yolo_approvals = (
+                    _security_settings(args, argv)
+                )
                 eval_run = run_eval_suite(
                     args.suite_path,
                     output_dir=output_dir,
@@ -675,7 +693,7 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                     profile=profile,
                     tools=default_tools(),
-                    policy=default_policy(),
+                    policy=policy,
                     resources=ResourceLoader(ResourceLoaderConfig(memory_enabled=args.memory)).load(
                         args.suite_path,
                         runtime_capabilities=profile.runtime_capabilities,
@@ -683,11 +701,14 @@ def main(argv: list[str] | None = None) -> int:
                     stream=args.stream != "off",
                     event_sink=_stream_sink(args.stream, debug_level),
                     cancel_token=cancel_token,
-                    workspace_mode=args.workspace_mode,
-                    approval_mode=args.approval_mode,
+                    workspace_mode=workspace_mode,
+                    approval_mode=approval_mode,
                     session_mode=args.session_mode,
                     approvals_reviewer=args.approvals_reviewer,
-                    sandbox_mode=args.sandbox_mode,
+                    sandbox_mode=sandbox_mode,
+                    permission_profile=permission_profile,
+                    enforce_policy_in_yolo=enforce_policy_in_yolo,
+                    deny_yolo_approvals=deny_yolo_approvals,
                 )
         except RunCancelled:
             print("eval cancelled: sigint")
@@ -1049,6 +1070,24 @@ def _main_eval_compare(argv: list[str]) -> int:
 def _default_eval_compare_output_dir(suite_path: Path) -> Path:
     default_dir = default_eval_output_dir(suite_path)
     return default_dir.with_name(f"{default_dir.name}-compare")
+
+
+def _security_settings(args: argparse.Namespace, argv: list[str]):
+    permission_profile = permission_profile_for(getattr(args, "permission_profile", None))
+    if permission_profile is None:
+        return args.workspace_mode, args.approval_mode, args.sandbox_mode, default_policy(), None, False, False
+    workspace_mode = args.workspace_mode if _has_cli_option(argv, "--workspace-mode") else permission_profile.workspace_mode
+    approval_mode = args.approval_mode if _has_cli_option(argv, "--approval-mode") else permission_profile.approval_mode
+    sandbox_mode = args.sandbox_mode if _has_cli_option(argv, "--sandbox-mode") else permission_profile.sandbox_mode
+    return (
+        workspace_mode,
+        approval_mode,
+        sandbox_mode,
+        permission_profile.policy(),
+        permission_profile.name,
+        permission_profile.enforce_policy_in_yolo,
+        permission_profile.deny_yolo_approvals,
+    )
 
 
 def _has_cli_option(argv: list[str], option: str) -> bool:

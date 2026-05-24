@@ -13,6 +13,7 @@ import pytest
 import tinyagent.cli as cli
 from tinyagent.cli import _sigint_cancel, main
 from tinyagent.core.run_control import CancelToken
+from tinyagent.core.state import RunState, ToolCall, Workspace
 
 
 @pytest.fixture(autouse=True)
@@ -76,6 +77,7 @@ def test_tinyagent_serve_uses_runtime_server_options(tmp_path, capsys, monkeypat
         session_mode,
         approvals_reviewer,
         sandbox_mode,
+        permission_profile,
         profile,
         profile_override,
         memory_enabled,
@@ -95,6 +97,7 @@ def test_tinyagent_serve_uses_runtime_server_options(tmp_path, capsys, monkeypat
                 session_mode,
                 approvals_reviewer,
                 sandbox_mode,
+                permission_profile,
                 profile,
                 profile_override,
                 memory_enabled,
@@ -152,6 +155,7 @@ def test_tinyagent_serve_uses_runtime_server_options(tmp_path, capsys, monkeypat
             "normal",
             "user",
             "none",
+            None,
             "tiny-pi",
             True,
             False,
@@ -869,6 +873,7 @@ def test_tinyagent_serve_uses_product_conversation_root(tmp_path, capsys, monkey
         session_mode,
         approvals_reviewer,
         sandbox_mode,
+        permission_profile,
         profile,
         profile_override,
         memory_enabled,
@@ -886,6 +891,7 @@ def test_tinyagent_serve_uses_product_conversation_root(tmp_path, capsys, monkey
                 session_mode,
                 approvals_reviewer,
                 sandbox_mode,
+                permission_profile,
                 profile,
                 profile_override,
                 memory_enabled,
@@ -915,6 +921,7 @@ def test_tinyagent_serve_uses_product_conversation_root(tmp_path, capsys, monkey
             "normal",
             "user",
             "none",
+            None,
             "tiny-coder",
             False,
             False,
@@ -991,6 +998,54 @@ def test_tinyagent_run_rejects_invalid_debug_level(tmp_path, capsys) -> None:
 
     assert exit_code == 2
     assert captured.out == "debug error: --debug must be non-negative.\n"
+
+
+def test_tinyagent_permission_profile_supplies_security_defaults() -> None:
+    args = cli.build_parser().parse_args(["run", "answer", "--permission-profile", "read-only"])
+
+    workspace_mode, approval_mode, sandbox_mode, policy, permission_profile, enforce_policy_in_yolo, deny_yolo_approvals = cli._security_settings(
+        args,
+        ["run", "answer", "--permission-profile", "read-only"],
+    )
+
+    assert workspace_mode == "current"
+    assert approval_mode == "never"
+    assert sandbox_mode == "none"
+    assert permission_profile == "read-only"
+    assert enforce_policy_in_yolo is True
+    assert deny_yolo_approvals is True
+    decision = policy.evaluate(
+        ToolCall(name="shell", args={"cmd": "printf nope > denied.txt"}),
+        RunState.create("x", Workspace(Path("."))),
+    )
+    assert decision.kind == "deny"
+
+
+def test_tinyagent_permission_profile_respects_explicit_mode_overrides() -> None:
+    argv = [
+        "run",
+        "answer",
+        "--permission-profile",
+        "read-only",
+        "--workspace-mode",
+        "worktree",
+        "--approval-mode",
+        "yolo",
+        "--sandbox-mode",
+        "native",
+    ]
+    args = cli.build_parser().parse_args(argv)
+
+    workspace_mode, approval_mode, sandbox_mode, _policy, permission_profile, enforce_policy_in_yolo, deny_yolo_approvals = (
+        cli._security_settings(args, argv)
+    )
+
+    assert workspace_mode == "worktree"
+    assert approval_mode == "yolo"
+    assert sandbox_mode == "native"
+    assert permission_profile == "read-only"
+    assert enforce_policy_in_yolo is True
+    assert deny_yolo_approvals is True
 
 
 def test_tinyagent_accepts_new_sandbox_mode_choices_and_reports_missing_backend(tmp_path, capsys, monkeypatch) -> None:

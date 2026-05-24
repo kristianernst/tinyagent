@@ -22,7 +22,7 @@ from tinyagent.core.ids import validate_run_id
 from tinyagent.core.index import WorkspaceIndexManager
 from tinyagent.core.kernel import Kernel
 from tinyagent.core.models import ProviderError
-from tinyagent.core.policy import default_policy
+from tinyagent.core.permission_profiles import permission_profile_for, policy_for_permission_profile
 from tinyagent.core.profiles import profile_for
 from tinyagent.core.providers.factory import ProviderSpec, provider_for
 from tinyagent.core.resources import ResourceLoader, ResourceLoaderConfig
@@ -112,6 +112,7 @@ class RuntimeConfig:
     session_mode: SessionMode = "normal"
     approvals_reviewer: str = "user"
     sandbox_mode: SandboxModeInput = "none"
+    permission_profile: str | None = None
     profile: str = "tiny-coder"
     conversation_store: ConversationStore | None = None
     workspace_index_manager: WorkspaceIndexManager | None = None
@@ -472,12 +473,13 @@ class RunController:
             if self.config.todo_memory_enabled:
                 extensions.append(TodoMemoryExtension())
             resolved_profile = profile_for(profile or self.config.profile)
+            permission_profile = permission_profile_for(self.config.permission_profile)
             model = self.config.provider_factory(task)
             kernel = Kernel(
                 model=model,
                 profile=resolved_profile,
                 tools=default_tools(),
-                policy=default_policy(),
+                policy=policy_for_permission_profile(self.config.permission_profile),
                 approval_handler=self._approval_handler_for(model, resolved_approvals_reviewer),
                 event_sink=TeeEventSink(
                     self.bus,
@@ -488,6 +490,9 @@ class RunController:
                 approval_mode=resolved_approval_mode,  # type: ignore[arg-type]
                 session_mode=resolved_session_mode,  # type: ignore[arg-type]
                 sandbox_mode=self.config.sandbox_mode,
+                permission_profile=permission_profile.name if permission_profile else None,
+                enforce_policy_in_yolo=permission_profile.enforce_policy_in_yolo if permission_profile else False,
+                deny_yolo_approvals=permission_profile.deny_yolo_approvals if permission_profile else False,
                 workspace_index_manager=self.config.workspace_index_manager,
                 extensions=extensions,
                 resources=ResourceLoader(ResourceLoaderConfig(memory_enabled=self.config.memory_enabled)).load(
@@ -633,6 +638,7 @@ class RunController:
             else self.config.workspace / default_eval_output_dir(suite)
         )
         resolved_profile = profile_for(profile or self.config.profile)
+        permission_profile = permission_profile_for(self.config.permission_profile)
         resolved_approval_mode = validate_approval_mode(approval_mode, self.config.approval_mode)
         resolved_session_mode = validate_session_mode(session_mode, self.config.session_mode)
         resolved_reviewer = approvals_reviewer or self.config.approvals_reviewer
@@ -642,13 +648,16 @@ class RunController:
             model_factory=self.config.provider_factory,
             profile=resolved_profile,
             tools=default_tools(),
-            policy=default_policy(),
+            policy=policy_for_permission_profile(self.config.permission_profile),
             stream=False,
             workspace_mode=self.config.workspace_mode,
             approval_mode=resolved_approval_mode,  # type: ignore[arg-type]
             session_mode=resolved_session_mode,  # type: ignore[arg-type]
             approvals_reviewer=resolved_reviewer,
             sandbox_mode=self.config.sandbox_mode,
+            permission_profile=permission_profile.name if permission_profile else None,
+            enforce_policy_in_yolo=permission_profile.enforce_policy_in_yolo if permission_profile else False,
+            deny_yolo_approvals=permission_profile.deny_yolo_approvals if permission_profile else False,
             resources=ResourceLoader(ResourceLoaderConfig(memory_enabled=self.config.memory_enabled)).load(
                 self.config.workspace,
                 runtime_capabilities=resolved_profile.runtime_capabilities,
@@ -1384,6 +1393,7 @@ def create_runtime_server(
     session_mode: SessionMode = "normal",
     approvals_reviewer: str = "user",
     sandbox_mode: SandboxModeInput = "none",
+    permission_profile: str | None = None,
     conversation_root: Path | None = None,
     mcp_clients: Mapping[str, McpClient] | None = None,
     profile: str = "tiny-coder",
@@ -1409,6 +1419,7 @@ def create_runtime_server(
             session_mode=session_mode,
             approvals_reviewer=approvals_reviewer,
             sandbox_mode=sandbox_mode,
+            permission_profile=permission_profile,
             profile=profile,
             conversation_store=ConversationStore(resolved_conversation_root),
             mcp_clients=mcp_clients,
