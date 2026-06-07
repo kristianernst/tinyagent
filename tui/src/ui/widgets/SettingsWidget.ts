@@ -3,10 +3,10 @@ import { dirname } from "node:path";
 import type { SettingsState } from "../../state/reducer";
 import type { Theme } from "../theme";
 import { keymapPath } from "../keymapLoader";
-import { makeBox, makeText } from "../layout";
-import { themeNames } from "../theme";
+import { selectableThemeNames } from "../theme";
+import { InfoPanelWidget, type InfoPanelContent } from "./InfoPanelWidget";
 
-const SPINNERS = ["ascii", "dots", "braille", "scanline", "minimal"];
+const SPINNERS = ["braille"];
 const TOGGLES = ["off", "on"] as const;
 
 type Row = {
@@ -16,84 +16,39 @@ type Row = {
 };
 
 const ROWS: Row[] = [
-  { key: "theme", label: "Theme", options: [...themeNames] },
+  { key: "theme", label: "Theme", options: [...selectableThemeNames] },
   { key: "spinner", label: "Spinner", options: SPINNERS },
-  { key: "showReasoning", label: "Show reasoning", options: [...TOGGLES] },
+  { key: "showReasoning", label: "Reasoning", options: [...TOGGLES] },
   { key: "diffView", label: "Diff view", options: ["unified", "split"] },
-  { key: "mouseCapture", label: "Mouse capture", options: [...TOGGLES] },
-  { key: "rightRail", label: "Right rail", options: [...TOGGLES] },
+  { key: "mouseCapture", label: "Mouse", options: [...TOGGLES] },
 ];
 
 export type SettingsApply = (next: SettingsState) => void;
 
 export class SettingsWidget {
   readonly node: any;
-  private rows = new Map<keyof SettingsState, { node: any; label: any; value: any }>();
-  private status: any;
-  private hint: any;
+  private panel: InfoPanelWidget;
   private current: SettingsState;
   private applyHandler: SettingsApply | null = null;
 
   constructor(private opentui: any, private ctx: any, private theme: Theme) {
-    this.node = makeBox(opentui, ctx, {
-      flexDirection: "column",
-      flexGrow: 1,
-      paddingY: 0,
-    });
-    const header = makeText(opentui, ctx, {
-      content: "Settings",
-      fg: theme.accent,
-    });
-    this.node.add?.(header);
+    this.panel = new InfoPanelWidget(opentui, ctx, theme);
+    this.node = this.panel.node;
     this.current = {
-      theme: "tiny-dark",
-      spinner: "ascii",
+      theme: "paper-dark",
+      spinner: "braille",
       showReasoning: false,
       diffView: "unified",
       mouseCapture: true,
-      rightRail: true,
+      rightRail: false,
       dirty: false,
     };
-    for (const row of ROWS) {
-      const wrap = makeBox(opentui, ctx, {
-        flexDirection: "row",
-        marginTop: 1,
-        paddingX: 1,
-        borderStyle: "single",
-        border: ["bottom"],
-        borderColor: theme.border,
-      });
-      const label = makeText(opentui, ctx, { content: row.label, fg: theme.textMuted, width: 20 });
-      const value = makeText(opentui, ctx, { content: this.valueFor(row.key, this.current), fg: theme.text });
-      wrap.add?.(label);
-      wrap.add?.(value);
-      this.rows.set(row.key, { node: wrap, label, value });
-      this.node.add?.(wrap);
-    }
-    this.status = makeText(opentui, ctx, {
-      content: "/settings set <key> <value> · /settings save · /settings reset",
-      fg: theme.textSubtle,
-      marginTop: 1,
-    });
-    this.hint = makeText(opentui, ctx, {
-      content: "",
-      fg: theme.warning,
-      marginTop: 1,
-    });
-    this.node.add?.(this.status);
-    this.node.add?.(this.hint);
+    this.panel.update(settingsContent(this.current));
   }
 
   update(settings: SettingsState): void {
     this.current = settings;
-    for (const [key, refs] of this.rows) {
-      if (refs.value && refs.value.content !== undefined) {
-        refs.value.content = this.valueFor(key, settings);
-      }
-    }
-    if (this.hint && this.hint.content !== undefined) {
-      this.hint.content = settings.dirty ? "Unsaved changes — run /settings save to persist." : "";
-    }
+    this.panel.update(settingsContent(settings));
   }
 
   bindApply(handler: SettingsApply): void {
@@ -102,24 +57,57 @@ export class SettingsWidget {
 
   setValue(key: keyof SettingsState, value: string): SettingsState {
     const next = { ...this.current, dirty: true };
-    if (key === "showReasoning" || key === "mouseCapture" || key === "rightRail") {
+    if (key === "showReasoning" || key === "mouseCapture") {
       next[key] = value === "on" || value === "true" || value === "1";
+    } else if (key === "rightRail") {
+      next.rightRail = false;
     } else if (key === "diffView") {
       next.diffView = value === "split" ? "split" : "unified";
     } else if (key === "theme" || key === "spinner") {
-      next[key] = value;
+      next[key] = key === "spinner" ? normalizeSpinner(value) : value;
     } else {
       return this.current;
     }
     this.applyHandler?.(next);
     return next;
   }
+}
 
-  private valueFor(key: keyof SettingsState, settings: SettingsState): string {
-    const value = settings[key];
-    if (typeof value === "boolean") return value ? "on" : "off";
-    return String(value);
+function settingsContent(settings: SettingsState): InfoPanelContent {
+  const rows = ROWS.map((row) => ({
+    label: row.label,
+    value: valueFor(row.key, settings),
+    detail: detailFor(row, settings),
+    tone: row.key === "theme" ? ("accent" as const) : undefined,
+  }));
+  if (settings.dirty) {
+    rows.push({
+      label: "save",
+      value: "pending",
+      detail: "changes not written to disk",
+      tone: "warning" as const,
+    });
   }
+  return {
+    eyebrow: "settings",
+    rows,
+  };
+}
+
+function detailFor(row: Row, settings: SettingsState): string {
+  if (row.key === "theme") return "semantic layer only · widgets unchanged";
+  if (row.key === "spinner") return "frame-based motion";
+  if (row.key === "showReasoning") return settings.showReasoning ? "reasoning visible" : "reasoning folded";
+  if (row.key === "diffView") return settings.diffView === "split" ? "split patch view" : "single patch view";
+  if (row.key === "mouseCapture") return settings.mouseCapture ? "mouse and keyboard aligned" : "keyboard only";
+  return row.options.join(" · ");
+}
+
+function valueFor(key: keyof SettingsState, settings: SettingsState): string {
+  if (key === "showReasoning") return settings.showReasoning ? "visible" : "folded";
+  const value = settings[key];
+  if (typeof value === "boolean") return value ? "on" : "off";
+  return String(value);
 }
 
 /**
@@ -139,7 +127,7 @@ export function saveSettings(settings: SettingsState): boolean {
     }
     raw.settings = {
       theme: settings.theme,
-      spinner: settings.spinner,
+      spinner: normalizeSpinner(settings.spinner),
       showReasoning: settings.showReasoning,
       diffView: settings.diffView,
       mouseCapture: settings.mouseCapture,
@@ -158,8 +146,13 @@ export function loadSettings(): Partial<SettingsState> {
   if (!existsSync(path)) return {};
   try {
     const raw = JSON.parse(readFileSync(path, "utf8")) as Record<string, any>;
-    return (raw.settings ?? {}) as Partial<SettingsState>;
+    const settings = (raw.settings ?? {}) as Partial<SettingsState>;
+    return settings.spinner === undefined ? settings : { ...settings, spinner: normalizeSpinner(settings.spinner) };
   } catch {
     return {};
   }
+}
+
+export function normalizeSpinner(value: unknown): string {
+  return SPINNERS.includes(String(value)) ? String(value) : "braille";
 }

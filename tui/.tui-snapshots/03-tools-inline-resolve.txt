@@ -1,0 +1,38 @@
+ ◆ tinyagent  │  ws : tinyagent  │  model : gpt-5  │  ⎇ ta-review-gated-learning                          ⠙  ⦗ streaming ⦘ ⦗ approve queued ⦘  │  ctx ▰▱▱▱▱ 24% 
+  › fix the streaming jitter in Transcript so phase changes don't reflow the whole pane                                                   20:48 · just now      
+                                                                                                                                                                
+  ◆ thought for 4s  ⌜r⌟ collapse                                                                                                                                
+    The reflow happens because we replace assistant.content on every chunk, which re-mounts the markdown node. The renderer should mutate                       
+    the existing node's content prop instead — markdown.ts already supports in-place updates via the streaming flag.                                            
+                                                                                                                                                                
+    ✓ read     src/ui/widgets/Transcript.ts · 250 lines                                                                                               0.4s      
+    ✓ search   "card.lastAssistant" in src/ · 3 hits                                                                                                  0.2s      
+               └ Transcript.ts:160 — card.assistant.content = next;                                                                                             
+               └ markdown.ts:42 — streaming: turn.phase === "streaming"                                                                                         
+    ⠙ edit     src/ui/widgets/Transcript.ts                                                                                                       running…      
+                                                                                                                                                                
+  We can keep the existing transcript card and mutate the assistant node in place. Here is the patch:                                                           
+                                                                                                                                                                
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮  
+  │ PATCH  src/ui/widgets/Transcript.ts                                                                                      +3  −1  ⌜⏎⌟ apply  ⌜d⌟ diff     │  
+  │  158    function applyChunk(card, next) {                                                                                                                │  
+  │  159 +    if (next !== card.lastAssistant) {                                                                                                             │  
+  │  160 +      card.assistant.content = next;                                                                                                               │  
+  │  161 +      card.lastAssistant = next;                                                                                                                   │  
+  │  159 -      card.assistant = rebuild(next);                                                                                                              │  
+  │  162      }                                                                                                                                              │  
+  │  163    }                                                                                                                                                │  
+  ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯  
+                                                                                                                                                                
+  Once that lands the per-chunk reflow disappears and the spinner can co-exist with the caret. We should also coalesce bursty chunks at                         
+  motion.stream.gate so we never queue redundant paints.                                                                                                        
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮  
+  │ implement the new design tokens                                                                                                                          │  
+  ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯  
+  ⌜enter⌟ send  ⌜⇧enter⌟ newline   ⌜/⌟ commands   ⌜@⌟ files   ⌜$⌟ skills                                                                     ⌜esc⌟ cancel turn  
+                                                                                                                                                                

@@ -24,7 +24,22 @@ test("/settings set rejects unknown keys", () => {
 test("/settings reset clears to defaults but stays dirty until save", () => {
   const store = new Store({ ...emptyState(), settings: { ...emptyState().settings, theme: "dracula" } });
   runSettingsCommand(store, ["reset"]);
-  expect(store.get().settings.theme).toBe("tiny-dark");
+  expect(store.get().settings.theme).toBe("paper-dark");
+  expect(store.get().settings.rightRail).toBe(false);
+  expect(store.get().settings.dirty).toBe(true);
+});
+
+test("/settings rail stays disabled for the Paper shell", () => {
+  const store = new Store(emptyState());
+  runSettingsCommand(store, ["set", "rail", "on"]);
+  expect(store.get().settings.rightRail).toBe(false);
+  expect(store.get().settings.dirty).toBe(true);
+});
+
+test("/settings spinner accepts only the Paper braille primitive", () => {
+  const store = new Store(emptyState());
+  runSettingsCommand(store, ["set", "spinner", "dots"]);
+  expect(store.get().settings.spinner).toBe("braille");
   expect(store.get().settings.dirty).toBe(true);
 });
 
@@ -39,6 +54,21 @@ test("saveSettings writes JSON and loadSettings reads it back", () => {
     expect(raw.settings.theme).toBe("gruvbox");
     expect(loadSettings().theme).toBe("gruvbox");
     expect(loadSettings().mouseCapture).toBe(false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    if (previous === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previous;
+  }
+});
+
+test("loadSettings normalizes removed spinner names", () => {
+  const dir = mkdtempSync(join(tmpdir(), "tinyagent-set-spinner-"));
+  const previous = process.env.XDG_CONFIG_HOME;
+  process.env.XDG_CONFIG_HOME = dir;
+  try {
+    mkdirSync(join(dir, "tinyagent"), { recursive: true });
+    writeFileSync(join(dir, "tinyagent", "tui.json"), JSON.stringify({ settings: { spinner: "scanline" } }));
+    expect(loadSettings().spinner).toBe("braille");
   } finally {
     rmSync(dir, { recursive: true, force: true });
     if (previous === undefined) delete process.env.XDG_CONFIG_HOME;

@@ -1,41 +1,74 @@
 import type { UsageStats } from "../../state/reducer";
 import type { Theme } from "../theme";
-import { makeBox, makeText } from "../layout";
+import { InfoPanelWidget } from "./InfoPanelWidget";
 
 export class UsageWidget {
   readonly node: any;
-  private summary: any;
-  private bars: any;
+  private panel: InfoPanelWidget;
 
   constructor(private opentui: any, private ctx: any, private theme: Theme) {
-    this.node = makeBox(opentui, ctx, { flexDirection: "column", flexGrow: 1 });
-    this.summary = makeText(opentui, ctx, { content: "", fg: theme.accent });
-    this.bars = makeText(opentui, ctx, { content: "", fg: theme.text, marginTop: 1 });
-    this.node.add?.(this.summary);
-    this.node.add?.(this.bars);
+    this.panel = new InfoPanelWidget(opentui, ctx, theme);
+    this.node = this.panel.node;
   }
 
   update(usage: UsageStats): void {
-    if (this.summary && this.summary.content !== undefined) {
-      this.summary.content = [
-        `Model calls: ${usage.modelCalls}`,
-        `Latency: ${usage.latencyMs} ms`,
-        `Total tokens: ${usage.totalTokens}`,
-      ].join("  ·  ");
-    }
     const denom = Math.max(1, usage.inputTokens + usage.outputTokens);
-    const inputBar = bar(usage.inputTokens, denom, 30);
-    const outputBar = bar(usage.outputTokens, denom, 30);
-    if (this.bars && this.bars.content !== undefined) {
-      this.bars.content = [
-        `Input  ${String(usage.inputTokens).padStart(6)}  ${inputBar}`,
-        `Output ${String(usage.outputTokens).padStart(6)}  ${outputBar}`,
-      ].join("\n");
-    }
+    this.panel.update({
+      eyebrow: "usage",
+      rows: [
+        {
+          label: "total tokens",
+          value: formatNumber(usage.totalTokens),
+          detail: `${formatNumber(usage.inputTokens)} in · ${formatNumber(usage.outputTokens)} out`,
+          tone: "accent",
+        },
+        {
+          label: "model calls",
+          value: formatNumber(usage.modelCalls),
+          detail: averageTokens(usage),
+        },
+        {
+          label: "latency",
+          value: formatLatencyValue(usage.latencyMs),
+          detail: formatLatencyDetail(usage.latencyMs),
+        },
+        {
+          label: "input",
+          value: formatNumber(usage.inputTokens),
+          detail: bar(usage.inputTokens, denom, 30),
+          tone: "success",
+        },
+        {
+          label: "output",
+          value: formatNumber(usage.outputTokens),
+          detail: bar(usage.outputTokens, denom, 30),
+          tone: "warning",
+        },
+      ],
+    });
   }
 }
 
 function bar(value: number, total: number, width: number): string {
   const filled = Math.max(0, Math.min(width, Math.round((value / total) * width)));
-  return `${"█".repeat(filled)}${"░".repeat(width - filled)}`;
+  return `${"▰".repeat(filled)}${"▱".repeat(width - filled)}`;
+}
+
+function formatNumber(value: number): string {
+  return new Intl.NumberFormat("en-US").format(value);
+}
+
+function formatLatencyValue(ms: number): string {
+  if (!ms) return "no sample";
+  if (ms < 1000) return `${formatNumber(ms)}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+function formatLatencyDetail(ms: number): string {
+  return ms ? "end to end" : "waiting for model call";
+}
+
+function averageTokens(usage: UsageStats): string {
+  if (!usage.modelCalls) return "no calls yet";
+  return `${formatNumber(Math.round(usage.totalTokens / usage.modelCalls))} tok/call avg`;
 }

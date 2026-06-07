@@ -1,0 +1,38 @@
+ ◆ tinyagent  │  ws : tinyagent  │  model : gpt-5  │  ⎇ ta-revi…arning                      ⦗ idle ⦘   │  ctx ▱▱▱▱▱  0% 
+  › copy the last answer                                                                                     20:48      
+                                                                                                                        
+                                                                                                                        
+  The context menu should feel like the same compact Paper popover as the rest of the shell.                            
+    ╭──────────────────────────────────────────────────╮                                                                
+    │  ⦗ menu ⦘ actions                             3  │                                                                
+    │ ▍ Copy last reply               assistant text   │                                                                
+    │   Copy conversation                  all turns   │                                                                
+    │   Stop run                          cancel run   │                                                                
+    │──────────────────────────────────────────────────│                                                                
+    │ ⌜↑↓⌟ move   ⌜⏎⌟ choose   ⌜esc⌟ cancel            │                                                                
+    ╰──────────────────────────────────────────────────╯                                                                
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮  
+  │ ask, plan, or /command                                                                                           │  
+  ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯  
+  ⌜enter⌟ send  ⌜⇧enter⌟ newline   ⌜/⌟ commands   ⌜@⌟ files   ⌜$⌟ skills                             ⌜esc⌟ cancel turn  
+                                                                                                                        

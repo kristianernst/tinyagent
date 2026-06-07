@@ -1,0 +1,38 @@
+ ◆ tinyagent  │  ws : tinyagent  │  model : gpt-5  │  ⎇ ta-revi…arning                      ⦗ idle ⦘   │  ctx ▰▱▱▱▱ 25% 
+  › bring the panel surface in line with the Paper TUI refer│  failure review                              ⌜esc⌟ close  
+                                                            │                                                           
+  ◆ thought  ⌜r⌟ expand                                     │───────────────────────────────────────────────────────────
+                                                            │                                                           
+    ✓ read     Paper overlay reference                      │  failure review                                           
+    ✓ edit     panel widgets                                │                                                           
+                                                            │   ▏ source         model                                  
+  The main shell stays one column. Panels slide over the tra│     stopped turn                                          
+  terminal rhythm.                                          │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ last ok        step 14                                
+                                                            │     tool completed · safe checkpoint                      
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ failed         step 15                                
+                                                            │     model failed · replay target                          
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │                                                           
+                                                            │  recovery actions                                         
+                                                            │                                                           
+                                                            │   ▍ inspect failure                            /replay    
+                                                            │     open replay                                           
+                                                            │     rewind before failure                   /rewind 14    
+                                                            │     step 14                                               
+                                                            │     retry compact prompt                         retry    
+                                                            │     smaller bundle                                        
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │───────────────────────────────────────────────────────────
+                                                            │  ⌜esc⌟ close                                              

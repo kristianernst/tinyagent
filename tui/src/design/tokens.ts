@@ -1,30 +1,35 @@
+// Legacy re-export. The token system now lives in primitives.ts + semantic.ts
+// + themes/*. New code should import from those files; this stub exists only
+// so any straggler `import { color, semantic } from "@/design/tokens"` keeps
+// working. Delete when no callers remain.
+
+import { chroma, neutralDark } from "./primitives";
+
 export const color = {
-  bg: "#0b0f14",
-  surface: "#11161c",
-  surface2: "#161c23",
-  border: "#22303a",
-  borderFocus: "#58a6ff",
-  text: "#e6edf3",
-  muted: "#8b949e",
-  subtle: "#6e7681",
-  blue: "#58a6ff",
-  cyan: "#56d6a4",
-  green: "#2ea043",
-  yellow: "#e3b341",
-  orange: "#f0883e",
-  red: "#f85149",
-  pink: "#ff6b9a",
-  purple: "#a371f7",
+  bg: neutralDark[900],
+  surface: neutralDark[850],
+  surface2: neutralDark[800],
+  border: neutralDark[700],
+  borderFocus: chroma.brand,
+  text: "#e8eef5",
+  muted: "#9aa4b1",
+  subtle: "#6a7480",
+  blue: chroma.brand,
+  cyan: chroma.info,
+  green: chroma.success,
+  yellow: chroma.warning,
+  red: chroma.danger,
+  purple: chroma.reason,
 } as const;
 
 export const semantic = {
-  thinking: color.yellow,
-  planning: color.purple,
-  reading: color.blue,
-  searching: color.cyan,
-  editing: color.orange,
-  success: color.green,
-  danger: color.red,
-  approval: color.orange,
+  thinking: chroma.reason,
+  planning: chroma.warning,
+  reading: chroma.brand,
+  searching: chroma.info,
+  editing: chroma.brand,
+  success: chroma.success,
+  danger: chroma.danger,
+  approval: chroma.warning,
   muted: color.muted,
 } as const;

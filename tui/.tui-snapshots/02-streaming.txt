@@ -1,0 +1,38 @@
+ ◆ tinyagent  │  ws : tinyagent  │  model : gpt-5  │  ⎇ ta-revi…arning              ⠙  ⦗ streaming ⦘   │  ctx ▱▱▱▱▱  1% 
+  › fix the streaming jitter in Transcript so phase changes don't reflow the whole pane           20:48 · just now      
+                                                                                                                        
+  ◆ thought  ⌜r⌟ collapse                                                                                               
+    The reflow happens because we replace assistant.content on every chunk.                                             
+                                                                                                                        
+                                                                                                                        
+  We can keep the existing transcript card and mutate the assistant node's content in place. The markdown               
+  renderer already supports in-place updates via the streaming flag, so we never re-mount when phase doesn't            
+  change.                                                                                                               
+                                                                                                                        
+  Once that lands the per-chunk reflow disappears and the spinner can co-exist with the caret.                          
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮  
+  │ ask, plan, or /command                                                                                           │  
+  ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯  
+  ⌜enter⌟ send  ⌜⇧enter⌟ newline   ⌜/⌟ commands   ⌜@⌟ files   ⌜$⌟ skills                             ⌜esc⌟ cancel turn  
+                                                                                                                        

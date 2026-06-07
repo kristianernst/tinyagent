@@ -10,6 +10,36 @@ uv run ruff check .
 uv run scripts/size_report.py --export /tmp/tinyagent-code-export.md
 ```
 
+## Install Locally
+
+From this checkout:
+
+```bash
+uv tool install --force --editable .
+```
+
+After that, `tinyagent` is callable from any terminal. Running it with no
+subcommand opens the TUI with the workspace set to the current directory:
+
+```bash
+cd /path/to/project
+tinyagent
+```
+
+Product state lives in `~/.tinyagent`. Edit `~/.tinyagent/config.toml` to set
+provider defaults:
+
+```toml
+[model]
+provider = "openai-compatible"
+name = "local-model"
+base_url = "http://127.0.0.1:11434/v1"
+api_key = "local"
+
+[model.reasoning]
+effort = "medium"
+```
+
 ## Examples
 
 See `examples/README.md` for runnable harness examples, including the web-searcher stress test.
@@ -18,6 +48,7 @@ See `examples/README.md` for runnable harness examples, including the web-search
 
 ```bash
 tinyagent run "read hello.txt and answer" --provider fake --workspace .
+tinyagent
 tinyagent replay .tinyagent/runs/<run_id>
 tinyagent inspect .tinyagent/runs/<run_id>
 tinyagent eval evals/tiny --provider fake
@@ -44,7 +75,7 @@ It accepts `TINYAGENT_CODEX_BEARER_TOKEN`, `TINYAGENT_CODEX_AUTH_COMMAND`, or an
 unexpired Codex CLI `auth.json` token:
 
 ```bash
-export TINYAGENT_MODEL_NAME=gpt-5.5-codex
+export TINYAGENT_MODEL_NAME=gpt-5.5
 tinyagent run "inspect this repo" --provider openai-codex --workspace .
 ```
 

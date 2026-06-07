@@ -1,6 +1,8 @@
 // Lightweight animations layer. Falls back to no-op when @opentui/core's
 // animation engine is unavailable (e.g. headless tests).
 
+import { motionMs } from "../design/primitives";
+
 type Easing = "linear" | "inOutSine" | "outBack" | "outQuad" | "outBounce" | "outExpo";
 
 export type AnimationHandle = {
@@ -33,7 +35,7 @@ export function createAnimator(opentui: any | null): Animator {
         const tl = opentui.createTimeline({ autoplay: false });
         tl.add(node, {
           opacity: opts.to ?? 1,
-          duration: opts.duration ?? 220,
+          duration: opts.duration ?? motionMs.slow,
           ease: opts.ease ?? "outQuad",
         });
         return register(tl);
@@ -48,7 +50,7 @@ export function createAnimator(opentui: any | null): Animator {
         const tl = opentui.createTimeline({ autoplay: false });
         tl.add(node, {
           opacity: opts.to ?? 0,
-          duration: opts.duration ?? 180,
+          duration: opts.duration ?? motionMs.slow,
           ease: opts.ease ?? "outQuad",
         });
         return register(tl);
@@ -66,7 +68,7 @@ export function createAnimator(opentui: any | null): Animator {
         const tl = opentui.createTimeline({ autoplay: false });
         tl.add(node, {
           [prop]: opts.to,
-          duration: opts.duration ?? 200,
+          duration: opts.duration ?? motionMs.slow,
           ease: opts.ease ?? "outBack",
         });
         return register(tl);
@@ -80,7 +82,7 @@ export function createAnimator(opentui: any | null): Animator {
         const tl = opentui.createTimeline({ autoplay: false });
         tl.add(node, {
           opacity: 0.55,
-          duration: opts.duration ?? 600,
+          duration: opts.duration ?? motionMs.dwell,
           ease: opts.ease ?? "inOutSine",
           alternate: true,
           loop: true,

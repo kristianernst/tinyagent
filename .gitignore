@@ -7,3 +7,4 @@ __pycache__/
 
 .tinyagent/
 docs/tinyagent-code-export.md
+.conductor

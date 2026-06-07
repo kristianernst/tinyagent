@@ -1,0 +1,38 @@
+ ◆ tinyagent  │  ws : tinyagent  │  model : gpt-5  │  ⎇ ta-revi…arning                      ⦗ idle ⦘   │  ctx ▱▱▱▱▱  0% 
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+  ╭──────────────────────────────────────────────────────────────────────╮                                              
+  │  ⦗ / ⦘   commands                                            1 / 19  │                                              
+  │ › /new            start new session                                ↵ │                                              
+  │   /context        show context                                       │                                              
+  │   /diff           show git diff                                      │                                              
+  │   /diff-stat      show diff summary                                  │                                              
+  │   /replay         replay current run                                 │                                              
+  │   /sessions       list sessions                                      │                                              
+  │   /skills         open skill forge                                   │                                              
+  │   /model          show model state                                   │                                              
+  │   /resume         resume session                                     │                                              
+  │  · 10 more · type to filter                                          │                                              
+  │──────────────────────────────────────────────────────────────────────│                                              
+  │ ⌜↑↓⌟ move   ⌜⏎⌟ run   ⌜esc⌟ cancel                                   │                                              
+  ╰──────────────────────────────────────────────────────────────────────╯                                              
+                                                                                                                        
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮  
+  │ ask, plan, or /command                                                                                           │  
+  ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯  
+  ⌜enter⌟ send  ⌜⇧enter⌟ newline   ⌜/⌟ commands   ⌜@⌟ files   ⌜$⌟ skills                             ⌜esc⌟ cancel turn  
+                                                                                                                        

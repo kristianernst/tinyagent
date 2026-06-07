@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { motionMs } from "../src/design/primitives";
 import { createAnimator } from "../src/ui/animations";
 
 test("createAnimator returns a noop animator when @opentui/core is absent", () => {
@@ -8,14 +9,23 @@ test("createAnimator returns a noop animator when @opentui/core is absent", () =
   a.cancelAll();
 });
 
-test("animator uses opentui.createTimeline when present", () => {
+test("animator uses Paper motion tokens when present", () => {
   const calls: string[] = [];
-  const fakeTl = { add: () => fakeTl, play: () => calls.push("play"), pause: () => calls.push("pause") };
+  const durations: number[] = [];
+  const fakeTl = {
+    add: (_node: any, props: any) => {
+      durations.push(props.duration);
+      return fakeTl;
+    },
+    play: () => calls.push("play"),
+    pause: () => calls.push("pause"),
+  };
   const fakeOpentui = { createTimeline: () => fakeTl };
   const a = createAnimator(fakeOpentui as any);
   const node = { opacity: 0 };
-  const handle = a.fadeIn(node, { duration: 100 });
+  const handle = a.fadeIn(node);
   expect(calls).toContain("play");
+  expect(durations).toEqual([motionMs.slow]);
   handle.cancel();
   expect(calls).toContain("pause");
 });

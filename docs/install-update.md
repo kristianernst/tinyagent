@@ -35,6 +35,41 @@ standalone        use tinyagent update apply
 
 `tinyagent update apply` refuses to mutate package-managed installs unless the install has a managed `install.json` receipt.
 
+## Local Editable Install
+
+During alpha development, install the checkout as a global tool:
+
+```sh
+uv tool install --force --editable .
+```
+
+Then `tinyagent` is available from any terminal. With no subcommand it launches
+the TUI for the current directory:
+
+```sh
+cd /path/to/workspace
+tinyagent
+```
+
+The product home is created at `~/.tinyagent`. Provider defaults live in
+`~/.tinyagent/config.toml`:
+
+```toml
+version = 1
+
+[model]
+provider = "openai-compatible"
+name = "local-model"
+base_url = "http://127.0.0.1:11434/v1"
+api_key = "local"
+
+[model.reasoning]
+effort = "medium"
+```
+
+Environment variables and explicit CLI flags still override model settings for
+one-off runs.
+
 ## Commands
 
 ```sh

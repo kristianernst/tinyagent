@@ -12,8 +12,9 @@ import pytest
 
 import tinyagent.cli as cli
 from tinyagent.cli import _sigint_cancel, main
+from tinyagent.core.models import FakeModelProvider
 from tinyagent.core.run_control import CancelToken
-from tinyagent.core.state import RunState, ToolCall, Workspace
+from tinyagent.core.state import ModelResponse, RunState, ToolCall, Workspace
 
 
 @pytest.fixture(autouse=True)
@@ -21,12 +22,47 @@ def isolated_tinyagent_home(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("TINYAGENT_HOME", str(tmp_path / "home"))
 
 
-def test_tinyagent_help_exits_successfully(capsys) -> None:
-    exit_code = main([])
+def test_tinyagent_without_subcommand_launches_tui_for_current_workspace(tmp_path, monkeypatch, capsys) -> None:
+    calls = []
+    real_run = subprocess.run
 
+    class Result:
+        returncode = 0
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd and cmd[0] == "git":
+            return real_run(cmd, *args, **kwargs)
+        cwd = kwargs["cwd"]
+        check = kwargs["check"]
+        calls.append((cmd, cwd, check))
+        return Result()
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/bin/bun" if name == "bun" else None)
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    exit_code = main([])
     captured = capsys.readouterr()
 
     assert exit_code == 0
+    assert captured.out == ""
+    assert (tmp_path / "home" / "config.toml").exists()
+    cmd, cwd, check = calls[0]
+    assert cwd.name == "tui"
+    assert check is False
+    assert cmd[0] == "/usr/local/bin/bun"
+    workspace_index = cmd.index("--workspace") + 1
+    assert cmd[workspace_index] == str(tmp_path.resolve())
+
+
+def test_tinyagent_help_exits_successfully(capsys) -> None:
+    try:
+        main(["--help"])
+    except SystemExit as exc:
+        assert exc.code == 0
+
+    captured = capsys.readouterr()
+
     assert "Control the tinyagent product." in captured.out
     assert "run" in captured.out
     assert "replay" in captured.out
@@ -89,6 +125,7 @@ def test_tinyagent_serve_uses_runtime_server_options(tmp_path, capsys, monkeypat
         provider,
         model_name,
         reasoning,
+        model_env,
         stream,
         debug_level,
         workspace_mode,
@@ -721,6 +758,113 @@ def test_tinyagent_run_uses_registered_default_provider_without_overwriting(tmp_
     assert updated["default_provider"] == "openai-compatible"
 
 
+def test_tinyagent_run_uses_product_config_model_defaults(tmp_path, capsys, monkeypatch) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home.mkdir()
+    (home / "config.toml").write_text(
+        "\n".join(
+            [
+                "version = 1",
+                "",
+                "[model]",
+                'provider = "openai-compatible"',
+                'name = "cfg-model"',
+                'base_url = "http://127.0.0.1:9999/v1"',
+                'api_key = "cfg-key"',
+                "",
+                "[model.reasoning]",
+                'effort = "medium"',
+                "",
+            ]
+        )
+    )
+    monkeypatch.setenv("TINYAGENT_HOME", str(home))
+    monkeypatch.delenv("TINYAGENT_MODEL_API_KEY", raising=False)
+    monkeypatch.delenv("TINYAGENT_MODEL_BASE_URL", raising=False)
+    monkeypatch.delenv("TINYAGENT_MODEL_NAME", raising=False)
+    calls = []
+
+    def fake_provider_for(spec, task, env=None):
+        calls.append((spec, task, env))
+        return FakeModelProvider([ModelResponse(content=f"Fake run finished: {task}", finish_reason="stop")])
+
+    monkeypatch.setattr(cli, "provider_for", fake_provider_for)
+
+    exit_code = cli.main(["run", "answer", "--workspace", str(workspace), "--run-id", "run_config_defaults"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "Fake run finished: answer" in captured.out
+    spec, task, env = calls[0]
+    assert spec.kind == "openai-compatible"
+    assert spec.model is None
+    assert spec.reasoning == {"effort": "medium"}
+    assert task == "answer"
+    assert env["TINYAGENT_MODEL_NAME"] == "cfg-model"
+    assert env["TINYAGENT_MODEL_BASE_URL"] == "http://127.0.0.1:9999/v1"
+    assert env["TINYAGENT_MODEL_API_KEY"] == "cfg-key"
+
+
+def test_tinyagent_serve_uses_product_config_model_defaults(tmp_path, capsys, monkeypatch) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home.mkdir()
+    (home / "config.toml").write_text(
+        "\n".join(
+            [
+                "version = 1",
+                "",
+                "[model]",
+                'provider = "openai-compatible"',
+                'name = "cfg-model"',
+                'base_url = "http://127.0.0.1:9999/v1"',
+                'api_key = "cfg-key"',
+                "",
+                "[model.reasoning]",
+                'effort = "medium"',
+                "",
+            ]
+        )
+    )
+    monkeypatch.setenv("TINYAGENT_HOME", str(home))
+    monkeypatch.delenv("TINYAGENT_MODEL_API_KEY", raising=False)
+    monkeypatch.delenv("TINYAGENT_MODEL_BASE_URL", raising=False)
+    monkeypatch.delenv("TINYAGENT_MODEL_NAME", raising=False)
+    calls = []
+
+    class FakeServer:
+        server_port = 8765
+
+        def serve_forever(self):
+            raise KeyboardInterrupt
+
+        def server_close(self):
+            calls.append(("closed",))
+
+    def fake_create_product_runtime_server(home_arg, **kwargs):
+        calls.append((home_arg, kwargs))
+        return FakeServer()
+
+    monkeypatch.setattr(cli, "create_product_runtime_server", fake_create_product_runtime_server)
+
+    exit_code = cli.main(["serve", "--workspace", str(workspace)])
+    capsys.readouterr()
+
+    assert exit_code == 130
+    home_arg, kwargs = calls[0]
+    assert home_arg.root == home
+    assert kwargs["provider"] == "openai-compatible"
+    assert kwargs["reasoning"] == {"effort": "medium"}
+    assert kwargs["model_env"]["TINYAGENT_MODEL_NAME"] == "cfg-model"
+    assert kwargs["model_env"]["TINYAGENT_MODEL_BASE_URL"] == "http://127.0.0.1:9999/v1"
+    assert kwargs["model_env"]["TINYAGENT_MODEL_API_KEY"] == "cfg-key"
+    assert kwargs["model_env"]["TINYAGENT_MODEL_REASONING_JSON"] == '{"effort": "medium"}'
+    assert calls[-1] == ("closed",)
+
+
 def test_tinyagent_run_uses_registered_default_profile_when_profile_omitted(tmp_path, capsys, monkeypatch) -> None:
     home = tmp_path / "home"
     workspace = tmp_path / "workspace"
@@ -885,6 +1029,7 @@ def test_tinyagent_serve_uses_product_conversation_root(tmp_path, capsys, monkey
         provider,
         model_name,
         reasoning,
+        model_env,
         stream,
         debug_level,
         workspace_mode,
@@ -1022,10 +1167,15 @@ def test_tinyagent_run_rejects_invalid_debug_level(tmp_path, capsys) -> None:
 def test_tinyagent_permission_profile_supplies_security_defaults() -> None:
     args = cli.build_parser().parse_args(["run", "answer", "--permission-profile", "read-only"])
 
-    workspace_mode, approval_mode, sandbox_mode, policy, permission_profile, enforce_policy_in_yolo, deny_yolo_approvals = cli._security_settings(
-        args,
-        ["run", "answer", "--permission-profile", "read-only"],
-    )
+    (
+        workspace_mode,
+        approval_mode,
+        sandbox_mode,
+        policy,
+        permission_profile,
+        enforce_policy_in_yolo,
+        deny_yolo_approvals,
+    ) = cli._security_settings(args, ["run", "answer", "--permission-profile", "read-only"])
 
     assert workspace_mode == "current"
     assert approval_mode == "never"

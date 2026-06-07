@@ -22,6 +22,8 @@ export type ReasoningBlock = {
   id: string;
   text: string;
   completed: boolean;
+  startedAt?: string;
+  completedAt?: string;
 };
 
 export type ToolCallView = {
@@ -100,6 +102,14 @@ export type SkillEntry = {
   description?: string;
 };
 
+export type WorkspaceFileMetadata = Record<
+  string,
+  {
+    bytes?: number;
+    mtimeMs?: number;
+  }
+>;
+
 export type ExtensionEntry = {
   name: string;
   kind: "mcp" | "lsp" | "feature" | "other";
@@ -176,6 +186,7 @@ export type AppState = {
   workspaces: Workspace[];
   activeWorkspaceId: string | null;
   workspaceFiles: string[];
+  workspaceFileMetadata: WorkspaceFileMetadata;
   sessions: Conversation[];
   activeSession: SessionState | null;
   provider: string;
@@ -201,6 +212,7 @@ export function emptyState(): AppState {
     workspaces: [],
     activeWorkspaceId: null,
     workspaceFiles: [],
+    workspaceFileMetadata: {},
     sessions: [],
     activeSession: null,
     provider: "tinyagent",
@@ -236,22 +248,22 @@ export function emptyState(): AppState {
     skills: [],
     extensions: [],
     settings: {
-      theme: "tiny-dark",
-      spinner: "ascii",
+      theme: "paper-dark",
+      spinner: "braille",
       showReasoning: false,
       diffView: "unified",
       mouseCapture: true,
-      rightRail: true,
+      rightRail: false,
       dirty: false,
     },
     mention: { trigger: null, query: "", index: 0 },
     ui: {
-      rightRail: true,
+      rightRail: false,
       commandPalette: false,
       debugOverlay: false,
       mode: "footer",
-      theme: "tiny-dark",
-      spinner: "ascii",
+      theme: "paper-dark",
+      spinner: "braille",
       activePanel: "transcript",
       showReasoning: false,
       paletteOpen: false,
@@ -340,7 +352,7 @@ export function reduceEvent(state: AppState, event: RunEvent): AppState {
       const blockId = reasoningId(event);
       return updateActiveTurn(next, event, (turn) => ({
         ...turn,
-        reasoning: appendReasoningDelta(turn.reasoning, blockId, delta),
+        reasoning: appendReasoningDelta(turn.reasoning, blockId, delta, event.time),
         phase: "thinking",
       }), "thinking");
     }
@@ -351,7 +363,7 @@ export function reduceEvent(state: AppState, event: RunEvent): AppState {
       const blockId = reasoningId(event);
       return updateActiveTurn(next, event, (turn) => ({
         ...turn,
-        reasoning: completeReasoning(turn.reasoning, blockId, text),
+        reasoning: completeReasoning(turn.reasoning, blockId, text, event.time),
       }));
     }
     case "model.text.delta": {
@@ -549,19 +561,19 @@ function turnPhaseFromStatus(status: string): TurnPhase {
   return "done";
 }
 
-function appendReasoningDelta(blocks: ReasoningBlock[], id: string, delta: string): ReasoningBlock[] {
+function appendReasoningDelta(blocks: ReasoningBlock[], id: string, delta: string, time?: string): ReasoningBlock[] {
   const index = blocks.findIndex((block) => block.id === id);
-  if (index === -1) return [...blocks, { id, text: delta, completed: false }];
+  if (index === -1) return [...blocks, { id, text: delta, completed: false, startedAt: time }];
   const next = blocks.slice();
   next[index] = { ...next[index], text: next[index].text + delta };
   return next;
 }
 
-function completeReasoning(blocks: ReasoningBlock[], id: string, text: string): ReasoningBlock[] {
+function completeReasoning(blocks: ReasoningBlock[], id: string, text: string, time?: string): ReasoningBlock[] {
   const index = blocks.findIndex((block) => block.id === id);
-  if (index === -1) return [...blocks, { id, text, completed: true }];
+  if (index === -1) return [...blocks, { id, text, completed: true, startedAt: time, completedAt: time }];
   const next = blocks.slice();
-  next[index] = { ...next[index], text: next[index].text || text, completed: true };
+  next[index] = { ...next[index], text: next[index].text || text, completed: true, completedAt: time };
   return next;
 }
 

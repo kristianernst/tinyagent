@@ -1,0 +1,38 @@
+ ◆ tinyagent  │  ws : tinyagent  │  model : gpt-5  │  ⎇ ta-revi…arning                      ⦗ idle ⦘   │  ctx ▰▰▱▱▱ 45% 
+  › bring the panel surface in line with the Paper TUI refer│  usage  ⦗ 11 ⦘                               ⌜esc⌟ close  
+                                                            │                                                           
+  ◆ thought  ⌜r⌟ expand                                     │───────────────────────────────────────────────────────────
+                                                            │                                                           
+    ✓ read     Paper overlay reference                      │  usage                                                    
+    ✓ edit     panel widgets                                │                                                           
+                                                            │   ▏ total tokens   57,620                                 
+  The main shell stays one column. Panels slide over the tra│     48,212 in · 9,408 out                                 
+  terminal rhythm.                                          │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ model calls    11                                     
+                                                            │     5,238 tok/call avg                                    
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ latency        18.7s                                  
+                                                            │     end to end                                            
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ input          48,212                                 
+                                                            │     ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱                        
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ output         9,408                                  
+                                                            │     ▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱                        
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │───────────────────────────────────────────────────────────
+                                                            │  ⌜esc⌟ close                                              

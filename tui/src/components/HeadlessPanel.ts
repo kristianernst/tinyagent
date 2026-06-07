@@ -1,28 +1,26 @@
 import type { AppState } from "../state/reducer";
 
 export function renderHeadlessPanel(state: AppState): string {
-  const runId = state.activeSession?.runId ?? "<run-id>";
-  const runPath = state.activeSession?.runPath || "<run_path>";
   const seq = state.replay?.cursorSeq || state.activeSession?.lastSeq || 1;
-  const task = state.activeSession?.turns.at(-1)?.user || "<task>";
   const usage = state.activeSession?.usage;
+  const run = `tinyagent run "<prompt>"`;
   return [
-    "Headless equivalents",
+    "headless",
     "",
-    `Run JSON: tinyagent run ${quote(task)} --output-format json`,
-    `Stream JSONL: tinyagent run ${quote(task)} --stream jsonl --debug 1`,
-    `Replay: tinyagent replay ${runId}`,
-    `Fork: tinyagent fork ${runPath} --at ${seq}`,
-    "Eval: tinyagent eval <suite-path>",
-    `Draft skill: tinyagent skills draft-from-run ${runPath}`,
-    `Usage JSON: tinyagent run ${quote(task)} --output-format json | jq .usage`,
-    usage ? `Current usage: ${usage.totalTokens} tokens across ${usage.modelCalls} call${usage.modelCalls === 1 ? "" : "s"}` : "",
-    "Stdio: tinyagent agent stdio --protocol tinyagent",
+    row("run", "start task", run),
+    row("stream", "watch progress", `tinyagent run "<prompt>" --stream text`),
+    row("replay", "review run", "tinyagent replay <run-id>"),
+    row("fork", `from step ${seq}`, `tinyagent fork <run-path> --at ${seq}`),
+    row("eval", "run suite", "tinyagent eval <suite-path>"),
+    row("draft skill", "capture pattern", "tinyagent skills draft-from-run <run-path>"),
+    row("usage", usage ? `${usage.totalTokens} tok · ${usage.modelCalls} ${usage.modelCalls === 1 ? "call" : "calls"}` : "after first run", "saved with run summary"),
+    row("bridge", "connect clients", "tinyagent agent stdio --protocol tinyagent"),
+    "same trace · cli parity",
   ]
     .filter(Boolean)
     .join("\n");
 }
 
-function quote(value: string): string {
-  return JSON.stringify(value);
+function row(label: string, value: string, detail: string): string {
+  return [`  ▏ ${label.padEnd(14)}${value}`, `    ${detail}`].join("\n");
 }

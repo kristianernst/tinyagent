@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -573,6 +573,7 @@ def create_product_runtime_server(
     provider: str = "fake",
     model_name: str | None = None,
     reasoning: dict[str, Any] | None = None,
+    model_env: Mapping[str, str] | None = None,
     stream: bool = True,
     debug_level: int = 0,
     workspace_mode: WorkspaceMode = "current",
@@ -587,10 +588,10 @@ def create_product_runtime_server(
     memory_enabled: bool = False,
 ) -> ProductRuntimeHTTPServer:
     spec = ProviderSpec(kind=provider, model=model_name, reasoning=reasoning)  # type: ignore[arg-type]
-    provider_for(spec, "provider validation")
+    provider_for(spec, "provider validation", env=model_env)
     product = ProductRuntimeController(
         home=home,
-        provider_factory=lambda task: provider_for(spec, task),
+        provider_factory=lambda task: provider_for(spec, task, env=model_env),
         stream=stream,
         debug_level=debug_level,
         workspace_mode=workspace_mode,

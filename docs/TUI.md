@@ -8,6 +8,13 @@ multi-month plan that produced it.
 ## Run
 
 ```bash
+uv tool install --force --editable .
+tinyagent
+```
+
+For source-level TUI development:
+
+```bash
 cd tui
 bun install
 bun src/main.ts --provider fake --workspace ../
@@ -23,27 +30,24 @@ Common flags:
 - `--approval-mode never | on-request | yolo`
 - `--server http://127.0.0.1:8080` — connect to an existing
   `tinyagent serve` backend instead of spawning one
-- `--task "echo hi"` — run a single task headless and exit
+- `tinyagent tui "echo hi"` — run a single task headless and exit from the
+  Python launcher
+- `--task "echo hi"` — direct `bun src/main.ts` equivalent
 
 ## Layout
 
 ```
-┌──────────────────────────────────────────────────┬────────────────────┐
-│  transcript (streaming markdown turns)           │  rail              │
-│                                                  │  /context /diff    │
-│                                                  │  /usage  /sessions │
-│                                                  │  /replay …         │
-├──────────────────────────────────────────────────┴────────────────────┤
-│  errors (only when non-empty)                                         │
-├───────────────────────────────────────────────────────────────────────┤
-│  approval modal (only when pending)                                   │
-├───────────────────────────────────────────────────────────────────────┤
-│  command palette (Ctrl+K)                                             │
-├───────────────────────────────────────────────────────────────────────┤
-│  composer  (multiline, history, mouse cursor)                         │
-├───────────────────────────────────────────────────────────────────────┤
-│  status bar  ⟳  thinking · workspace · mode · run · tokens · model    │
-└───────────────────────────────────────────────────────────────────────┘
+╭─ ◆ tinyagent │ ws:... │ model:... │ ⎇ branch   ⠋ ⦗phase⦘ │ ctx ▰▱ 24% ╮
+│                                                                            │
+│  transcript (streaming turns, inline tools, no per-turn cards)             │
+│                                                                            │
+│  overlays (picker, approval, history, context menu) cover the transcript   │
+│                                                                            │
+│  ╭─ ask, plan, or /command ─────────────────────────────────────────────╮  │
+│  │ composer  (multiline, history, mouse cursor)                         │  │
+│  ╰──────────────────────────────────────────────────────────────────────╯  │
+│    ⌜enter⌟ send  ⌜⇧enter⌟ newline  ⌜/⌟ commands  ⌜@⌟ files  ⌜$⌟ skills    │
+╰────────────────────────────────────────────────────────────────────────────╯
 ```
 
 ## Keybindings
@@ -55,7 +59,7 @@ Common flags:
 | `Up` / `Down`          | history nav (in composer)             |
 | `Ctrl+R`               | reverse history search                |
 | `Ctrl+K` / `Ctrl+P`    | command palette                       |
-| `Ctrl+B` / `Ctrl+R`    | toggle rail                           |
+| `Ctrl+B`               | open the sessions overlay             |
 | `Ctrl+D`               | open `/diff`                          |
 | `Ctrl+U`               | open `/usage`                         |
 | `Ctrl+L`               | clear (visual)                        |
@@ -64,8 +68,8 @@ Common flags:
 | `Alt+t`                | cycle theme                           |
 | `Alt+r`                | toggle reasoning visibility           |
 | `Alt+d`                | toggle debug overlay                  |
-| `Tab` / `Shift+Tab`    | cycle focus across composer/transcript/rail |
-| `Escape`               | close overlay (palette / approval)    |
+| `Tab` / `Shift+Tab`    | cycle focus across composer/transcript |
+| `Escape`               | close overlay; deny/dismiss approval  |
 | `A` / `D` (in modal)   | approve / deny the pending tool       |
 
 Bindings live in `tui/src/ui/keymap.ts`. A `~/.config/tinyagent/tui.json`
@@ -75,7 +79,7 @@ override is honored on next startup (M1 default; full editor lands in M3).
 
 - Click any panel to focus it.
 - Click in the composer to position the cursor.
-- Scroll wheel in the transcript or rail to scroll.
+- Scroll wheel in the transcript to scroll.
 - Drag in the transcript to select text; Ctrl+C copies the selection.
 
 To disable mouse capture (useful with iTerm2's select-on-click), set
@@ -95,10 +99,12 @@ capture on.
   `/update [check|apply|rollback]` — extension surfaces.
 - `/extensions` — MCP / LSP / feature toggles from the backend.
 - `/settings [set <key> <value> | save | reset]` — adjust theme,
-  spinner, reasoning visibility, diff view, mouse capture, and rail
-  visibility; persist to `tui.json`.
+  reasoning visibility, diff view, and mouse capture; persist to
+  `tui.json`.
 - `/headless`, `/acp` — show headless / ACP equivalents.
-- `/theme`, `/reason`, `/rail`, `/palette`, `/debug` — UI toggles.
+- `/theme`, `/reason`, `/palette`, `/debug` — UI toggles.
+- `/rail` remains accepted for compatibility and opens the `/sessions`
+  right-side overlay; the persistent split rail is disabled in the Paper shell.
 - `/stop`, `/quit`.
 
 ## Inline mentions
@@ -117,14 +123,14 @@ Arrow keys navigate the list, Enter inserts the selection, Esc dismisses.
 
 ## Animations
 
-Overlay open/close (palette, approval modal, history search, rail
-toggle) fade in/out via OpenTUI's `Timeline`. The splash logo pulses
-gently on the empty-transcript state. All animations degrade to no-ops
-in headless mode and when the runtime can't construct a timeline.
+Overlay open/close (picker, approval modal, history search, context menu)
+fade in/out via OpenTUI's `Timeline`. All animations degrade to no-ops in
+headless mode and when the runtime can't construct a timeline.
 
 ## Themes
 
-Built-in: `tiny-dark` (default), `tiny-light`, `dracula`, `gruvbox`.
+Built-in cycle: `paper-dark` (default), `paper-light`, `mono`.
+Community themes such as `dracula` and `gruvbox` remain available by name.
 Cycle with `Alt+t` or `/theme`. Custom themes load on startup from
 `$XDG_CONFIG_HOME/tinyagent/themes/<name>.json` (defaults to
 `~/.config/tinyagent/themes/`). Each theme file is a JSON object with
@@ -148,7 +154,7 @@ accepted (merged in order):
 ```
 
 Valid contexts are `global`, `composer`, `transcript`, `palette`,
-`modal`, `rail`. Valid actions live in `tui/src/ui/keymap.ts`.
+`modal`, `rail` (legacy alias). Valid actions live in `tui/src/ui/keymap.ts`.
 
 ## Persistent history
 
@@ -160,9 +166,9 @@ this history.
 
 ## Right-click menu
 
-Right-click the transcript, rail, or composer to open a context menu
-with "Copy last reply", "Copy conversation", and panel-specific actions
-("Copy diff", "Stop run"). Selections are written to the system
+Right-click the transcript or composer to open a context menu with "Copy last
+reply", "Copy conversation", and panel-specific actions ("Stop run").
+Selections are written to the system
 clipboard via `pbcopy` (macOS), `xclip` (Linux), or `clip` (Windows).
 
 ## Test surface

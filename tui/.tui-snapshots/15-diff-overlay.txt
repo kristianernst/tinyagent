@@ -1,0 +1,38 @@
+ ◆ tinyagent  │  ws : tinyagent  │  model : gpt-5  │  ⎇ ta-revi…arning                      ⦗ idle ⦘   │  ctx ▰▱▱▱▱ 25% 
+  › bring the panel surface in line with the Paper TUI refer│  diff  ⦗ 2 ⦘                                 ⌜esc⌟ close  
+                                                            │                                                           
+  ◆ thought  ⌜r⌟ expand                                     │───────────────────────────────────────────────────────────
+                                                            │                                                           
+    ✓ read     Paper overlay reference                      │  diff summary                                             
+    ✓ edit     panel widgets                                │                                                           
+                                                            │   ▏ files          2 changed files                        
+  The main shell stays one column. Panels slide over the tra│     Rail.ts · panelStyle.ts                               
+  terminal rhythm.                                          │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ changes        +4 −1                                  
+                                                            │     unified · full patch                                  
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │                                                           
+                                                            │                                                           
+                                                            │   83 -       backgroundColor: theme.surface,              
+                                                            │   83 +       backgroundColor: theme.surfaceOverlay,       
+                                                            │   84         border: ["left"],                            
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │───────────────────────────────────────────────────────────
+                                                            │  ⌜esc⌟ close                                              

@@ -49,7 +49,7 @@ export const defaultKeymap: KeyBinding[] = [
   { context: "global", combo: "Ctrl+K", action: "open-palette" },
   { context: "global", combo: "Ctrl+P", action: "open-palette" },
   { context: "global", combo: "?", action: "open-help" },
-  { context: "global", combo: "Ctrl+R", action: "toggle-rail" },
+  { context: "global", combo: "Ctrl+R", action: "history-search" },
   { context: "global", combo: "Ctrl+B", action: "toggle-rail" },
   { context: "global", combo: "Ctrl+D", action: "toggle-diff" },
   { context: "global", combo: "Ctrl+U", action: "toggle-usage" },

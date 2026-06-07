@@ -1,0 +1,38 @@
+ ◆ tinyagent  │  ws : tinyagent  │  model : gpt-5  │  ⎇ ta-revi…arning                      ⦗ idle ⦘   │  ctx ▰▱▱▱▱ 25% 
+  › bring the panel surface in line with the Paper TUI refer│  settings                                    ⌜esc⌟ close  
+                                                            │                                                           
+  ◆ thought  ⌜r⌟ expand                                     │───────────────────────────────────────────────────────────
+                                                            │                                                           
+    ✓ read     Paper overlay reference                      │  settings                                                 
+    ✓ edit     panel widgets                                │                                                           
+                                                            │   ▏ theme          paper-dark                             
+  The main shell stays one column. Panels slide over the tra│     semantic layer only · widgets unchanged               
+  terminal rhythm.                                          │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ spinner        braille                                
+                                                            │     frame-based motion                                    
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ reasoning      folded                                 
+                                                            │     reasoning folded                                      
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ diff view      split                                  
+                                                            │     split patch view                                      
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ mouse          on                                     
+                                                            │     mouse and keyboard aligned                            
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ save           pending                                
+                                                            │     changes not written to disk                           
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │───────────────────────────────────────────────────────────
+                                                            │  ⌜esc⌟ close                                              

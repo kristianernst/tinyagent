@@ -1,7 +1,11 @@
 import type { AppState } from "../state/reducer";
 
 export function renderPlanBoard(state: AppState): string {
-  return state.sessionMode === "plan"
-    ? "Plan mode active. Write tools are blocked by backend policy."
-    : "Plan mode inactive.";
+  return ["session mode", state.sessionMode === "plan" ? row("mode", "plan", "write tools locked") : row("mode", "build", "write tools available")].join(
+    "\n",
+  );
+}
+
+function row(label: string, value: string, detail: string): string {
+  return [`  ▏ ${label.padEnd(14)}${value}`, `    ${detail}`].join("\n");
 }
