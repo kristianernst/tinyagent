@@ -12,6 +12,7 @@ import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from tinyagent import __version__
@@ -25,6 +26,7 @@ from tinyagent.core.ids import validate_run_id
 from tinyagent.core.kernel import Kernel
 from tinyagent.core.memory import MemoryStore
 from tinyagent.core.models import ProviderError
+from tinyagent.core.permission_profiles import PERMISSION_PROFILE_NAMES, permission_profile_for
 from tinyagent.core.policy import default_policy
 from tinyagent.core.profiles import profile_for
 from tinyagent.core.providers.factory import DEFAULT_PROVIDER_REGISTRY, ProviderSpec, provider_for
@@ -43,6 +45,7 @@ from tinyagent.evals.runner import (
     run_eval_suite,
 )
 from tinyagent.evals.variants import VariantSpec
+from tinyagent.extensions.workspace_snapshot import create_workspace_snapshot, restore_workspace_snapshot
 from tinyagent.runtime.conversation import ConversationStore
 from tinyagent.runtime.replay import replay_run
 from tinyagent.runtime.run_graph import fork_run
@@ -92,6 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--session-mode", choices=["normal", "plan"], default="normal")
     run_parser.add_argument("--approvals-reviewer", choices=["user", "auto_review"], default="user")
     run_parser.add_argument("--sandbox-mode", choices=["none", "container", "native"], default="none")
+    run_parser.add_argument("--permission-profile", choices=PERMISSION_PROFILE_NAMES)
     run_parser.add_argument("--profile", help="Profile to run, e.g. tiny-coder or tiny-pi.")
     run_parser.add_argument("--memory", action="store_true", help="Enable explicit file-backed memory context.")
     run_parser.add_argument("--reasoning-json", help="JSON object passed as the provider's top-level reasoning parameter.")
@@ -153,6 +157,19 @@ def build_parser() -> argparse.ArgumentParser:
     fork_parser.add_argument("--at", required=True, help="Event id or sequence to fork from.")
     fork_parser.add_argument("--output-dir", type=Path)
 
+    snapshot_parser = subparsers.add_parser("snapshot", help="Create or restore opt-in workspace snapshots.")
+    snapshot_subparsers = snapshot_parser.add_subparsers(dest="snapshot_command")
+    snapshot_create = snapshot_subparsers.add_parser("create", help="Create a workspace snapshot for explicit paths.")
+    snapshot_create.add_argument("paths", nargs="+")
+    snapshot_create.add_argument("--workspace", default=".")
+    snapshot_create.add_argument("--snapshot-root", type=Path)
+    snapshot_create.add_argument("--label", default="manual")
+    snapshot_create.add_argument("--json", action="store_true")
+    snapshot_restore = snapshot_subparsers.add_parser("restore", help="Restore a workspace snapshot manifest.")
+    snapshot_restore.add_argument("manifest", type=Path)
+    snapshot_restore.add_argument("--workspace", default=".")
+    snapshot_restore.add_argument("--json", action="store_true")
+
     serve_parser = subparsers.add_parser("serve", help="Serve live and recorded runs over HTTP.")
     serve_parser.add_argument("--workspace", help="Register an initial workspace before serving.")
     serve_parser.add_argument("--host", default="127.0.0.1")
@@ -171,6 +188,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--session-mode", choices=["normal", "plan"], default="normal")
     serve_parser.add_argument("--approvals-reviewer", choices=["user", "auto_review"], default="user")
     serve_parser.add_argument("--sandbox-mode", choices=["none", "container", "native"], default="none")
+    serve_parser.add_argument("--permission-profile", choices=PERMISSION_PROFILE_NAMES)
     serve_parser.add_argument("--profile", default="tiny-coder", help="Default runtime profile.")
     serve_parser.add_argument("--memory", action="store_true", help="Enable explicit file-backed memory context.")
     serve_parser.add_argument("--print-json", action="store_true", help="Print machine-readable server metadata before serving.")
@@ -196,6 +214,7 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument("--session-mode", choices=["normal", "plan"], default="normal")
     eval_parser.add_argument("--approvals-reviewer", choices=["user", "auto_review"], default="user")
     eval_parser.add_argument("--sandbox-mode", choices=["none", "container", "native"], default="none")
+    eval_parser.add_argument("--permission-profile", choices=PERMISSION_PROFILE_NAMES)
     eval_parser.add_argument("--profile", default="tiny-coder", help="Profile to run, e.g. tiny-coder or tiny-pi.")
     eval_parser.add_argument("--memory", action="store_true", help="Enable explicit file-backed memory context.")
     eval_parser.add_argument(
@@ -280,8 +299,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command is None:
-        parser.print_help()
-        return 0
+        argv = ["tui"]
+        args = parser.parse_args(argv)
+
+    product_config: dict[str, Any] = {}
+    if args.command in {"agent", "eval", "run", "serve", "tui"}:
+        try:
+            config_home, product_config = _load_product_config()
+            _apply_config_defaults(args, argv, product_config)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"config error: {exc}")
+            return 1
 
     if args.command == "install":
         home = ProductHome.from_env()
@@ -348,11 +376,21 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("config requires a subcommand")
 
     if args.command == "doctor":
+        doctor_home = ProductHome.from_env()
+        try:
+            doctor_home.ensure()
+            product_config = doctor_home.load_config()
+            _apply_config_defaults(args, argv, product_config)
+        except OSError:
+            product_config = {}
+        except (ValueError, json.JSONDecodeError):
+            product_config = {}
         report, ok = render_doctor(
-            ProductHome.from_env(),
+            doctor_home,
             workspace=Path(args.workspace),
             provider=args.provider,
             port=args.port,
+            env=_provider_env_for_config(product_config),
         )
         print(report, end="")
         return 0 if ok else 1
@@ -438,6 +476,33 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         parser.error("conversations requires a subcommand")
 
+    if args.command == "snapshot":
+        try:
+            if args.snapshot_command == "create":
+                workspace = Path(args.workspace).expanduser().resolve()
+                snapshot_root = args.snapshot_root or workspace / ".tinyagent" / "snapshots" / f"snapshot-{uuid4().hex[:12]}"
+                result = create_workspace_snapshot(workspace, snapshot_root, args.paths, label=args.label)
+                payload = result.to_json_dict()
+                if args.json:
+                    print(json.dumps(payload, sort_keys=True))
+                else:
+                    print(f"snapshot_manifest: {result.manifest_path}")
+                    print(f"paths: {len(result.paths)}")
+                return 0
+            if args.snapshot_command == "restore":
+                result = restore_workspace_snapshot(Path(args.workspace).expanduser().resolve(), args.manifest)
+                payload = result.to_json_dict()
+                if args.json:
+                    print(json.dumps(payload, sort_keys=True))
+                else:
+                    print(f"restored: {len(result.restored)}")
+                    print(f"deleted: {len(result.deleted)}")
+                return 0
+        except (OSError, ValueError, json.JSONDecodeError, TypeError) as exc:
+            print(f"snapshot error: {exc}")
+            return 1
+        parser.error("snapshot requires a subcommand")
+
     product_workspace_record = None
     try:
         if not (args.command in {"replay", "inspect"} and _is_existing_path(args.run_path)):
@@ -446,11 +511,22 @@ def main(argv: list[str] | None = None) -> int:
             store = WorkspaceStore(home)
             if args.command == "run" and args.run_id is not None and args.output_dir is None:
                 validate_run_id(args.run_id)
-            if args.command == "run" or (args.command == "serve" and args.workspace):
+            if args.command == "run" or (args.command == "serve" and args.workspace) or (args.command == "tui" and not args.server):
                 product_workspace_record = store.register(Path(args.workspace), trust="untrusted")
-                if not _has_cli_option(argv, "--provider") and product_workspace_record.default_provider:
+                config_provider = _config_provider(product_config)
+                if (
+                    not _has_cli_option(argv, "--provider")
+                    and product_workspace_record.default_provider
+                    and (product_workspace_record.default_provider != "fake" or not config_provider)
+                ):
                     args.provider = product_workspace_record.default_provider
-                if args.command == "run" and not _has_cli_option(argv, "--profile") and product_workspace_record.default_profile:
+                config_profile = _config_default(product_config, "profile")
+                if (
+                    args.command in {"run", "tui"}
+                    and not _has_cli_option(argv, "--profile")
+                    and product_workspace_record.default_profile
+                    and (product_workspace_record.default_profile != "tiny-coder" or not config_profile)
+                ):
                     args.profile = product_workspace_record.default_profile
                 args.workspace = product_workspace_record.root
                 args.conversation_root = home.workspaces_dir / product_workspace_record.workspace_id / "conversations"
@@ -476,7 +552,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"debug error: {exc}")
             return 2
         try:
-            model = _model_for(args.provider, args.task, model_name=args.model, reasoning_json=args.reasoning_json)
+            model = _model_for(
+                args.provider,
+                args.task,
+                model_name=args.model,
+                reasoning_json=args.reasoning_json,
+                product_config=product_config,
+            )
         except ProviderError as exc:
             print(f"provider error: {exc}")
             return 1
@@ -485,22 +567,34 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as exc:
             print(f"run error: {exc}")
             return 1
+        (
+            workspace_mode,
+            approval_mode,
+            sandbox_mode,
+            policy,
+            permission_profile,
+            enforce_policy_in_yolo,
+            deny_yolo_approvals,
+        ) = _security_settings(args, argv)
         kernel = Kernel(
             model=model,
             profile=profile,
             tools=default_tools(),
-            policy=default_policy(),
+            policy=policy,
             resources=ResourceLoader(ResourceLoaderConfig(memory_enabled=args.memory)).load(
                 Path(args.workspace),
                 runtime_capabilities=profile.runtime_capabilities,
             ),
-            approval_handler=_approval_handler_for(args.approval_mode, args.approvals_reviewer, model),
+            approval_handler=_approval_handler_for(approval_mode, args.approvals_reviewer, model),
             stream=args.stream != "off",
             event_sink=_stream_sink(args.stream, debug_level, output_format=args.output_format),
-            workspace_mode=args.workspace_mode,
-            approval_mode=args.approval_mode,
+            workspace_mode=workspace_mode,
+            approval_mode=approval_mode,
             session_mode=args.session_mode,
-            sandbox_mode=args.sandbox_mode,
+            sandbox_mode=sandbox_mode,
+            permission_profile=permission_profile,
+            enforce_policy_in_yolo=enforce_policy_in_yolo,
+            deny_yolo_approvals=deny_yolo_approvals,
         )
         cancel_token = CancelToken()
         state: RunState | None = None
@@ -526,10 +620,10 @@ def main(argv: list[str] | None = None) -> int:
                     run_id=args.run_id,
                     output_dir=args.output_dir,
                     cancel_token=cancel_token,
-                    workspace_mode=args.workspace_mode,
-                    approval_mode=args.approval_mode,
+                    workspace_mode=workspace_mode,
+                    approval_mode=approval_mode,
                     session_mode=args.session_mode,
-                    sandbox_mode=args.sandbox_mode,
+                    sandbox_mode=sandbox_mode,
                 )
         except RunCancelled:
             print("run cancelled: sigint")
@@ -604,20 +698,29 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "serve":
         try:
             debug_level = _debug_level(args.debug)
+            workspace_mode, approval_mode, sandbox_mode, _policy, permission_profile, _enforce_policy_in_yolo, _deny_yolo_approvals = (
+                _security_settings(args, argv)
+            )
             server = create_product_runtime_server(
-                ProductHome.from_env(),
+                config_home,
                 host=args.host,
                 port=args.port,
                 provider=args.provider,
                 model_name=args.model,
-                reasoning=_parse_reasoning_json(args.reasoning_json),
+                reasoning=(
+                    _parse_reasoning_json(args.reasoning_json)
+                    if args.reasoning_json is not None
+                    else _config_reasoning(product_config)
+                ),
+                model_env=_provider_env_for_config(product_config),
                 stream=args.stream,
                 debug_level=debug_level,
-                workspace_mode=args.workspace_mode,
-                approval_mode=args.approval_mode,
+                workspace_mode=workspace_mode,
+                approval_mode=approval_mode,
                 session_mode=args.session_mode,
                 approvals_reviewer=args.approvals_reviewer,
-                sandbox_mode=args.sandbox_mode,
+                sandbox_mode=sandbox_mode,
+                permission_profile=permission_profile,
                 profile=args.profile,
                 profile_override=_has_cli_option(argv, "--profile"),
                 memory_enabled=args.memory,
@@ -664,6 +767,9 @@ def main(argv: list[str] | None = None) -> int:
                 except ValueError as exc:
                     print(f"eval error: {exc}")
                     return 1
+                workspace_mode, approval_mode, sandbox_mode, policy, permission_profile, enforce_policy_in_yolo, deny_yolo_approvals = (
+                    _security_settings(args, argv)
+                )
                 eval_run = run_eval_suite(
                     args.suite_path,
                     output_dir=output_dir,
@@ -672,10 +778,11 @@ def main(argv: list[str] | None = None) -> int:
                         task,
                         model_name=args.model,
                         reasoning_json=args.reasoning_json,
+                        product_config=product_config,
                     ),
                     profile=profile,
                     tools=default_tools(),
-                    policy=default_policy(),
+                    policy=policy,
                     resources=ResourceLoader(ResourceLoaderConfig(memory_enabled=args.memory)).load(
                         args.suite_path,
                         runtime_capabilities=profile.runtime_capabilities,
@@ -683,11 +790,14 @@ def main(argv: list[str] | None = None) -> int:
                     stream=args.stream != "off",
                     event_sink=_stream_sink(args.stream, debug_level),
                     cancel_token=cancel_token,
-                    workspace_mode=args.workspace_mode,
-                    approval_mode=args.approval_mode,
+                    workspace_mode=workspace_mode,
+                    approval_mode=approval_mode,
                     session_mode=args.session_mode,
                     approvals_reviewer=args.approvals_reviewer,
-                    sandbox_mode=args.sandbox_mode,
+                    sandbox_mode=sandbox_mode,
+                    permission_profile=permission_profile,
+                    enforce_policy_in_yolo=enforce_policy_in_yolo,
+                    deny_yolo_approvals=deny_yolo_approvals,
                 )
         except RunCancelled:
             print("eval cancelled: sigint")
@@ -725,7 +835,7 @@ def main(argv: list[str] | None = None) -> int:
                     workspace=workspace,
                     suite_path=args.suite,
                     output_dir=output_dir,
-                    model_factory=lambda task: _model_for(args.provider, task),
+                    model_factory=lambda task: _model_for(args.provider, task, product_config=product_config),
                     profile=profile,
                     tools=default_tools(),
                     policy=default_policy(),
@@ -766,7 +876,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "agent":
         if args.agent_command == "stdio":
-            return _main_agent_stdio(args)
+            return _main_agent_stdio(args, product_config)
         parser.error("agent subcommand required")
 
     if args.command == "evolve":
@@ -815,7 +925,7 @@ class _JsonRpcEventSink:
         )
 
 
-def _main_agent_stdio(args: argparse.Namespace) -> int:
+def _main_agent_stdio(args: argparse.Namespace, product_config: dict[str, Any] | None = None) -> int:
     session_id = f"session_{uuid4().hex}"
     for line in sys.stdin:
         if not line.strip():
@@ -825,12 +935,17 @@ def _main_agent_stdio(args: argparse.Namespace) -> int:
         except json.JSONDecodeError as exc:
             _write_jsonrpc(_jsonrpc_error(None, -32700, f"parse error: {exc.msg}"))
             continue
-        response = _handle_agent_stdio_request(request, args, session_id)
+        response = _handle_agent_stdio_request(request, args, session_id, product_config or {})
         _write_jsonrpc(response)
     return 0
 
 
-def _handle_agent_stdio_request(request: dict[str, object], args: argparse.Namespace, session_id: str) -> dict[str, object]:
+def _handle_agent_stdio_request(
+    request: dict[str, object],
+    args: argparse.Namespace,
+    session_id: str,
+    product_config: dict[str, Any] | None = None,
+) -> dict[str, object]:
     request_id = request.get("id")
     method = str(request.get("method") or "")
     params = request.get("params") if isinstance(request.get("params"), dict) else {}
@@ -858,7 +973,7 @@ def _handle_agent_stdio_request(request: dict[str, object], args: argparse.Names
     if not task:
         return _jsonrpc_error(request_id, -32602, "session.prompt requires params.task or params.prompt")
     try:
-        model = _model_for(args.provider, task, model_name=args.model, reasoning_json=None)
+        model = _model_for(args.provider, task, model_name=args.model, reasoning_json=None, product_config=product_config or {})
         profile = profile_for(args.profile)
         workspace = Path(args.workspace).expanduser().resolve()
         run_id = str(params.get("run_id") or f"run_stdio_{uuid4().hex}")
@@ -1051,6 +1166,157 @@ def _default_eval_compare_output_dir(suite_path: Path) -> Path:
     return default_dir.with_name(f"{default_dir.name}-compare")
 
 
+def _load_product_config() -> tuple[ProductHome, dict[str, Any]]:
+    home = ProductHome.from_env()
+    home.ensure()
+    return home, home.load_config()
+
+
+def _apply_config_defaults(args: argparse.Namespace, argv: list[str], config: dict[str, Any]) -> None:
+    if hasattr(args, "provider") and not _has_cli_option(argv, "--provider"):
+        provider = _config_provider(config)
+        if provider:
+            args.provider = provider
+    defaults = {
+        "approval_mode": "approval-mode",
+        "approvals_reviewer": "approvals-reviewer",
+        "permission_profile": "permission-profile",
+        "profile": "profile",
+        "sandbox_mode": "sandbox-mode",
+        "session_mode": "session-mode",
+        "workspace_mode": "workspace-mode",
+    }
+    for attr, flag in defaults.items():
+        if hasattr(args, attr) and not _has_cli_option(argv, f"--{flag}"):
+            value = _config_default(config, attr)
+            if value:
+                setattr(args, attr, value)
+    if hasattr(args, "memory") and not _has_cli_option(argv, "--memory"):
+        memory_enabled = _config_bool(_config_table(config, "defaults"), "memory")
+        if memory_enabled is not None:
+            args.memory = memory_enabled
+
+
+def _config_provider(config: dict[str, Any]) -> str | None:
+    return _config_str(_config_table(config, "model"), "provider") or _config_default(config, "provider")
+
+
+def _config_default(config: dict[str, Any], key: str) -> str | None:
+    return _config_str(_config_table(config, "defaults"), key)
+
+
+def _provider_env_for_config(config: dict[str, Any]) -> dict[str, str]:
+    values = dict(os.environ)
+    model = _config_table(config, "model")
+    aliases = {
+        "api_key": "TINYAGENT_MODEL_API_KEY",
+        "base_url": "TINYAGENT_MODEL_BASE_URL",
+        "context_window": "TINYAGENT_MODEL_CONTEXT_WINDOW",
+        "max_output_tokens": "TINYAGENT_MODEL_MAX_OUTPUT_TOKENS",
+        "parallel_tool_calls": "TINYAGENT_MODEL_PARALLEL_TOOL_CALLS",
+        "prompt_cache_key": "TINYAGENT_MODEL_PROMPT_CACHE_KEY",
+        "timeout_seconds": "TINYAGENT_MODEL_TIMEOUT_SECONDS",
+    }
+    model_name = _config_str(model, "name") or _config_str(model, "model")
+    if model_name and "TINYAGENT_MODEL_NAME" not in values:
+        values["TINYAGENT_MODEL_NAME"] = model_name
+    for key, env_name in aliases.items():
+        if env_name not in values and key in model:
+            values[env_name] = _config_env_value(model[key], f"model.{key}")
+    if "TINYAGENT_MODEL_EXTRA_BODY_JSON" not in values:
+        extra_body_json = _config_str(model, "extra_body_json")
+        if extra_body_json:
+            values["TINYAGENT_MODEL_EXTRA_BODY_JSON"] = extra_body_json
+        elif "extra_body" in model:
+            extra_body = model["extra_body"]
+            if not isinstance(extra_body, dict):
+                raise ValueError("model.extra_body must be a TOML table")
+            values["TINYAGENT_MODEL_EXTRA_BODY_JSON"] = json.dumps(extra_body, sort_keys=True)
+    if "TINYAGENT_MODEL_REASONING_JSON" not in values:
+        reasoning = _config_reasoning(config)
+        if reasoning is not None:
+            values["TINYAGENT_MODEL_REASONING_JSON"] = json.dumps(reasoning, sort_keys=True)
+    return values
+
+
+def _config_reasoning(config: dict[str, Any]) -> dict[str, Any] | None:
+    model = _config_table(config, "model")
+    result: dict[str, Any] = {}
+    if "reasoning_json" in model:
+        raw = _config_str(model, "reasoning_json")
+        if raw:
+            return _parse_reasoning_json(raw)
+    if "reasoning" in model:
+        reasoning = model["reasoning"]
+        if not isinstance(reasoning, dict):
+            raise ValueError("model.reasoning must be a TOML table")
+        result.update(reasoning)
+    effort = _config_str(model, "reasoning_effort")
+    if effort:
+        result.setdefault("effort", effort)
+    if "reasoning_budget_tokens" in model:
+        budget = model["reasoning_budget_tokens"]
+        if not isinstance(budget, int):
+            raise ValueError("model.reasoning_budget_tokens must be an integer")
+        result.setdefault("budget_tokens", budget)
+    return result or None
+
+
+def _config_table(config: dict[str, Any], key: str) -> dict[str, Any]:
+    value = config.get(key)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"[{key}] must be a TOML table")
+    return value
+
+
+def _config_str(table: dict[str, Any], key: str) -> str | None:
+    if key not in table:
+        return None
+    value = table[key]
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{key} must be a string")
+    return value.strip() or None
+
+
+def _config_bool(table: dict[str, Any], key: str) -> bool | None:
+    if key not in table:
+        return None
+    value = table[key]
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} must be a boolean")
+    return value
+
+
+def _config_env_value(value: Any, key: str) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int | float | str):
+        return str(value)
+    raise ValueError(f"{key} must be a string, number, or boolean")
+
+
+def _security_settings(args: argparse.Namespace, argv: list[str]):
+    permission_profile = permission_profile_for(getattr(args, "permission_profile", None))
+    if permission_profile is None:
+        return args.workspace_mode, args.approval_mode, args.sandbox_mode, default_policy(), None, False, False
+    workspace_mode = args.workspace_mode if _has_cli_option(argv, "--workspace-mode") else permission_profile.workspace_mode
+    approval_mode = args.approval_mode if _has_cli_option(argv, "--approval-mode") else permission_profile.approval_mode
+    sandbox_mode = args.sandbox_mode if _has_cli_option(argv, "--sandbox-mode") else permission_profile.sandbox_mode
+    return (
+        workspace_mode,
+        approval_mode,
+        sandbox_mode,
+        permission_profile.policy(),
+        permission_profile.name,
+        permission_profile.enforce_policy_in_yolo,
+        permission_profile.deny_yolo_approvals,
+    )
+
+
 def _has_cli_option(argv: list[str], option: str) -> bool:
     return any(value == option or value.startswith(f"{option}=") for value in argv)
 
@@ -1065,11 +1331,20 @@ def _is_existing_path(path: Path) -> bool:
     return Path(path).expanduser().exists()
 
 
-def _model_for(provider: str, task: str, *, model_name: str | None = None, reasoning_json: str | None = None):
+def _model_for(
+    provider: str,
+    task: str,
+    *,
+    model_name: str | None = None,
+    reasoning_json: str | None = None,
+    product_config: dict[str, Any] | None = None,
+):
+    config = product_config or {}
+    reasoning = _parse_reasoning_json(reasoning_json) if reasoning_json is not None else _config_reasoning(config)
     return provider_for(
-        ProviderSpec(kind=provider, model=model_name, reasoning=_parse_reasoning_json(reasoning_json)),
+        ProviderSpec(kind=provider, model=model_name, reasoning=reasoning),
         task,
-        env=os.environ,
+        env=_provider_env_for_config(config),
     )  # type: ignore[arg-type]
 
 

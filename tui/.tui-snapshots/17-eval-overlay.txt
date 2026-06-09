@@ -1,0 +1,38 @@
+ ◆ tinyagent  │  ws : tinyagent  │  model : gpt-5  │  ⎇ ta-revi…arning                      ⦗ idle ⦘   │  ctx ▰▱▱▱▱ 25% 
+  › bring the panel surface in line with the Paper TUI refer│  eval lab  ⦗ completed ⦘                     ⌜esc⌟ close  
+                                                            │                                                           
+  ◆ thought  ⌜r⌟ expand                                     │───────────────────────────────────────────────────────────
+                                                            │                                                           
+    ✓ read     Paper overlay reference                      │  eval lab                                                 
+    ✓ edit     panel widgets                                │                                                           
+                                                            │   ▏ status         completed                              
+  The main shell stays one column. Panels slide over the tra│     3 / 4 passing                                         
+  terminal rhythm.                                          │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ suite          evals/tui-overlay.yaml                 
+                                                            │     snapshot gate                                         
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ output         eval artifacts                         
+                                                            │     .tinyagent/evals/overlay-20260525                     
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │                                                           
+                                                            │   ▍ slash-picker                      passed              
+                                                            │     approval-modal                    passed              
+                                                            │     sessions-overlay                  passed              
+                                                            │     compact-80col                     failed              
+                                                            │     footer clipped at 80 columns                          
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │  needs review · compact-80col · footer clipped            
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │───────────────────────────────────────────────────────────
+                                                            │  ⌜esc⌟ close                                              

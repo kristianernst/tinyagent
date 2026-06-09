@@ -1,0 +1,38 @@
+ ◆ tinyagent  │  ws : tinyagent  │  model : gpt-5  │  ⎇ ta-revi…arning                      ⦗ idle ⦘   │  ctx ▰▱▱▱▱ 25% 
+  › bring the panel surface in line with the Paper TUI refer│  acp bridge                                  ⌜esc⌟ close  
+                                                            │                                                           
+  ◆ thought  ⌜r⌟ expand                                     │───────────────────────────────────────────────────────────
+                                                            │                                                           
+    ✓ read     Paper overlay reference                      │  acp bridge                                               
+    ✓ edit     panel widgets                                │                                                           
+                                                            │   ▏ bridge         live session                           
+  The main shell stays one column. Panels slide over the tra│     app-connected turn stream                             
+  terminal rhythm.                                          │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ command        app bridge                             
+                                                            │     tinyagent agent stdio --protocol acp                  
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ start          open session                           
+                                                            │     create conversation                                   
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ prompt         stream turn                            
+                                                            │     send user prompt                                      
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ cancel         stop run                               
+                                                            │     return control                                        
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ approval       resolve tool                           
+                                                            │     allow or deny                                         
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │  same trace · app parity                                  
+                                                            │                                                           
+                                                            │───────────────────────────────────────────────────────────
+                                                            │  ⌜esc⌟ close                                              

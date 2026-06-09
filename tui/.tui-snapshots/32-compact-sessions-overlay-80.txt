@@ -1,0 +1,24 @@
+ ◆ tinyagent  │  tinyagent  │  gpt-5  │  ⎇ …                      ⦗ idle ⦘   0% 
+  › the slash-command list was getting│  sessions  ⦗ 12 ⦘          ⌜esc⌟ close  
+                                      │                                         
+  ◆ thought  ⌜r⌟ expand               │─────────────────────────────────────────
+                                      │                                         
+    ✓ read     src/ui/widgets/Picker.t│   ▍ design tokens · TUI       active    
+    ✓ search   "menu" in src/ui · 14 h│     gpt-5 · 14 turns · 4.2k tok         
+                                      │     review-gated learning     2h ago    
+  All three widgets now consume the sa│     gpt-5 · 27 turns · 11.4k tok        
+  list, file mentions, and skill menti│     SDK lifecycle surface     1d ago    
+  consistent keyboard behavior.       │     gpt-5 · 9 turns · 2.1k tok          
+                                      │     workspace snapshot ext    1d ago    
+                                      │     gpt-5 · 15 turns                    
+                                      │     permission profiles v1    2d ago    
+                                      │     haiku-4.5 · 6 turns                 
+                                      │     allowed tool boundary     3d ago    
+                                      │     gpt-5 · 22 turns                    
+                                      │                                         
+                                      │                                         
+                                      │                                         
+                                      │                                         
+                                      │                                         
+                                      │─────────────────────────────────────────
+                                      │  ⌜↑↓⌟ nav   ⌜⏎⌟ open   ⌜n⌟ new          

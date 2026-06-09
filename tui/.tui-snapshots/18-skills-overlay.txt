@@ -1,0 +1,38 @@
+ ◆ tinyagent  │  ws : tinyagent  │  model : gpt-5  │  ⎇ ta-revi…arning                      ⦗ idle ⦘   │  ctx ▰▱▱▱▱ 25% 
+  › bring the panel surface in line with the Paper TUI refer│  skill forge  ⦗ 2 ⦘                          ⌜esc⌟ close  
+                                                            │                                                           
+  ◆ thought  ⌜r⌟ expand                                     │───────────────────────────────────────────────────────────
+                                                            │                                                           
+    ✓ read     Paper overlay reference                      │  skill forge                                              
+    ✓ edit     panel widgets                                │                                                           
+                                                            │   ▏ status         ready                                  
+  The main shell stays one column. Panels slide over the tra│     2 drafts loaded                                       
+  terminal rhythm.                                          │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ draft          overlay-review                         
+                                                            │     skills/overlay-review/SKILL.md                        
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │                                                           
+                                                            │                                                           
+                                                            │   ▍ overlay-review                               draft    
+                                                            │     skills/overlay-review/SKILL.md · overlay refactor     
+                                                            │     visual-check                                 ready    
+                                                            │     skills/visual-check/SKILL.md · snapshots              
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │  draft preview                                            
+                                                            │    ▏ name          overlay-review                         
+                                                            │      skills/overlay-review/SKILL.md                       
+                                                            │    ▏ purpose       TUI overlay panel changes              
+                                                            │      draft intent                                         
+                                                            │    ▏ step 1        inspect Paper                          
+                                                            │      1 of 3                                               
+                                                            │    ▏ step 2        update a focused surface               
+                                                            │      2 of 3                                               
+                                                            │    ▏ step 3        capture snapshots                      
+                                                            │      3 of 3                                               
+                                                            │                                                           
+                                                            │                                                           
+                                                            │───────────────────────────────────────────────────────────
+                                                            │  ⌜esc⌟ close                                              

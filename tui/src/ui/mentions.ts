@@ -1,5 +1,5 @@
-import { commands } from "../commands";
-import type { ExtensionEntry, MentionTrigger, SkillEntry } from "../state/reducer";
+import { pickerCommands } from "../commands";
+import type { ExtensionEntry, MentionTrigger, SkillEntry, WorkspaceFileMetadata } from "../state/reducer";
 
 export type MentionDetection = {
   trigger: MentionTrigger;
@@ -12,6 +12,8 @@ export type MentionCandidate = {
   label: string;
   description?: string;
   insert: string;
+  meta?: string;
+  disabled?: boolean;
 };
 
 const TRIGGERS: MentionTrigger[] = ["/", "@", "$"];
@@ -48,52 +50,54 @@ export function detectMention(text: string, cursor: number = text.length): Menti
 
 export function candidatesForSlash(query: string): MentionCandidate[] {
   const needle = query.toLowerCase();
-  return commands
-    .filter((command) => !needle || command.id.includes(needle) || command.title.toLowerCase().includes(needle))
-    .slice(0, 8)
-    .map((command) => ({
-      label: `/${command.id}`,
-      description: command.title,
-      insert: `/${command.id} `,
-    }));
+  const matches = (command: (typeof pickerCommands)[number]) => !needle || command.id.includes(needle) || command.title.toLowerCase().includes(needle);
+  if (!pickerCommands.some(matches)) return [];
+  return pickerCommands.map((command) => ({
+    label: `/${command.id}`,
+    description: command.title,
+    insert: `/${command.id} `,
+  }));
 }
 
-export function candidatesForFile(query: string, files: string[]): MentionCandidate[] {
+export function candidatesForFile(query: string, files: string[], metadata: WorkspaceFileMetadata = {}): MentionCandidate[] {
   const needle = query.toLowerCase();
   const ranked = files
     .map((path) => ({ path, score: rankFile(path, needle) }))
     .filter((row) => row.score >= 0)
     .sort((a, b) => a.score - b.score)
     .slice(0, 12);
-  return ranked.map(({ path }) => ({
-    label: path,
-    description: "",
-    insert: `@${path} `,
-  }));
+  const matches = ranked.map(({ path }) => fileCandidate(path, metadata));
+  const recent = needle && matches.length > 0 ? recentFile(files, new Set(ranked.map((row) => row.path)), metadata) : "";
+  if (!recent) return matches;
+  return [
+    ...matches,
+    { label: "— recent —", insert: "", disabled: true },
+    fileCandidate(recent, metadata),
+  ];
 }
 
 export function candidatesForSkill(query: string, skills: SkillEntry[]): MentionCandidate[] {
   const needle = query.toLowerCase();
-  return skills
-    .filter((skill) => !needle || skill.name.toLowerCase().includes(needle))
-    .slice(0, 10)
-    .map((skill) => ({
-      label: `$${skill.name}`,
-      description: skill.description ?? skill.path,
-      insert: `$${skill.name} `,
-    }));
+  const matches = (skill: SkillEntry) => !needle || skill.name.toLowerCase().includes(needle);
+  if (!skills.some(matches)) return [];
+  return skills.map((skill) => ({
+    label: `$${skill.name}`,
+    description: skillPickerDescription(skill),
+    insert: `$${skill.name} `,
+  }));
 }
 
 export function pickCandidates(
   detection: MentionDetection,
   files: string[],
   skills: SkillEntry[],
+  options: { fileMetadata?: WorkspaceFileMetadata } = {},
 ): MentionCandidate[] {
   switch (detection.trigger) {
     case "/":
       return candidatesForSlash(detection.query);
     case "@":
-      return candidatesForFile(detection.query, files);
+      return candidatesForFile(detection.query, files, options.fileMetadata);
     case "$":
       return candidatesForSkill(detection.query, skills);
   }
@@ -118,6 +122,47 @@ function rankFile(path: string, needle: string): number {
   if (idx === baseStart) return 0;
   if (lower.slice(baseStart).startsWith(needle)) return 1;
   return 2 + idx;
+}
+
+function fileCandidate(path: string, metadata: WorkspaceFileMetadata): MentionCandidate {
+  const meta = metadata[path];
+  return {
+    label: path,
+    description: "",
+    insert: `@${path} `,
+    meta: typeof meta?.bytes === "number" ? formatBytes(meta.bytes) : undefined,
+  };
+}
+
+function recentFile(files: string[], matched: Set<string>, metadata: WorkspaceFileMetadata): string {
+  return files
+    .filter((path) => !matched.has(path) && typeof metadata[path]?.mtimeMs === "number")
+    .sort((a, b) => (metadata[b]?.mtimeMs ?? 0) - (metadata[a]?.mtimeMs ?? 0))[0] ?? "";
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${Math.max(0, Math.round(bytes))}b`;
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))}kb`;
+  return `${Math.max(1, Math.round(bytes / (1024 * 1024)))}mb`;
+}
+
+function skillPickerDescription(skill: SkillEntry): string {
+  const raw = (skill.description || skill.path || "skill").trim().replace(/\s+/g, " ");
+  const compact = raw
+    .replace(/\bOpenTUI\b/g, "TUI")
+    .replace(/\bthe terminal surface\b/gi, "terminal")
+    .replace(/\bterminal surface\b/gi, "terminal")
+    .replace(/\bthe Paper artboard\b/g, "Paper")
+    .replace(/\bPaper artboard\b/g, "Paper");
+  const before = compact.match(/^(.+?)\s+before\s+/i);
+  const candidate = before?.[1] ?? compact;
+  if (candidate.length <= 32) return lowerFirst(candidate);
+  return lowerFirst(candidate.split(/\s+/).slice(0, 4).join(" "));
+}
+
+function lowerFirst(value: string): string {
+  if (!value) return value;
+  return `${value[0]!.toLowerCase()}${value.slice(1)}`;
 }
 
 // Helper for tests: synthesize ExtensionEntry list so panels can render uniformly.

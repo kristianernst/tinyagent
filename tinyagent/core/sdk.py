@@ -4,22 +4,27 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import queue
 import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 from tinyagent.core.contracts import ApprovalHandler, ModelProvider, PolicyEngine, Tool
 from tinyagent.core.events import Event, EventSink
 from tinyagent.core.hooks import TinyHook
+from tinyagent.core.ids import validate_run_id
 from tinyagent.core.kernel import Kernel
+from tinyagent.core.path_safety import checked_relative_path
 from tinyagent.core.profiles import ApexCoderProfile
 from tinyagent.core.run_control import CancelToken
 from tinyagent.core.state import ApprovalMode, ApprovalRequest, ApprovalResolution, RunBudgets, RunState
 from tinyagent.core.workspace import SandboxModeInput, WorkspaceMode
+from tinyagent.runtime.replay import load_run_events
+from tinyagent.runtime.run_record import load_run_record
 
 ApprovalDecision = Literal["approved", "denied", "cancelled", "expired"]
 ApprovalScope = Literal["once", "run"]
@@ -28,6 +33,33 @@ ApprovalCallback = Callable[[ApprovalRequest, "ApprovalContext"], ApprovalResolu
 _TERMINAL_EVENTS = {"run.completed", "run.failed", "run.cancelled", "run.timed_out"}
 _VALID_APPROVAL_DECISIONS = {"approved", "denied", "cancelled", "expired"}
 _VALID_APPROVAL_SCOPES = {None, "once", "run"}
+_AGENT_FEATURES = frozenset({"prompt", "start", "run", "run_once", "list_runs", "read_run"})
+_RUN_HANDLE_FEATURES = frozenset({"events", "stream", "wait", "result", "cancel"})
+_UNSUPPORTED_REASONS = {
+    "resume": "run resume is not implemented yet; use read_run() for recorded runs",
+    "mcp_status": "MCP status is extension-specific and is not exposed by the base SDK",
+}
+
+
+class SDKError(RuntimeError):
+    phase = "sdk"
+
+
+class SDKRunError(SDKError):
+    phase = "run"
+
+    def __init__(self, run_id: str, reason: str) -> None:
+        self.run_id = run_id
+        super().__init__(f"SDK run failed before producing RunState ({run_id}): {reason}")
+
+
+class UnsupportedOperationError(SDKError):
+    phase = "unsupported"
+
+    def __init__(self, operation: str, reason: str) -> None:
+        self.operation = operation
+        self.reason = reason
+        super().__init__(f"{operation} is not supported: {reason}")
 
 
 @dataclass(frozen=True)
@@ -49,14 +81,34 @@ class RunResult:
     events: tuple[Event, ...]
     failure_reason: str = ""
     cancel_reason: str = ""
+    artifact_paths: tuple[str, ...] = ()
+    context_usage: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RunSummary:
+    run_id: str
+    status: str
+    output_dir: Path
+    task: str = ""
+    failure_reason: str = ""
 
 
 class RunHandle:
-    def __init__(self, *, run_id: str, sink: _QueueSink, task: asyncio.Task[RunState], cancel_token: CancelToken) -> None:
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        sink: _QueueSink,
+        task: asyncio.Task[RunState],
+        cancel_token: CancelToken,
+        capabilities: frozenset[str],
+    ) -> None:
         self._run_id = run_id
         self._sink = sink
         self._task = task
         self._cancel_token = cancel_token
+        self._capabilities = capabilities
         self._events_started = False
 
     @property
@@ -78,26 +130,33 @@ class RunHandle:
                 yield event
                 if event.type in _TERMINAL_EVENTS and self._sink.empty():
                     break
-            await self._task
+            await self._state()
         finally:
             if not self._task.done():
                 await self.cancel("event_stream_closed")
+
+    async def stream(self) -> AsyncIterator[Event]:
+        async for event in self.events():
+            yield event
 
     async def cancel(self, reason: str = "user_cancelled") -> None:
         self._cancel_token.cancel(reason)
 
     async def result(self) -> RunResult:
-        state = await self._task
-        status = state.terminal_status or state.status
-        return RunResult(
-            run_id=state.run_id,
-            status=status,
-            final_output=state.final_output,
-            output_dir=state.output_dir,
-            events=tuple(state.events),
-            failure_reason=state.failure_reason or "",
-            cancel_reason=state.cancel_reason or state.cancel_token.reason or "",
-        )
+        state = await self._state()
+        return _result_from_state(state)
+
+    async def wait(self) -> RunResult:
+        return await self.result()
+
+    def supports(self, feature: str) -> bool:
+        return feature in self._capabilities
+
+    async def _state(self) -> RunState:
+        try:
+            return await self._task
+        except Exception as exc:
+            raise SDKRunError(self._run_id, str(exc)) from exc
 
 
 class Agent:
@@ -127,6 +186,7 @@ class Agent:
         self.approval_mode = approval_mode
         self.sandbox_mode = sandbox_mode
         self.approval_handler = approval_handler
+        self._capabilities = _agent_capabilities_for(approval_handler)
 
     @classmethod
     def create(cls, **kwargs) -> Agent:
@@ -134,6 +194,7 @@ class Agent:
 
     async def start(self, prompt: str, *, run_id: str | None = None, output_dir: Path | None = None) -> RunHandle:
         resolved_run_id = run_id or f"run_{uuid4().hex}"
+        validate_run_id(resolved_run_id)
         sink = _QueueSink()
         cancel_token = CancelToken()
         loop = asyncio.get_running_loop()
@@ -164,7 +225,13 @@ class Agent:
                 sandbox_mode=self.sandbox_mode,
             )
         )
-        return RunHandle(run_id=resolved_run_id, sink=sink, task=task, cancel_token=cancel_token)
+        return RunHandle(
+            run_id=resolved_run_id,
+            sink=sink,
+            task=task,
+            cancel_token=cancel_token,
+            capabilities=_RUN_HANDLE_FEATURES,
+        )
 
     async def run(self, prompt: str, *, run_id: str | None = None, output_dir: Path | None = None) -> AsyncIterator[Event]:
         handle = await self.start(prompt, run_id=run_id, output_dir=output_dir)
@@ -174,6 +241,173 @@ class Agent:
     async def run_once(self, prompt: str, *, run_id: str | None = None, output_dir: Path | None = None) -> RunResult:
         handle = await self.start(prompt, run_id=run_id, output_dir=output_dir)
         return await handle.result()
+
+    async def prompt(self, prompt: str, *, run_id: str | None = None, output_dir: Path | None = None) -> RunResult:
+        return await self.run_once(prompt, run_id=run_id, output_dir=output_dir)
+
+    def supports(self, feature: str) -> bool:
+        return feature in self._capabilities
+
+    def support_reason(self, feature: str) -> str:
+        if self.supports(feature):
+            return "supported"
+        return _UNSUPPORTED_REASONS.get(feature, "unsupported by the base SDK")
+
+    def list_runs(self) -> tuple[RunSummary, ...]:
+        root = self._runs_root()
+        if not root.exists():
+            return ()
+        summaries: list[RunSummary] = []
+        for path in sorted(root.iterdir()):
+            if path.is_symlink() or not path.is_dir():
+                continue
+            if not _path_is_relative_to(path.resolve(), root):
+                continue
+            if not (path / "events.jsonl").exists():
+                continue
+            try:
+                record = load_run_record(path)
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            summaries.append(
+                RunSummary(
+                    run_id=record.run_id,
+                    status=record.status,
+                    output_dir=path,
+                    task=record.task,
+                    failure_reason=record.failure_reason,
+                )
+            )
+        return tuple(summaries)
+
+    def read_run(self, run_id: str) -> RunResult:
+        path = self._run_path(run_id)
+        record = load_run_record(path)
+        events = tuple(load_run_events(path))
+        metrics = _read_json(path / "metrics.json")
+        return RunResult(
+            run_id=record.run_id,
+            status=record.status,
+            final_output=_read_final_output(_run_file(path, record.final_output_path)),
+            output_dir=path,
+            events=events,
+            failure_reason=record.failure_reason,
+            cancel_reason=str(metrics.get("cancel_reason") or ""),
+            artifact_paths=_artifact_paths(events),
+            context_usage=_context_usage_from_metrics(metrics),
+        )
+
+    async def resume(self, run_id: str) -> RunHandle:
+        del run_id
+        raise UnsupportedOperationError("resume", self.support_reason("resume"))
+
+    def _runs_root(self) -> Path:
+        root = self.workspace.expanduser().resolve() / ".tinyagent" / "runs"
+        if _path_has_existing_symlink(root):
+            raise ValueError(f"SDK runs root crosses a symlink: {root}")
+        return root.resolve()
+
+    def _run_path(self, run_id: str) -> Path:
+        validate_run_id(run_id)
+        root = self._runs_root()
+        path = root / run_id
+        if path.exists():
+            if path.is_symlink():
+                raise ValueError(f"SDK run directory crosses a symlink: {run_id}")
+            if not _path_is_relative_to(path.resolve(), root):
+                raise ValueError(f"SDK run directory is outside runs root: {run_id}")
+        return path
+
+
+def _agent_capabilities_for(approval_handler: ApprovalCallback | ApprovalHandler | None) -> frozenset[str]:
+    features = set(_AGENT_FEATURES)
+    if approval_handler is not None:
+        features.add("approvals")
+    return frozenset(features)
+
+
+def _result_from_state(state: RunState) -> RunResult:
+    status = state.terminal_status or state.status
+    events = tuple(state.events)
+    return RunResult(
+        run_id=state.run_id,
+        status=status,
+        final_output=state.final_output,
+        output_dir=state.output_dir,
+        events=events,
+        failure_reason=state.failure_reason or "",
+        cancel_reason=state.cancel_reason or state.cancel_token.reason or "",
+        artifact_paths=_artifact_paths(events),
+        context_usage={
+            "context_token_estimate": state.context_token_estimate,
+            "compaction_count": state.compaction_count,
+            "context_checkpoint_artifact": state.context_checkpoint_artifact or "",
+        },
+    )
+
+
+def _artifact_paths(events: Sequence[Event]) -> tuple[str, ...]:
+    paths: list[str] = []
+    for event in events:
+        if event.type != "artifact.created":
+            continue
+        path = event.data.get("path")
+        if isinstance(path, str) and path:
+            paths.append(path)
+    return tuple(paths)
+
+
+def _context_usage_from_metrics(metrics: dict[str, Any]) -> dict[str, object]:
+    return {
+        "context_token_estimate": int(metrics.get("context_token_estimate") or 0),
+        "compaction_count": int(metrics.get("compaction_count") or 0),
+        "context_checkpoint_artifact": str(metrics.get("context_checkpoint_artifact") or ""),
+    }
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _run_file(run_dir: Path, value: str) -> Path:
+    rel = checked_relative_path(value, label="Run artifact path")
+    target = (run_dir / rel).resolve()
+    if not _path_is_relative_to(target, run_dir):
+        raise ValueError(f"Run artifact path is outside run directory: {value}")
+    return target
+
+
+def _path_is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _path_has_existing_symlink(path: Path) -> bool:
+    current = Path(path.anchor) if path.is_absolute() else Path()
+    parts = path.parts[1:] if path.is_absolute() else path.parts
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            return True
+    return False
+
+
+def _read_final_output(path: Path) -> str:
+    try:
+        text = path.read_text()
+    except OSError:
+        return ""
+    prefix = "# Final output\n\n"
+    if text.startswith(prefix):
+        return text.removeprefix(prefix).rstrip("\n")
+    return text
 
 
 class AsyncApprovalHandlerAdapter:

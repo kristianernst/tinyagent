@@ -1,44 +1,109 @@
 import type { UpdatePanelState } from "../../state/reducer";
 import type { Theme } from "../theme";
-import { makeBox, makeText } from "../layout";
+import { InfoPanelWidget } from "./InfoPanelWidget";
 
 export class UpdateWidget {
   readonly node: any;
-  private summary: any;
-  private detail: any;
-  private hint: any;
+  private panel: InfoPanelWidget;
 
   constructor(private opentui: any, private ctx: any, private theme: Theme) {
-    this.node = makeBox(opentui, ctx, { flexDirection: "column", flexGrow: 1 });
-    this.summary = makeText(opentui, ctx, { content: "", fg: theme.accent });
-    this.detail = makeText(opentui, ctx, { content: "", fg: theme.text, marginTop: 1 });
-    this.hint = makeText(opentui, ctx, {
-      content: "/update check · /update apply · /update rollback",
-      fg: theme.textSubtle,
-      marginTop: 1,
-    });
-    this.node.add?.(this.summary);
-    this.node.add?.(this.detail);
-    this.node.add?.(this.hint);
+    this.panel = new InfoPanelWidget(opentui, ctx, theme);
+    this.node = this.panel.node;
   }
 
   update(panel: UpdatePanelState): void {
     const result = panel.result;
-    const summary = result
-      ? `${result.channel} · ${result.current_version}${result.available ? ` → ${result.latest_version}` : " (up to date)"}`
-      : "channel alpha · status: not checked";
-    if (this.summary && this.summary.content !== undefined) this.summary.content = summary;
-    const lines = result
-      ? [
-          `Install: ${result.install_kind}`,
-          `Status: ${result.reason}`,
-          result.active_version ? `Active: ${result.active_version}` : "",
-          result.previous_version ? `Previous: ${result.previous_version}` : "",
-          result.manifest_source ? `Manifest: ${result.manifest_source}` : "",
-          panel.lastAction ? `Last action: ${panel.lastAction}` : "",
-          panel.error ? `Error: ${panel.error}` : "",
-        ]
-      : [panel.error ? `Error: ${panel.error}` : "Use /update check to query the manifest."];
-    if (this.detail && this.detail.content !== undefined) this.detail.content = lines.filter(Boolean).join("\n");
+    if (!result) {
+      this.panel.update({
+        eyebrow: "update",
+        rows: [
+          {
+            label: "status",
+            value: panel.status,
+            detail: panel.error || "release source pending",
+            tone: panel.error ? "danger" : "muted",
+          },
+          {
+            label: "next",
+            value: "check now",
+            detail: "refresh release feed",
+          },
+        ],
+        footer: panel.error ? "needs attention · check again" : "check for updates",
+      });
+      return;
+    }
+    this.panel.update({
+      eyebrow: `${result.channel} channel`,
+      rows: [
+        {
+          label: "version",
+          value: result.available ? `${result.current_version} → ${result.latest_version}` : result.current_version,
+          detail: result.available ? "new build available" : "current build is up to date",
+          tone: result.available ? "warning" : "success",
+        },
+        {
+          label: "install",
+          value: result.install_kind,
+          detail: result.reason,
+        },
+        {
+          label: "active",
+          value: result.active_version || result.current_version,
+          detail: result.previous_version ? `previous ${result.previous_version}` : "no rollback target reported",
+        },
+        {
+          label: "source",
+          value: releaseSourceValue(result.manifest_source, result.channel),
+          detail: releaseSourceDetail(result.manifest_source),
+        },
+        {
+          label: "last",
+          value: humanAction(panel.lastAction),
+          detail: checkedDetail(result.checked_at),
+        },
+        ...(panel.error
+          ? [
+              {
+                label: "error",
+                value: panel.error,
+                detail: "needs attention",
+                tone: "danger" as const,
+              },
+            ]
+          : []),
+      ],
+      footer: updateFooter(panel, result),
+    });
   }
+}
+
+function releaseSourceValue(source: string, channel: string): string {
+  if (!source) return "not reported";
+  if (/^https?:\/\//.test(source)) return `${channel} feed`;
+  return "local source";
+}
+
+function releaseSourceDetail(source: string): string {
+  if (!source) return "not reported";
+  if (/^https?:\/\//.test(source)) return "checked release service";
+  return "local release source";
+}
+
+function humanAction(action: string): string {
+  if (action === "check") return "checked";
+  if (action === "apply") return "applied";
+  if (action === "rollback") return "rolled back";
+  return action || "none";
+}
+
+function checkedDetail(checkedAt: string): string {
+  if (!checkedAt) return "no local action";
+  return checkedAt.replace("T", " ").replace(/:00(?:\.000)?Z$/, "").replace(/Z$/, "");
+}
+
+function updateFooter(panel: UpdatePanelState, result: NonNullable<UpdatePanelState["result"]>): string {
+  if (panel.error) return "needs attention · check again";
+  if (!result.available) return "checked · no action needed";
+  return result.previous_version ? "ready to apply · rollback available" : "ready to apply";
 }

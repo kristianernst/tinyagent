@@ -1,0 +1,38 @@
+ ◆ tinyagent  │  ws : tinyagent  │  model : gpt-5  │  ⎇ ta-revi…arning                      ⦗ idle ⦘   │  ctx ▰▱▱▱▱ 25% 
+  › bring the panel surface in line with the Paper TUI refer│  extensions  ⦗ 3 ⦘                           ⌜esc⌟ close  
+                                                            │                                                           
+  ◆ thought  ⌜r⌟ expand                                     │───────────────────────────────────────────────────────────
+                                                            │                                                           
+    ✓ read     Paper overlay reference                      │   ▍ mcp                                      3 servers    
+    ✓ edit     panel widgets                                │     servers: filesystem, linear, paper                    
+                                                            │     lsp                                      2 servers    
+  The main shell stays one column. Panels slide over the tra│     servers: typescript, python                           
+  terminal rhythm.                                          │     app hooks                                      off    
+                                                            │     lifecycle hooks                                       
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │  extension detail                                         
+                                                            │                                                           
+                                                            │   ▏ name           mcp                                    
+                                                            │     enabled                                               
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ servers        filesystem, linear, paper              
+                                                            │     3 servers                                             
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ purpose        tool access                            
+                                                            │     local tool bridge                                     
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │───────────────────────────────────────────────────────────
+                                                            │  ⌜esc⌟ close                                              

@@ -27,6 +27,7 @@ export type CommandId =
   | "theme"
   | "stop"
   | "diff"
+  | "diff-stat"
   | "debug"
   | "reason"
   | "rail"
@@ -48,39 +49,66 @@ export type ParsedCommand = {
 };
 
 export const commands: Command[] = [
-  { id: "new", title: "New session" },
-  { id: "sessions", title: "Session browser", panel: "sessions" },
-  { id: "resume", title: "Resume session" },
-  { id: "context", title: "Context graph", panel: "context" },
-  { id: "model", title: "Model switcher", panel: "model" },
-  { id: "plan", title: "Plan mode" },
-  { id: "build", title: "Build mode" },
-  { id: "always-approve", title: "Always approve" },
-  { id: "ask", title: "Ask for approval" },
-  { id: "approve", title: "Approve pending tool", mutatesBackend: true },
-  { id: "deny", title: "Deny pending tool", mutatesBackend: true },
-  { id: "compact-mode", title: "Compact mode", panel: "context" },
-  { id: "usage", title: "Usage panel", panel: "usage" },
-  { id: "replay", title: "Replay cinema", panel: "replay" },
-  { id: "rewind", title: "Rewind event", panel: "replay" },
-  { id: "fork", title: "Fork from event", panel: "replay", mutatesBackend: true },
-  { id: "review", title: "Failure review", panel: "review" },
-  { id: "eval", title: "Eval lab", panel: "eval", mutatesBackend: true },
-  { id: "skills", title: "Skill forge", panel: "skills", mutatesBackend: true },
-  { id: "update", title: "Update manager", panel: "update", mutatesBackend: true },
-  { id: "headless", title: "Headless parity", panel: "headless" },
-  { id: "acp", title: "ACP bridge", panel: "acp" },
-  { id: "theme", title: "Theme switcher", panel: "theme" },
-  { id: "stop", title: "Stop run", mutatesBackend: true },
-  { id: "diff", title: "Diff forge", panel: "diff" },
-  { id: "debug", title: "Debug overlay", panel: "debug" },
-  { id: "reason", title: "Toggle internal reasoning" },
-  { id: "rail", title: "Toggle right rail" },
-  { id: "palette", title: "Toggle command palette" },
-  { id: "settings", title: "Settings", panel: "settings", mutatesBackend: false },
-  { id: "extensions", title: "Extensions", panel: "extensions", mutatesBackend: false },
-  { id: "help", title: "Command map", panel: "help" },
+  { id: "new", title: "start new session" },
+  { id: "context", title: "show context", panel: "context" },
+  { id: "diff", title: "show git diff", panel: "diff" },
+  { id: "diff-stat", title: "show diff summary", panel: "diff" },
+  { id: "replay", title: "replay current run", panel: "replay" },
+  { id: "sessions", title: "list sessions", panel: "sessions" },
+  { id: "skills", title: "open skill forge", panel: "skills", mutatesBackend: true },
+  { id: "model", title: "show model state", panel: "model" },
+  { id: "always-approve", title: "always approve" },
+  { id: "resume", title: "resume session" },
+  { id: "plan", title: "plan mode" },
+  { id: "build", title: "build mode" },
+  { id: "ask", title: "ask for approval" },
+  { id: "approve", title: "approve pending tool", mutatesBackend: true },
+  { id: "deny", title: "deny pending tool", mutatesBackend: true },
+  { id: "compact-mode", title: "compact context", panel: "context" },
+  { id: "usage", title: "show token usage", panel: "usage" },
+  { id: "rewind", title: "rewind to event", panel: "replay" },
+  { id: "fork", title: "fork from event", panel: "replay", mutatesBackend: true },
+  { id: "review", title: "review failure", panel: "review" },
+  { id: "eval", title: "run eval suite", panel: "eval", mutatesBackend: true },
+  { id: "update", title: "check for update", panel: "update", mutatesBackend: true },
+  { id: "headless", title: "show CLI commands", panel: "headless" },
+  { id: "acp", title: "show ACP bridge", panel: "acp" },
+  { id: "theme", title: "preview themes", panel: "theme" },
+  { id: "stop", title: "stop run", mutatesBackend: true },
+  { id: "debug", title: "show debug state", panel: "debug" },
+  { id: "reason", title: "toggle reasoning" },
+  { id: "rail", title: "list sessions" },
+  { id: "palette", title: "open command palette" },
+  { id: "settings", title: "open settings", panel: "settings", mutatesBackend: false },
+  { id: "extensions", title: "show extensions", panel: "extensions", mutatesBackend: false },
+  { id: "help", title: "show commands", panel: "help" },
 ];
+
+const pickerCommandIds = [
+  "new",
+  "context",
+  "diff",
+  "diff-stat",
+  "replay",
+  "sessions",
+  "skills",
+  "model",
+  "resume",
+  "plan",
+  "build",
+  "usage",
+  "review",
+  "eval",
+  "update",
+  "headless",
+  "acp",
+  "theme",
+  "help",
+] as const satisfies readonly CommandId[];
+
+// The parser accepts compatibility and low-level action commands; the picker
+// stays curated to the Paper command surface so it remains scannable.
+export const pickerCommands: Command[] = pickerCommandIds.map((id) => commands.find((command) => command.id === id)!);
 
 export const plannedCommands = [
   "compact",
@@ -100,7 +128,7 @@ export function parseCommandInput(input: string): ParsedCommand | null {
   return { id, args: args ? args.split(/\s+/) : [] };
 }
 
-export const themeCycle = ["tiny-dark", "tiny-light", "dracula", "gruvbox"] as const;
+export const themeCycle = ["paper-dark", "paper-light", "mono"] as const;
 
 export function applyLocalCommand(state: AppState, id: CommandId): AppState {
   if (id === "plan") return { ...state, sessionMode: "plan" satisfies SessionMode };
@@ -109,11 +137,13 @@ export function applyLocalCommand(state: AppState, id: CommandId): AppState {
   if (id === "ask") return { ...state, approvalMode: "on-request" satisfies ApprovalMode };
   if (id === "debug") return { ...state, ui: { ...state.ui, debugOverlay: !state.ui.debugOverlay } };
   if (id === "reason") return { ...state, ui: { ...state.ui, showReasoning: !state.ui.showReasoning } };
-  if (id === "rail") return { ...state, ui: { ...state.ui, rightRail: !state.ui.rightRail } };
+  // The Paper redesign removes the persistent split rail. Keep the command as
+  // a compatibility alias for the sessions overlay.
+  if (id === "rail") return { ...state, ui: { ...state.ui, rightRail: false, activePanel: "sessions" } };
   if (id === "palette") return { ...state, ui: { ...state.ui, paletteOpen: !state.ui.paletteOpen, activePanel: state.ui.paletteOpen ? state.ui.activePanel : "help" } };
   if (id === "theme") {
     const index = themeCycle.indexOf(state.ui.theme as (typeof themeCycle)[number]);
-    const next = themeCycle[(index + 1 + themeCycle.length) % themeCycle.length] ?? "tiny-dark";
+    const next = themeCycle[(index + 1 + themeCycle.length) % themeCycle.length] ?? "paper-dark";
     return { ...state, ui: { ...state.ui, theme: next, activePanel: "theme" } };
   }
   const command = commands.find((item) => item.id === id);

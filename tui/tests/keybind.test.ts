@@ -12,6 +12,8 @@ test("comboFromKeyEvent renders canonical chords", () => {
 test("lookupAction falls back to global context", () => {
   expect(lookupAction(defaultKeymap, "composer", "Ctrl+K")).toBe("open-palette");
   expect(lookupAction(defaultKeymap, "transcript", "Ctrl+K")).toBe("open-palette");
+  expect(lookupAction(defaultKeymap, "transcript", "Ctrl+R")).toBe("history-search");
+  expect(lookupAction(defaultKeymap, "transcript", "Ctrl+B")).toBe("toggle-rail");
 });
 
 test("composer bindings override global Up", () => {

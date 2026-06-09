@@ -22,6 +22,7 @@ import { applyUserThemes } from "./ui/themeLoader";
 import { loadUserKeymap } from "./ui/keymapLoader";
 import { loadComposerHistory, saveComposerHistory } from "./ui/historyStore";
 import { loadSettings } from "./ui/widgets/SettingsWidget";
+import { metadataForWorkspaceFiles } from "./ui/fileMetadata";
 
 export { handleCommand, startRunTask };
 export type { ActiveRun };
@@ -87,6 +88,8 @@ async function initializeState(client: TinyAgentClient): Promise<AppState> {
   const activeWorkspaceId = workspaces[0]?.workspace_id ?? null;
   const sessions = activeWorkspaceId ? await client.listConversations(activeWorkspaceId).catch(() => []) : [];
   const workspaceFiles = activeWorkspaceId ? await client.workspaceFiles(activeWorkspaceId).catch(() => []) : [];
+  const workspace = workspaces.find((item) => item.workspace_id === activeWorkspaceId);
+  const workspaceFileMetadata = metadataForWorkspaceFiles(workspace?.root, workspaceFiles);
   const git = activeWorkspaceId ? await client.gitStatus(activeWorkspaceId).catch(() => null) : null;
   const updateStatus = await client.updateStatus().catch(() => null);
   const persistedSettings = loadSettings();
@@ -96,6 +99,7 @@ async function initializeState(client: TinyAgentClient): Promise<AppState> {
     workspaces,
     activeWorkspaceId,
     workspaceFiles,
+    workspaceFileMetadata,
     sessions,
     activeSession: { ...createSession(sessions[0]?.conversation_id ?? "local"), git },
     updatePanel: updateStatus
@@ -168,6 +172,11 @@ async function interactiveLoop(
     activeRun = await handleCommand(client, store, { id, args: [] }, activeRun, render);
     render();
   });
+  mount.setOnSlashCommand(async (id) => {
+    mount.mentionMenu.hide();
+    activeRun = await handleCommand(client, store, { id, args: [] }, activeRun, render);
+    render();
+  });
 
   mount.approval.setOnDecide(async (decision, id) => {
     activeRun = await handleCommand(
@@ -212,8 +221,8 @@ async function interactiveLoop(
       // Any other key falls through to the textarea so the user can continue typing.
     }
 
-    // Palette is a real modal — its select holds focus, so arrows work natively.
-    // We just need to handle Escape and the outer toggle here.
+    // Command-palette mode uses the same PickerWidget as /, @, and $ mentions.
+    // Keep the composer focused and route only navigation/commit keys here.
     if (mount.palette.isVisible()) {
       if (name === "escape") {
         mount.togglePalette();
@@ -249,6 +258,58 @@ async function interactiveLoop(
       resolveDone?.();
       return;
     }
+    if (mount.contextMenu.isVisible()) {
+      if (name === "escape") {
+        mount.contextMenu.hide();
+        render();
+        return;
+      }
+      if (name === "up") {
+        mount.contextMenu.moveUp();
+        render();
+        return;
+      }
+      if (name === "down") {
+        mount.contextMenu.moveDown();
+        render();
+        return;
+      }
+      if (name === "return" || name === "enter") {
+        if (mount.contextMenu.commit()) {
+          suppressNextSubmit = true;
+          render();
+          return;
+        }
+      }
+    }
+    if (mount.historySearch.isOpen()) {
+      if (name === "escape") {
+        mount.historySearch.close();
+        render();
+        return;
+      }
+      if (name === "return" || name === "enter") {
+        mount.historySearch.commit();
+        suppressNextSubmit = true;
+        render();
+        return;
+      }
+      if (name === "backspace") {
+        mount.historySearch.backspace();
+        render();
+        return;
+      }
+      if (key.ctrl && name === "r") {
+        mount.historySearch.cycle();
+        render();
+        return;
+      }
+      if (key.sequence && key.sequence.length === 1 && !key.ctrl && !key.meta) {
+        mount.historySearch.appendChar(key.sequence);
+        render();
+        return;
+      }
+    }
     if (key.ctrl && (name === "k" || name === "p")) {
       mount.togglePalette();
       return;
@@ -261,27 +322,51 @@ async function interactiveLoop(
       mount.toggleRail();
       return;
     }
-    if (mount.historySearch.isOpen()) {
-      if (name === "escape") {
-        mount.historySearch.close();
+    if (name === "escape" && store.get().ui.activePanel !== "transcript") {
+      mount.closePanelOverlay();
+      render();
+      return;
+    }
+    if (store.get().ui.activePanel !== "transcript") {
+      if (store.get().ui.activePanel === "sessions" && name === "n") {
+        activeRun = await handleCommand(client, store, { id: "new", args: [] }, activeRun, render);
+        render();
+        return;
+      }
+      if (name === "up") {
+        mount.rail.moveSelection(-1);
+        render();
+        return;
+      }
+      if (name === "down") {
+        mount.rail.moveSelection(1);
+        render();
         return;
       }
       if (name === "return" || name === "enter") {
-        mount.historySearch.commit();
-        suppressNextSubmit = true;
-        return;
-      }
-      if (name === "backspace") {
-        mount.historySearch.backspace();
-        return;
-      }
-      if (key.ctrl && name === "r") {
-        mount.historySearch.cycle();
-        return;
-      }
-      if (key.sequence && key.sequence.length === 1 && !key.ctrl && !key.meta) {
-        mount.historySearch.appendChar(key.sequence);
-        return;
+        if (store.get().ui.activePanel === "help") {
+          const id = mount.rail.selectedCommandId();
+          if (id) {
+            activeRun = await handleCommand(client, store, { id, args: [] }, activeRun, render);
+            suppressNextSubmit = true;
+            render();
+            return;
+          }
+        }
+        if (store.get().ui.activePanel === "sessions") {
+          const conversationId = mount.rail.selectedValue();
+          if (conversationId) {
+            activeRun = await handleCommand(client, store, { id: "resume", args: [conversationId] }, activeRun, render);
+            suppressNextSubmit = true;
+            render();
+            return;
+          }
+        }
+        if (mount.rail.commitSelection()) {
+          suppressNextSubmit = true;
+          render();
+          return;
+        }
       }
     }
     if (key.ctrl && name === "d") {

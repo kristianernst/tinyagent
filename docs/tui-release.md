@@ -5,12 +5,14 @@
 TinyAgent keeps Python runtime dependencies separate from the Bun/OpenTUI client.
 
 ```bash
-uv tool install .
+uv tool install --force --editable .
 tinyagent doctor --workspace . --provider fake --port 0
-tinyagent tui --workspace . --provider fake
+tinyagent
 ```
 
 For packaged wheels, the launcher uses the bundled `tinyagent/tui/dist/main.js`. In a source checkout, it uses `tui/src/main.ts`.
+Running `tinyagent` with no subcommand opens the TUI for the current directory;
+use `tinyagent tui ...` when passing explicit launch flags.
 
 The product release channel is alpha. Install and update behavior is documented in [install-update.md](install-update.md). The TUI and Python backend ship as one versioned payload, and `/update` exposes the same update state as `tinyagent update`.
 

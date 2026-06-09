@@ -1,0 +1,38 @@
+ ◆ tinyagent  │  ws : tinyagent  │  model : gpt-5  │  ⎇ ta-revi…arning                      ⦗ idle ⦘   │  ctx ▰▱▱▱▱ 25% 
+  › bring the panel surface in line with the Paper TUI refer│  replay  ⦗ 5 ⦘                               ⌜esc⌟ close  
+                                                            │                                                           
+  ◆ thought  ⌜r⌟ expand                                     │───────────────────────────────────────────────────────────
+                                                            │                                                           
+    ✓ read     Paper overlay reference                      │  replay                                                   
+    ✓ edit     panel widgets                                │    ▏ run            overlay refactor                      
+                                                            │      saved trace                                          
+  The main shell stays one column. Panels slide over the tra│    ▏ timeline       5 steps                               
+  terminal rhythm.                                          │      cursor 4 · replay 5.7ms                              
+                                                            │    ▏ fork           workspace copy                        
+                                                            │      temporary workspace                                  
+                                                            │     run started                                 step 1    
+                                                            │     trace opened                                          
+                                                            │     reasoning done                              step 2    
+                                                            │     reasoning sealed                                      
+                                                            │     tool started                                step 3    
+                                                            │     read · running                                        
+                                                            │   ▍ tool completed                              step 4    
+                                                            │     read · output captured                                
+                                                            │     assistant delta                             step 5    
+                                                            │     assistant text                                        
+                                                            │                                                           
+                                                            │  turn preview                                             
+                                                            │    ▏ phase          streaming                             
+                                                            │      1 turn · 1 tool · 5.7ms replay                       
+                                                            │    ▏ assistant      response preview                      
+                                                            │      The panel surfaces now share one language.           
+                                                            │                                                           
+                                                            │  selected step                                            
+                                                            │    ▏ step           4                                     
+                                                            │      read · output captured                               
+                                                            │    ▏ tool           read                                  
+                                                            │    ▏ output         RailWidget mounts the overlay shell.  
+                                                            │                                                           
+                                                            │                                                           
+                                                            │───────────────────────────────────────────────────────────
+                                                            │  ⌜esc⌟ close                                              

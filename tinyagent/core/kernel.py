@@ -101,6 +101,9 @@ class Kernel:
         session_mode: SessionMode = "normal",
         workspace_mode: WorkspaceMode = "auto",
         sandbox_mode: SandboxModeInput = "none",
+        permission_profile: str | None = None,
+        enforce_policy_in_yolo: bool = False,
+        deny_yolo_approvals: bool = False,
         hooks: Sequence[TinyHook] = (),
         extensions: Sequence[Extension] = (),
         resources: LoadedResources | None = None,
@@ -153,6 +156,9 @@ class Kernel:
         self.session_mode = session_mode
         self.workspace_mode = workspace_mode
         self.sandbox_mode = sandbox_mode
+        self.permission_profile = permission_profile
+        self.enforce_policy_in_yolo = enforce_policy_in_yolo
+        self.deny_yolo_approvals = deny_yolo_approvals
         self.hooks = (*tuple(hooks), *extension_host.hooks())
         self.hook_error_policy = hook_error_policy
         self.hook_runner = HookRunner(self.hooks, error_policy=hook_error_policy)
@@ -251,6 +257,7 @@ class Kernel:
                     "sandbox_backend": state.workspace_envelope.sandbox_backend if state.workspace_envelope else "none",
                     "network_mode": state.workspace_envelope.network_mode if state.workspace_envelope else "deny",
                     "sandbox_enforced": bool(state.workspace_envelope.sandbox_enforced) if state.workspace_envelope else False,
+                    "permission_profile": self.permission_profile,
                     "parent_run_id": state.parent_run_id,
                     "parent_event_id": state.parent_event_id,
                     "branch_name": state.branch_name,
@@ -854,10 +861,18 @@ class Kernel:
                 self._record_blocked_tool_call(state, call, result)
                 return
         if decision.kind == "needs_approval":
-            decision = resolve_approval(state, decision, approval_handler=self.approval_handler)
-            state.raise_if_cancelled()
-            if decision.kind == "deny":
+            if state.approval_mode == "yolo" and self.deny_yolo_approvals:
+                decision = PolicyDecision.deny(
+                    "permission profile requires policy enforcement; yolo cannot auto-approve this action",
+                    matched_rule=decision.matched_rule,
+                    permission=decision.permission,
+                )
                 record_policy_decision(state, call, decision)
+            else:
+                decision = resolve_approval(state, decision, approval_handler=self.approval_handler)
+                state.raise_if_cancelled()
+                if decision.kind == "deny":
+                    record_policy_decision(state, call, decision)
         if not decision.allowed:
             data = _blocked_result_data(decision)
             result = ToolResult(
@@ -873,6 +888,9 @@ class Kernel:
             self._record_blocked_tool_call(state, call, result)
             return
 
+        self._execute_allowed_tool_call(state, call, tool)
+
+    def _execute_allowed_tool_call(self, state: RunState, call: ToolCall, tool: Tool) -> None:
         tool_execution_id = f"tool-exec-{call.id}"
         self._record_mutation_event(state, "workspace.mutation.planned", call)
         self._record_mutation_event(state, "workspace.mutation.started", call)
@@ -966,7 +984,7 @@ class Kernel:
                     permission=decision.permission,
                 )
             return decision
-        if state.approval_mode == "yolo":
+        if state.approval_mode == "yolo" and not self.enforce_policy_in_yolo:
             return PolicyDecision.allow(
                 "approval-mode=yolo bypasses policy enforcement",
                 matched_rule="approval_mode:yolo:allow",

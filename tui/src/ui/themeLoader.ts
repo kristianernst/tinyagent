@@ -47,7 +47,7 @@ function mergeWithBase(partial: Partial<Theme>): Theme | null {
     if (key === "name") continue;
     if (typeof partial[key] !== "string") return null;
   }
-  // Inherit any unset keys from the default tiny-dark to keep widgets safe.
-  const base = themes["tiny-dark"];
+  // Inherit any unset keys from the default paper-dark to keep widgets safe.
+  const base = themes["paper-dark"];
   return { ...base, ...partial, name: partial.name } as Theme;
 }

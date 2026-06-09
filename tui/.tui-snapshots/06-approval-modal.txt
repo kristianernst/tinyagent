@@ -1,0 +1,38 @@
+ ◆ tinyagent  │  ws : tinyagent  │  model : gpt-5  │  ⎇ ta-revi…arning                   ⦗ approve ⦘   │  ctx ▱▱▱▱▱  0% 
+                                                                                                                        
+    › fix the streaming jitte…                                                                                          
+    ◆ thought for 4s                                                                                                    
+    ⠙ shell rm -rf node_modul…                                                                                          
+    We should clean the loc…  ┌──────────────────────────────────────────────────────────┐                              
+    ━━━━━━━━━━━━━━━━━━━━━━━━  │                                                          │                              
+                              │   ┏━  ⦗ APPROVE ⦘  shell                            ━┓   │                              
+                              │                                                          │                              
+                              │   ┌──────────────────────────────────────────────────┐   │                              
+                              │   │  rm -rf node_modules                             │   │                              
+                              │   └──────────────────────────────────────────────────┘   │                              
+                              │                                                          │                              
+                              │   in: /Users/kristian/work/dev/tinyagent                 │                              
+                              │   requested by: agent · turn 7                           │                              
+                              │                                                          │                              
+                              │   ──────────────────────────────────────────────────     │                              
+                              │   ⌜y⌟ allow once         ⌜a⌟ allow for session           │                              
+                              │   ⌜n⌟ deny               ⌜e⌟ edit command                │                              
+                              │                                                          │                              
+                              │   ┗━ esc dismisses                                  ━┛   │                              
+                              │                                                          │                              
+                              └──────────────────────────────────────────────────────────┘                              
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        

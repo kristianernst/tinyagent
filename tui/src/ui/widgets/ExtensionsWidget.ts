@@ -1,33 +1,28 @@
 import type { ExtensionEntry } from "../../state/reducer";
 import type { Theme } from "../theme";
-import { makeBox, makeSelect, makeText } from "../layout";
+import { makeBox } from "../layout";
+import { InfoPanelWidget } from "./InfoPanelWidget";
+import { makePanelList } from "./panelStyle";
 
 export class ExtensionsWidget {
   readonly node: any;
   private select: any;
-  private detail: any;
+  private detail: InfoPanelWidget;
   private extensions: ExtensionEntry[] = [];
 
   constructor(private opentui: any, private ctx: any, private theme: Theme) {
     this.node = makeBox(opentui, ctx, { flexDirection: "column", flexGrow: 1 });
-    this.select = makeSelect(opentui, ctx, {
-      options: [],
+    this.select = makePanelList(opentui, ctx, theme, {
       showDescription: true,
-      backgroundColor: theme.surface,
-      textColor: theme.text,
-      selectedBackgroundColor: theme.selectionBg,
-      selectedTextColor: theme.selectionFg,
-      descriptionColor: theme.textMuted,
-      selectedDescriptionColor: theme.text,
-      showScrollIndicator: true,
-      wrapSelection: true,
-      focusable: true,
       minHeight: 4,
-      flexGrow: 1,
+      height: 10,
+      flexShrink: 0,
+      maxRows: 4,
+      maxTextWidth: 52,
     });
-    this.detail = makeText(opentui, ctx, { content: "No extensions detected.", fg: theme.textMuted, marginTop: 1 });
+    this.detail = new InfoPanelWidget(opentui, ctx, theme, { compact: true, minHeight: 11 });
     this.node.add?.(this.select);
-    this.node.add?.(this.detail);
+    this.node.add?.(this.detail.node);
     if (typeof this.select?.on === "function") {
       this.select.on("selectionChanged", (event: any) => {
         const index = event?.index ?? event?.selectedIndex ?? 0;
@@ -40,14 +35,24 @@ export class ExtensionsWidget {
     this.extensions = extensions;
     if (!extensions.length) {
       if (this.select && "options" in this.select) this.select.options = [];
-      if (this.detail && this.detail.content !== undefined)
-        this.detail.content = "No extensions reported by the backend.";
+      this.detail.update({
+        eyebrow: "extension detail",
+        rows: [
+          {
+            label: "status",
+            value: "empty",
+            detail: "no extensions reported",
+            tone: "muted",
+          },
+        ],
+      });
       return;
     }
     if (this.select && "options" in this.select) {
       this.select.options = extensions.map((ext) => ({
-        name: `${kindIcon(ext.kind)} ${ext.name}`,
-        description: ext.description ?? extensionDescription(ext),
+        name: extensionName(ext),
+        rightMeta: extensionMeta(ext),
+        description: extensionListDetail(ext),
         value: ext.name,
       }));
     }
@@ -56,16 +61,41 @@ export class ExtensionsWidget {
 
   private renderDetail(ext: ExtensionEntry | undefined): void {
     if (!ext) {
-      if (this.detail && this.detail.content !== undefined) this.detail.content = "";
+      this.detail.update({
+        eyebrow: "extension detail",
+        rows: [
+          {
+            label: "status",
+            value: "quiet",
+            detail: "choose an extension row",
+            tone: "muted",
+          },
+        ],
+      });
       return;
     }
-    const lines = [
-      `${kindIcon(ext.kind)} ${ext.name} · ${ext.kind}`,
-      ext.servers && ext.servers.length ? `servers: ${ext.servers.join(", ")}` : "",
-      typeof ext.enabled === "boolean" ? `enabled: ${ext.enabled ? "yes" : "no"}` : "",
-      ext.description ? `\n${ext.description}` : "",
-    ].filter(Boolean);
-    if (this.detail && this.detail.content !== undefined) this.detail.content = lines.join("\n");
+    this.detail.update({
+      eyebrow: "extension detail",
+      rows: [
+        {
+          label: "name",
+          value: extensionName(ext),
+          detail: statusLabel(ext),
+          tone: ext.enabled === false ? "muted" : "accent",
+        },
+        {
+          label: "servers",
+          value: serverSummary(ext),
+          detail: serverDetail(ext),
+        },
+        {
+          label: "purpose",
+          value: purposeValue(ext),
+          detail: purposeDetail(ext),
+          tone: ext.enabled === false ? "warning" : "default",
+        },
+      ],
+    });
   }
 }
 
@@ -84,16 +114,64 @@ export function normalizeExtensions(raw: Array<Record<string, unknown>>): Extens
   return out;
 }
 
-function kindIcon(kind: ExtensionEntry["kind"]): string {
-  if (kind === "mcp") return "▤";
-  if (kind === "lsp") return "⌘";
-  if (kind === "feature") return "✦";
-  return "•";
+function extensionMeta(ext: ExtensionEntry): string {
+  const count = ext.servers?.length ?? 0;
+  if (ext.kind === "mcp" || ext.kind === "lsp") return `${count} ${count === 1 ? "server" : "servers"}`;
+  return statusShort(ext);
 }
 
-function extensionDescription(ext: ExtensionEntry): string {
-  if (ext.kind === "mcp") return `Model Context Protocol — ${ext.servers?.length ?? 0} servers`;
-  if (ext.kind === "lsp") return `Language servers — ${ext.servers?.length ?? 0} configured`;
-  if (ext.kind === "feature") return "Backend feature toggle";
-  return "Extension";
+function extensionListDetail(ext: ExtensionEntry): string {
+  if (ext.servers?.length) return `servers: ${ext.servers.join(", ")}`;
+  if (ext.kind === "feature") return "lifecycle hooks";
+  return purposeDetail(ext);
+}
+
+function statusLabel(ext: ExtensionEntry): string {
+  if (ext.enabled === true) return "enabled";
+  if (ext.enabled === false) return "disabled";
+  return "status unknown";
+}
+
+function statusShort(ext: ExtensionEntry): string {
+  if (ext.enabled === true) return "on";
+  if (ext.enabled === false) return "off";
+  return "unknown";
+}
+
+function serverSummary(ext: ExtensionEntry): string {
+  if (!ext.servers?.length) return "none";
+  return ext.servers.length > 3 ? `${ext.servers.length} configured` : ext.servers.join(", ");
+}
+
+function serverDetail(ext: ExtensionEntry): string {
+  if (ext.servers?.length) return `${ext.servers.length} ${ext.servers.length === 1 ? "server" : "servers"}`;
+  return "no server bindings reported";
+}
+
+function purposeValue(ext: ExtensionEntry): string {
+  if (ext.kind === "mcp") return "tool access";
+  if (ext.kind === "lsp") return "editor intelligence";
+  if (ext.kind === "feature") return "app hooks";
+  return "extension";
+}
+
+function purposeDetail(ext: ExtensionEntry): string {
+  if (ext.kind === "mcp") return "local tool bridge";
+  if (ext.kind === "lsp") return "hover · symbols · diagnostics";
+  if (ext.kind === "feature") return "lifecycle hooks";
+  if (ext.description) return humanDescription(ext.description);
+  return "no description";
+}
+
+function extensionName(ext: ExtensionEntry): string {
+  if (ext.kind === "feature" && ext.name === "product_runtime") return "app hooks";
+  return displayName(ext.name);
+}
+
+function displayName(value: string): string {
+  return value.replace(/[_-]+/g, " ");
+}
+
+function humanDescription(value: string): string {
+  return value.replace(/^Experimental\s+/i, "").replace(/\.$/, "");
 }

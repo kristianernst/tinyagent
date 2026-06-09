@@ -1,6 +1,6 @@
 import type { SettingsState } from "../state/reducer";
 import type { Store } from "../state/store";
-import { saveSettings } from "../ui/widgets/SettingsWidget";
+import { normalizeSpinner, saveSettings } from "../ui/widgets/SettingsWidget";
 
 export function runSettingsCommand(store: Store, args: string[]): boolean {
   const action = args[0] ?? "show";
@@ -18,12 +18,12 @@ export function runSettingsCommand(store: Store, args: string[]): boolean {
     store.set({
       ...state,
       settings: {
-        theme: "tiny-dark",
-        spinner: "ascii",
+        theme: "paper-dark",
+        spinner: "braille",
         showReasoning: false,
         diffView: "unified",
         mouseCapture: true,
-        rightRail: true,
+        rightRail: false,
         dirty: true,
       },
     });
@@ -57,7 +57,7 @@ function applyValue(current: SettingsState, key: string, raw: string): SettingsS
       next.theme = value;
       return next;
     case "spinner":
-      next.spinner = value;
+      next.spinner = normalizeSpinner(value);
       return next;
     case "diff":
     case "diffView":
@@ -73,7 +73,9 @@ function applyValue(current: SettingsState, key: string, raw: string): SettingsS
       return next;
     case "rail":
     case "rightRail":
-      next.rightRail = boolish(value);
+      // The persistent rail was removed by the Paper redesign. Keep these
+      // keys accepted for old configs/commands, but never re-enable the split.
+      next.rightRail = false;
       return next;
     default:
       return null;

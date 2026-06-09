@@ -26,6 +26,7 @@ from tinyagent.core.path_safety import (
     relative_path_is_within,
     safe_artifact_name,
 )
+from tinyagent.core.permission_profiles import permission_profile_for
 from tinyagent.core.policy import LocalPolicy
 from tinyagent.core.profile_catalog import (
     DEFAULT_RUNTIME_CAPABILITIES,
@@ -1532,6 +1533,69 @@ def test_fake_provider_trace_shells_patches_answers_with_content_and_captures_di
     )
     assert (state.output_dir / patch_result.data["output_artifact"]).exists()
     assert (state.output_dir / shell_result.data["output_artifact"]).read_text() == "hello tinyagent\n"
+
+
+def test_read_only_permission_profile_denies_patch_and_shell_writes(tmp_path) -> None:
+    state = RunState.create("read only", Workspace(tmp_path), run_id="run_readonly_policy")
+    profile = permission_profile_for("read-only")
+    assert profile is not None
+    policy = profile.policy()
+
+    patch = "*** Begin Patch\n*** Add File: denied.txt\n+nope\n*** End Patch"
+    patch_decision = policy.evaluate(ToolCall(name="apply_patch", args={"patch": patch}), state)
+    write_file_decision = policy.evaluate(ToolCall(name="write_file", args={"path": "denied.txt", "content": "nope"}), state)
+    str_replace_decision = policy.evaluate(
+        ToolCall(name="str_replace_edit", args={"path": "denied.txt", "old_str": "a", "new_str": "b"}),
+        state,
+    )
+    shell_decision = policy.evaluate(ToolCall(name="shell", args={"cmd": "printf nope > denied.txt"}), state)
+
+    assert patch_decision.kind == "deny"
+    assert patch_decision.permission == "filesystem"
+    assert patch_decision.matched_rule == "filesystem:*:deny"
+    assert write_file_decision.kind == "deny"
+    assert write_file_decision.matched_rule == "filesystem:*:deny"
+    assert str_replace_decision.kind == "deny"
+    assert str_replace_decision.matched_rule == "filesystem:*:deny"
+    assert shell_decision.kind == "deny"
+    assert shell_decision.permission == "filesystem"
+    assert shell_decision.matched_rule == "filesystem:*:deny"
+
+
+def test_permission_profile_mode_mappings() -> None:
+    workspace_write = permission_profile_for("workspace-write")
+    contained_yolo = permission_profile_for("contained-yolo")
+    assert workspace_write is not None
+    assert contained_yolo is not None
+
+    assert (workspace_write.workspace_mode, workspace_write.approval_mode, workspace_write.sandbox_mode) == (
+        "auto",
+        "on-request",
+        "none",
+    )
+    assert (contained_yolo.workspace_mode, contained_yolo.approval_mode, contained_yolo.sandbox_mode) == (
+        "worktree",
+        "yolo",
+        "container",
+    )
+    assert contained_yolo.enforce_policy_in_yolo is True
+    assert contained_yolo.deny_yolo_approvals is False
+
+
+def test_danger_full_access_keeps_hard_shell_denies(tmp_path) -> None:
+    state = RunState.create("danger", Workspace(tmp_path), run_id="run_danger_policy")
+    profile = permission_profile_for("danger-full-access")
+    assert profile is not None
+    policy = profile.policy()
+
+    network = policy.evaluate(ToolCall(name="shell", args={"cmd": "curl https://example.com"}), state)
+    destructive = policy.evaluate(ToolCall(name="shell", args={"cmd": "rm -rf ."}), state)
+
+    assert network.allowed is True
+    assert network.matched_rule == "network:*:allow"
+    assert destructive.kind == "deny"
+    assert destructive.matched_rule is not None
+    assert "rm" in destructive.matched_rule
 
 
 def test_golden_streaming_trace_runs_shell_then_finalizes(tmp_path) -> None:

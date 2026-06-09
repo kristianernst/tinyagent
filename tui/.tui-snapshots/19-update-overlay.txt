@@ -1,0 +1,38 @@
+ ◆ tinyagent  │  ws : tinyagent  │  model : gpt-5  │  ⎇ …                   ⦗ idle ⦘ ⦗ update 0.4.2 ⦘  │  ctx ▰▱▱▱▱ 25% 
+  › bring the panel surface in line with the Paper TUI refer│  update  ⦗ ready ⦘                           ⌜esc⌟ close  
+                                                            │                                                           
+  ◆ thought  ⌜r⌟ expand                                     │───────────────────────────────────────────────────────────
+                                                            │                                                           
+    ✓ read     Paper overlay reference                      │  alpha channel                                            
+    ✓ edit     panel widgets                                │                                                           
+                                                            │   ▏ version        0.4.1 → 0.4.2                          
+  The main shell stays one column. Panels slide over the tra│     new build available                                   
+  terminal rhythm.                                          │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ install        uv-tool                                
+                                                            │     new alpha build available                             
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ active         0.4.1                                  
+                                                            │     previous 0.4.0                                        
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ source         alpha feed                             
+                                                            │     checked release service                               
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ last           checked                                
+                                                            │     2026-05-25 18:40                                      
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │  ready to apply · rollback available                      
+                                                            │                                                           
+                                                            │───────────────────────────────────────────────────────────
+                                                            │  ⌜esc⌟ close                                              

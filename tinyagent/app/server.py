@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -48,6 +48,7 @@ class ProductRuntimeController:
         session_mode: SessionMode = "normal",
         approvals_reviewer: str = "user",
         sandbox_mode: SandboxModeInput = "none",
+        permission_profile: str | None = None,
         profile: str = "tiny-coder",
         profile_override: bool = False,
         todo_memory_enabled: bool = False,
@@ -64,6 +65,7 @@ class ProductRuntimeController:
         self.session_mode = session_mode
         self.approvals_reviewer = approvals_reviewer
         self.sandbox_mode = sandbox_mode
+        self.permission_profile = permission_profile
         self.profile = profile
         self.profile_override = profile_override
         self.todo_memory_enabled = todo_memory_enabled
@@ -122,6 +124,7 @@ class ProductRuntimeController:
                 session_mode=self.session_mode,
                 approvals_reviewer=self.approvals_reviewer,
                 sandbox_mode=self.sandbox_mode,
+                permission_profile=self.permission_profile,
                 profile=self.profile if self.profile_override else record.default_profile,
                 conversation_store=ConversationStore(workspace_root_path / "conversations"),
                 workspace_index_manager=WorkspaceIndexManager.for_workspace_id(
@@ -570,6 +573,7 @@ def create_product_runtime_server(
     provider: str = "fake",
     model_name: str | None = None,
     reasoning: dict[str, Any] | None = None,
+    model_env: Mapping[str, str] | None = None,
     stream: bool = True,
     debug_level: int = 0,
     workspace_mode: WorkspaceMode = "current",
@@ -577,16 +581,17 @@ def create_product_runtime_server(
     session_mode: SessionMode = "normal",
     approvals_reviewer: str = "user",
     sandbox_mode: SandboxModeInput = "none",
+    permission_profile: str | None = None,
     profile: str = "tiny-coder",
     profile_override: bool = False,
     todo_memory_enabled: bool = False,
     memory_enabled: bool = False,
 ) -> ProductRuntimeHTTPServer:
     spec = ProviderSpec(kind=provider, model=model_name, reasoning=reasoning)  # type: ignore[arg-type]
-    provider_for(spec, "provider validation")
+    provider_for(spec, "provider validation", env=model_env)
     product = ProductRuntimeController(
         home=home,
-        provider_factory=lambda task: provider_for(spec, task),
+        provider_factory=lambda task: provider_for(spec, task, env=model_env),
         stream=stream,
         debug_level=debug_level,
         workspace_mode=workspace_mode,
@@ -594,6 +599,7 @@ def create_product_runtime_server(
         session_mode=session_mode,
         approvals_reviewer=approvals_reviewer,
         sandbox_mode=sandbox_mode,
+        permission_profile=permission_profile,
         profile=profile,
         profile_override=profile_override or profile != "tiny-coder",
         todo_memory_enabled=todo_memory_enabled,

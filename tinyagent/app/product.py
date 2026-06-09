@@ -19,6 +19,22 @@ from tinyagent.core.ids import validate_run_id
 
 DEFAULT_HOME = Path("~/.tinyagent")
 SCHEMA_VERSION = 1
+DEFAULT_CONFIG_TOML = """version = 1
+
+[model]
+provider = "fake"
+# name = "gpt-5.5"
+# base_url = "http://127.0.0.1:11434/v1"
+# api_key = "local"
+
+# [model.reasoning]
+# effort = "medium"
+# budget_tokens = 1024
+
+[defaults]
+profile = "tiny-coder"
+# approval_mode = "on-request"
+"""
 
 
 @dataclass(frozen=True)
@@ -66,6 +82,8 @@ class ProductHome:
                 "tinyagent_version": __version__,
             }
             self.version_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        if not self.config_path.exists():
+            self.config_path.write_text(DEFAULT_CONFIG_TOML)
 
     def load_config(self) -> dict[str, Any]:
         if not self.config_path.exists():
@@ -196,7 +214,8 @@ def _validate_workspace_id(workspace_id: str) -> None:
         raise ValueError(f"invalid workspace_id: {workspace_id}")
 
 
-def render_doctor(home: ProductHome, *, workspace: Path, provider: str, port: int) -> tuple[str, bool]:
+def render_doctor(home: ProductHome, *, workspace: Path, provider: str, port: int, env: dict[str, str] | None = None) -> tuple[str, bool]:
+    values = os.environ if env is None else env
     lines = ["Tinyagent Doctor", "", f"version: {__version__}", f"home: {home.root}"]
     ok = True
 
@@ -230,18 +249,18 @@ def render_doctor(home: ProductHome, *, workspace: Path, provider: str, port: in
     ok = _check(lines, f"port {port}", _port_available(port)) and ok
 
     if provider in {"openai-compatible", "openai-responses"}:
-        has_key = bool(os.environ.get("TINYAGENT_MODEL_API_KEY"))
-        has_model = bool(os.environ.get("TINYAGENT_MODEL_NAME"))
+        has_key = bool(values.get("TINYAGENT_MODEL_API_KEY"))
+        has_model = bool(values.get("TINYAGENT_MODEL_NAME"))
         ok = _check(lines, "provider api key", has_key, "TINYAGENT_MODEL_API_KEY") and ok
         ok = _check(lines, "provider model", has_model, "TINYAGENT_MODEL_NAME") and ok
     elif provider == "openai-codex":
         has_token_source = bool(
-            os.environ.get("TINYAGENT_CODEX_BEARER_TOKEN")
-            or os.environ.get("TINYAGENT_CODEX_AUTH_COMMAND")
-            or os.environ.get("TINYAGENT_CODEX_AUTH_FILE")
-            or (Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "auth.json").is_file()
+            values.get("TINYAGENT_CODEX_BEARER_TOKEN")
+            or values.get("TINYAGENT_CODEX_AUTH_COMMAND")
+            or values.get("TINYAGENT_CODEX_AUTH_FILE")
+            or (Path(values.get("CODEX_HOME", str(Path.home() / ".codex"))) / "auth.json").is_file()
         )
-        has_model = bool(os.environ.get("TINYAGENT_CODEX_MODEL_NAME") or os.environ.get("TINYAGENT_MODEL_NAME"))
+        has_model = bool(values.get("TINYAGENT_CODEX_MODEL_NAME") or values.get("TINYAGENT_MODEL_NAME"))
         ok = _check(lines, "provider codex auth", has_token_source, "Codex bearer token source") and ok
         ok = _check(lines, "provider model", has_model, "TINYAGENT_MODEL_NAME") and ok
     else:

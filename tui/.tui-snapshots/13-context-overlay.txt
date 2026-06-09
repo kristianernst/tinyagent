@@ -1,0 +1,38 @@
+ ◆ tinyagent  │  ws : tinyagent  │  model : gpt-5  │  ⎇ tui-paper-overlay                   ⦗ idle ⦘   │  ctx ▰▱▱▱▱ 25% 
+  › bring the panel surface in line with the Paper TUI refer│  context  ⦗ 7 ⦘                              ⌜esc⌟ close  
+                                                            │                                                           
+  ◆ thought  ⌜r⌟ expand                                     │───────────────────────────────────────────────────────────
+                                                            │                                                           
+    ✓ read     Paper overlay reference                      │  workspace context                                        
+    ✓ edit     panel widgets                                │                                                           
+                                                            │   ▏ workspace      tinyagent                              
+  The main shell stays one column. Panels slide over the tra│     ~/work/dev/tinyagent                                  
+  terminal rhythm.                                          │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ git            tui-paper-overlay dirty                
+                                                            │     3 changed files · ahead 2                             
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ files          7                                      
+                                                            │     file mentions                                         
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │   ▍ tui/src/ui/widgets/Rail.ts                            
+                                                            │     tui/src/ui/widgets/ContextWidget.ts       modified    
+                                                            │     tui/src/ui/widgets/ReplayWidget.ts                    
+                                                            │     tui/src/ui/widgets/panelStyle.ts             added    
+                                                            │     tui/scripts/visual-check.ts               modified    
+                                                            │     docs/TUI.md                                           
+                                                            │     README.md                                             
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │───────────────────────────────────────────────────────────
+                                                            │  ⌜esc⌟ close                                              

@@ -1,0 +1,38 @@
+ ◆ tinyagent  │  ws : tinyagent  │  model : gpt-5  │  ⎇ ta-revi…arning                      ⦗ plan ⦘   │  ctx ▰▱▱▱▱ 25% 
+  › wait for the next step                                  │  activity                                    ⌜esc⌟ close  
+                                                            │                                                           
+                                                            │───────────────────────────────────────────────────────────
+  The activity surface should stay quiet until a tool call a│                                                           
+                                                            │  activity clear                                           
+                                                            │                                                           
+                                                            │  tool calls                                               
+                                                            │    ▏ status        quiet                                  
+                                                            │      waiting for agent actions                            
+                                                            │  session mode                                             
+                                                            │    ▏ mode          plan                                   
+                                                            │      write tools locked                                   
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │───────────────────────────────────────────────────────────
+                                                            │  ⌜esc⌟ close                                              

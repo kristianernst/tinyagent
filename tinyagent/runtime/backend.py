@@ -27,6 +27,7 @@ class RunRequest:
     session_mode: str | None = None
     approvals_reviewer: str | None = None
     profile: str | None = None
+    permission_profile: str | None = None
 
 
 @dataclass(frozen=True)
@@ -88,6 +89,7 @@ class LocalRunBackend:
                 approval_mode=request.approval_mode,
                 session_mode=request.session_mode,
                 approvals_reviewer=request.approvals_reviewer,
+                permission_profile=request.permission_profile,
                 profile=request.profile,
             )
         else:
@@ -97,6 +99,7 @@ class LocalRunBackend:
                 approval_mode=request.approval_mode,
                 session_mode=request.session_mode,
                 approvals_reviewer=request.approvals_reviewer,
+                permission_profile=request.permission_profile,
                 profile=request.profile,
             )
         run_id = str(payload["run_id"])
@@ -165,6 +168,7 @@ class HTTPRunBackend:
             "approval_mode": request.approval_mode,
             "session_mode": request.session_mode,
             "approvals_reviewer": request.approvals_reviewer,
+            "permission_profile": request.permission_profile,
             "profile": request.profile,
         }
         payload = self._json("POST", "/v1/runs", {key: value for key, value in body.items() if value is not None})

@@ -22,7 +22,7 @@ from tinyagent.core.ids import validate_run_id
 from tinyagent.core.index import WorkspaceIndexManager
 from tinyagent.core.kernel import Kernel
 from tinyagent.core.models import ProviderError
-from tinyagent.core.policy import default_policy
+from tinyagent.core.permission_profiles import permission_profile_for, policy_for_permission_profile
 from tinyagent.core.profiles import profile_for
 from tinyagent.core.providers.factory import ProviderSpec, provider_for
 from tinyagent.core.resources import ResourceLoader, ResourceLoaderConfig
@@ -112,6 +112,7 @@ class RuntimeConfig:
     session_mode: SessionMode = "normal"
     approvals_reviewer: str = "user"
     sandbox_mode: SandboxModeInput = "none"
+    permission_profile: str | None = None
     profile: str = "tiny-coder"
     conversation_store: ConversationStore | None = None
     workspace_index_manager: WorkspaceIndexManager | None = None
@@ -329,6 +330,7 @@ class RunStore:
             "workspace_mode": started.data.get("workspace_mode", "") if started else "",
             "approval_mode": started.data.get("approval_mode", "") if started else "",
             "session_mode": started.data.get("session_mode", "normal") if started else "normal",
+            "permission_profile": started.data.get("permission_profile", "") if started else "",
             "sandbox_mode": started.data.get("sandbox_mode", "") if started else "",
             "event_count": events[-1].seq if events else 0,
             "event_log_only": True,
@@ -374,6 +376,7 @@ class RunController:
         approval_mode: str | None = None,
         session_mode: str | None = None,
         approvals_reviewer: str | None = None,
+        permission_profile: str | None = None,
         profile: str | None = None,
     ) -> dict[str, Any]:
         return self._start_run(
@@ -382,6 +385,7 @@ class RunController:
             approval_mode=approval_mode,
             session_mode=session_mode,
             approvals_reviewer=approvals_reviewer,
+            permission_profile=permission_profile,
             profile=profile,
         )
 
@@ -396,6 +400,7 @@ class RunController:
         approval_mode: str | None = None,
         session_mode: str | None = None,
         approvals_reviewer: str | None = None,
+        permission_profile: str | None = None,
         profile: str | None = None,
     ) -> dict[str, Any]:
         if self.config.conversation_store is None:
@@ -416,6 +421,7 @@ class RunController:
             approval_mode=approval_mode,
             session_mode=session_mode,
             approvals_reviewer=approvals_reviewer,
+            permission_profile=permission_profile,
             profile=profile,
             prior_messages=prior_messages,
             conversation_id=conversation_id,
@@ -447,6 +453,7 @@ class RunController:
         approval_mode: str | None = None,
         session_mode: str | None = None,
         approvals_reviewer: str | None = None,
+        permission_profile: str | None = None,
         profile: str | None = None,
         prior_messages=(),
         conversation_id: str | None = None,
@@ -457,14 +464,19 @@ class RunController:
         resolved_run_id = run_id or f"run_server_{uuid4().hex}"
         output_dir = self.store.run_path(resolved_run_id)
         thread: threading.Thread
+        resolved_permission_profile_name = permission_profile if permission_profile is not None else self.config.permission_profile
+        resolved_permission_profile = permission_profile_for(resolved_permission_profile_name)
+        default_approval_mode = resolved_permission_profile.approval_mode if resolved_permission_profile and approval_mode is None else self.config.approval_mode
+        resolved_approval_mode = validate_approval_mode(approval_mode, default_approval_mode)
+        resolved_session_mode = validate_session_mode(session_mode, self.config.session_mode)
+        resolved_approvals_reviewer = approvals_reviewer or self.config.approvals_reviewer
+        resolved_workspace_mode = resolved_permission_profile.workspace_mode if resolved_permission_profile else self.config.workspace_mode
+        resolved_sandbox_mode = resolved_permission_profile.sandbox_mode if resolved_permission_profile else self.config.sandbox_mode
         with self._lock:
             if resolved_run_id in self._reserved_run_ids or output_dir.exists():
                 raise ValueError(f"run already exists: {resolved_run_id}")
             self._reserved_run_ids.add(resolved_run_id)
             self._cancel_tokens[resolved_run_id] = token
-        resolved_approval_mode = validate_approval_mode(approval_mode, self.config.approval_mode)
-        resolved_session_mode = validate_session_mode(session_mode, self.config.session_mode)
-        resolved_approvals_reviewer = approvals_reviewer or self.config.approvals_reviewer
         try:
             extensions = []
             if self.config.mcp_clients:
@@ -477,17 +489,20 @@ class RunController:
                 model=model,
                 profile=resolved_profile,
                 tools=default_tools(),
-                policy=default_policy(),
+                policy=policy_for_permission_profile(resolved_permission_profile_name),
                 approval_handler=self._approval_handler_for(model, resolved_approvals_reviewer),
                 event_sink=TeeEventSink(
                     self.bus,
                     SurfaceEventLogSink(output_dir, debug_level=self.config.debug_level),
                 ),
                 stream=self.config.stream,
-                workspace_mode=self.config.workspace_mode,
+                workspace_mode=resolved_workspace_mode,
                 approval_mode=resolved_approval_mode,  # type: ignore[arg-type]
                 session_mode=resolved_session_mode,  # type: ignore[arg-type]
-                sandbox_mode=self.config.sandbox_mode,
+                sandbox_mode=resolved_sandbox_mode,
+                permission_profile=resolved_permission_profile.name if resolved_permission_profile else None,
+                enforce_policy_in_yolo=resolved_permission_profile.enforce_policy_in_yolo if resolved_permission_profile else False,
+                deny_yolo_approvals=resolved_permission_profile.deny_yolo_approvals if resolved_permission_profile else False,
                 workspace_index_manager=self.config.workspace_index_manager,
                 extensions=extensions,
                 resources=ResourceLoader(ResourceLoaderConfig(memory_enabled=self.config.memory_enabled)).load(
@@ -522,10 +537,10 @@ class RunController:
                     output_dir=output_dir,
                     cancel_token=token,
                     stream=self.config.stream,
-                    workspace_mode=self.config.workspace_mode,
+                    workspace_mode=resolved_workspace_mode,
                     approval_mode=resolved_approval_mode,  # type: ignore[arg-type]
                     session_mode=resolved_session_mode,  # type: ignore[arg-type]
-                    sandbox_mode=self.config.sandbox_mode,
+                    sandbox_mode=resolved_sandbox_mode,
                     prior_messages=prior_messages,
                 )
             finally:
@@ -549,8 +564,11 @@ class RunController:
             self._threads[resolved_run_id] = thread
         thread.start()
         payload = {"run_id": resolved_run_id, "run_path": str(output_dir), "status": "running"}
+        payload["workspace_mode"] = resolved_workspace_mode
         payload["approval_mode"] = resolved_approval_mode
         payload["session_mode"] = resolved_session_mode
+        payload["permission_profile"] = resolved_permission_profile.name if resolved_permission_profile else ""
+        payload["sandbox_mode"] = resolved_sandbox_mode
         payload["profile"] = resolved_profile.name
         if conversation_id:
             payload["conversation_id"] = conversation_id
@@ -633,6 +651,7 @@ class RunController:
             else self.config.workspace / default_eval_output_dir(suite)
         )
         resolved_profile = profile_for(profile or self.config.profile)
+        permission_profile = permission_profile_for(self.config.permission_profile)
         resolved_approval_mode = validate_approval_mode(approval_mode, self.config.approval_mode)
         resolved_session_mode = validate_session_mode(session_mode, self.config.session_mode)
         resolved_reviewer = approvals_reviewer or self.config.approvals_reviewer
@@ -642,13 +661,16 @@ class RunController:
             model_factory=self.config.provider_factory,
             profile=resolved_profile,
             tools=default_tools(),
-            policy=default_policy(),
+            policy=policy_for_permission_profile(self.config.permission_profile),
             stream=False,
             workspace_mode=self.config.workspace_mode,
             approval_mode=resolved_approval_mode,  # type: ignore[arg-type]
             session_mode=resolved_session_mode,  # type: ignore[arg-type]
             approvals_reviewer=resolved_reviewer,
             sandbox_mode=self.config.sandbox_mode,
+            permission_profile=permission_profile.name if permission_profile else None,
+            enforce_policy_in_yolo=permission_profile.enforce_policy_in_yolo if permission_profile else False,
+            deny_yolo_approvals=permission_profile.deny_yolo_approvals if permission_profile else False,
             resources=ResourceLoader(ResourceLoaderConfig(memory_enabled=self.config.memory_enabled)).load(
                 self.config.workspace,
                 runtime_capabilities=resolved_profile.runtime_capabilities,
@@ -1053,8 +1075,17 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 if not task:
                     self._v1_error(HTTPStatus.BAD_REQUEST, "bad_request", "task is required")
                     return
-                approval_mode = validate_approval_mode(body.get("approval_mode"), self.server.controller.config.approval_mode)
-                session_mode = validate_session_mode(body.get("session_mode"), self.server.controller.config.session_mode)
+                approval_mode = (
+                    validate_approval_mode(body["approval_mode"], self.server.controller.config.approval_mode)
+                    if "approval_mode" in body
+                    else None
+                )
+                session_mode = (
+                    validate_session_mode(body["session_mode"], self.server.controller.config.session_mode)
+                    if "session_mode" in body
+                    else None
+                )
+                permission_profile = str(body["permission_profile"]) if "permission_profile" in body else None
                 if body.get("conversation_id"):
                     payload = self.server.controller.start_conversation_turn(
                         str(body["conversation_id"]),
@@ -1065,6 +1096,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                         approval_mode=approval_mode,
                         session_mode=session_mode,
                         approvals_reviewer=str(body.get("approvals_reviewer") or self.server.controller.config.approvals_reviewer),
+                        permission_profile=permission_profile,
                         profile=str(body.get("profile") or self.server.controller.config.profile),
                     )
                 else:
@@ -1074,6 +1106,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                         approval_mode=approval_mode,
                         session_mode=session_mode,
                         approvals_reviewer=str(body.get("approvals_reviewer") or self.server.controller.config.approvals_reviewer),
+                        permission_profile=permission_profile,
                         profile=str(body.get("profile") or self.server.controller.config.profile),
                     )
                 self._json(
@@ -1384,6 +1417,7 @@ def create_runtime_server(
     session_mode: SessionMode = "normal",
     approvals_reviewer: str = "user",
     sandbox_mode: SandboxModeInput = "none",
+    permission_profile: str | None = None,
     conversation_root: Path | None = None,
     mcp_clients: Mapping[str, McpClient] | None = None,
     profile: str = "tiny-coder",
@@ -1409,6 +1443,7 @@ def create_runtime_server(
             session_mode=session_mode,
             approvals_reviewer=approvals_reviewer,
             sandbox_mode=sandbox_mode,
+            permission_profile=permission_profile,
             profile=profile,
             conversation_store=ConversationStore(resolved_conversation_root),
             mcp_clients=mcp_clients,
@@ -1553,6 +1588,8 @@ def _not_found_code(message: str) -> str:
 
 def _bad_request_code(message: str) -> str:
     lowered = message.lower()
+    if "permission profile" in lowered:
+        return "permission_profile_error"
     if "already exists" in lowered:
         return "already_exists"
     if "provider" in lowered:

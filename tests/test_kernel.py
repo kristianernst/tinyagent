@@ -28,6 +28,7 @@ from tinyagent.core.events import (
 from tinyagent.core.kernel import Kernel
 from tinyagent.core.model_recording import record_model_tool_calls
 from tinyagent.core.model_stream import ModelDelta
+from tinyagent.core.permission_profiles import permission_profile_for
 from tinyagent.core.run_control import RunCancelled
 from tinyagent.core.state import (
     ApprovalRequest,
@@ -790,6 +791,87 @@ def test_session_mode_plan_blocks_mutation_even_with_yolo(tmp_path) -> None:
     assert "patch.applied" not in event_types(state)
     started = next(event for event in state.events if event.type == "run.started")
     assert started.data["session_mode"] == "plan"
+
+
+def test_read_only_permission_profile_denies_mutation_even_when_yolo_is_requested(tmp_path) -> None:
+    profile = permission_profile_for("read-only")
+    assert profile is not None
+    patch = "*** Begin Patch\n*** Add File: denied.txt\n+nope\n*** End Patch"
+    call = ToolCall(name="apply_patch", args={"patch": patch})
+    model = StaticModel([ModelResponse(tool_calls=[call]), ModelResponse(content="done", finish_reason="stop")])
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[ApplyPatchTool()],
+        policy=profile.policy(),
+        approval_mode="yolo",
+        permission_profile=profile.name,
+        enforce_policy_in_yolo=profile.enforce_policy_in_yolo,
+        deny_yolo_approvals=profile.deny_yolo_approvals,
+    )
+
+    state = kernel.run("read-only should not mutate", workspace=tmp_path)
+
+    assert not (tmp_path / "denied.txt").exists()
+    started = next(event for event in state.events if event.type == "run.started")
+    decision = next(event for event in state.events if event.type == "policy.evaluated")
+    assert started.data["permission_profile"] == "read-only"
+    assert decision.data["kind"] == "deny"
+    assert decision.data["matched_rule"] == "filesystem:*:deny"
+    assert "patch.applied" not in event_types(state)
+
+
+def test_read_only_permission_profile_blocks_yolo_auto_approval_for_shell_ask(tmp_path) -> None:
+    profile = permission_profile_for("read-only")
+    assert profile is not None
+    call = ToolCall(
+        name="shell",
+        args={"cmd": "python -c 'from pathlib import Path; Path(\"created.txt\").write_text(\"x\")'"},
+    )
+    model = StaticModel([ModelResponse(tool_calls=[call]), ModelResponse(content="done", finish_reason="stop")])
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[ShellTool()],
+        policy=profile.policy(),
+        approval_mode="yolo",
+        permission_profile=profile.name,
+        enforce_policy_in_yolo=profile.enforce_policy_in_yolo,
+        deny_yolo_approvals=profile.deny_yolo_approvals,
+    )
+
+    state = kernel.run("read-only yolo ask should not mutate", workspace=tmp_path)
+
+    assert not (tmp_path / "created.txt").exists()
+    decisions = [event for event in state.events if event.type == "policy.evaluated"]
+    assert [event.data["kind"] for event in decisions] == ["needs_approval", "deny"]
+    assert decisions[-1].data["reason"] == "permission profile requires policy enforcement; yolo cannot auto-approve this action"
+    assert "command.started" not in event_types(state)
+
+
+def test_contained_yolo_permission_profile_keeps_hard_shell_denies(tmp_path) -> None:
+    profile = permission_profile_for("contained-yolo")
+    assert profile is not None
+    call = ToolCall(name="shell", args={"cmd": "rm -rf ."})
+    model = StaticModel([ModelResponse(tool_calls=[call]), ModelResponse(content="done", finish_reason="stop")])
+    kernel = Kernel(
+        model=model,
+        profile=BasicProfile(),
+        tools=[ShellTool()],
+        policy=profile.policy(),
+        approval_mode="yolo",
+        permission_profile=profile.name,
+        enforce_policy_in_yolo=profile.enforce_policy_in_yolo,
+        deny_yolo_approvals=profile.deny_yolo_approvals,
+    )
+
+    state = kernel.run("contained-yolo should keep hard denies", workspace=tmp_path)
+
+    decision = next(event for event in state.events if event.type == "policy.evaluated")
+    assert decision.data["kind"] == "deny"
+    assert decision.data["matched_rule"] is not None
+    assert "rm" in decision.data["matched_rule"]
+    assert "command.started" not in event_types(state)
 
 
 def test_session_mode_plan_blocks_shell_writes_but_allows_read_only_shell(tmp_path) -> None:

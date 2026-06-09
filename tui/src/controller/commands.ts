@@ -39,7 +39,7 @@ export async function handleCommand(
     store.set(applyLocalCommand(store.get(), command.id));
     return activeRun;
   }
-  if (command.id === "context" || command.id === "diff") {
+  if (command.id === "context" || command.id === "diff" || command.id === "diff-stat") {
     await refreshWorkspaceSurface(client, store);
     store.set(applyLocalCommand(store.get(), command.id));
     return activeRun;

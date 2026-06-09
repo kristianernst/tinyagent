@@ -1,0 +1,38 @@
+ ◆ tinyagent  │  ws : tinyagent  │  model : gpt-5  │  ⎇ ta-revi…arning                      ⦗ idle ⦘   │  ctx ▰▱▱▱▱ 25% 
+  › bring the panel surface in line with the Paper TUI refer│  model                                       ⌜esc⌟ close  
+                                                            │                                                           
+  ◆ thought  ⌜r⌟ expand                                     │───────────────────────────────────────────────────────────
+                                                            │                                                           
+    ✓ read     Paper overlay reference                      │  model state                                              
+    ✓ edit     panel widgets                                │                                                           
+                                                            │   ▏ provider       openai                                 
+  The main shell stays one column. Panels slide over the tra│     next turn                                             
+  terminal rhythm.                                          │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ model          gpt-5                                  
+                                                            │     generation model                                      
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ approval       on-request                             
+                                                            │     tool gates                                            
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ session        normal                                 
+                                                            │     reasoning folded                                      
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │───────────────────────────────────────────────────────────
+                                                            │  ⌜esc⌟ close                                              

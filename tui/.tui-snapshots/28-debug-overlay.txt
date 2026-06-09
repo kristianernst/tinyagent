@@ -1,0 +1,38 @@
+ ◆ tinyagent  │  ws : tinyagent  │  model : gpt-5  │  ⎇ …                   ⠙  ⦗ streaming ⦘ ⦗ plan ⦘  │  ctx ▰▱▱▱▱ 25% 
+  › bring the panel surface in line with the Paper TUI refer│  debug                                       ⌜esc⌟ close  
+                                                            │                                                           
+  ◆ thought  ⌜r⌟ expand                                     │───────────────────────────────────────────────────────────
+                                                            │                                                           
+    ✓ read     Paper overlay reference                      │  debug                                                    
+    ✓ edit     panel widgets                                │                                                           
+                                                            │   ▏ phase          streaming                              
+  The main shell stays one column. Panels slide over the tra│     approval on-request · plan session                    
+  terminal rhythm.                                          │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ model          openai · gpt-5                         
+                                                            │     next turn                                             
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ theme          paper-dark                             
+                                                            │     semantic layer only · widgets unchanged               
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ activity       3 steps                                
+                                                            │     latest step 88 · 1 turn                               
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ replay         0 steps                                
+                                                            │     0.0 ms timeline                                       
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ surface        debug overlay                          
+                                                            │     right sheet · diff unified                            
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ reasoning      folded                                 
+                                                            │     transcript fold                                       
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │───────────────────────────────────────────────────────────
+                                                            │  ⌜esc⌟ close                                              

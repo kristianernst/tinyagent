@@ -186,7 +186,7 @@ test("stale stop and approval failures are captured as UI errors", async () => {
   expect(store.get().errors).toContain("Approval not found");
 });
 
-test("sessions command renders refreshed session ids in the rail", async () => {
+test("sessions command renders refreshed session ids in the overlay", async () => {
   const store = new Store({ ...emptyState(), activeWorkspaceId: "default", activeSession: createSession("local") });
   const client = {
     listConversations: async () => [

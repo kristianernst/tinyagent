@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from tinyagent.core.container_sandbox import CONTAINER_HOME, CONTAINER_WORKDIR, container_backend_version, default_container_image
+from tinyagent.core.native_sandbox import native_backend_version
 from tinyagent.core.state import RunState
 from tinyagent.core.tools.core import tool_env
 from tinyagent.core.workspace import NetworkMode, SandboxBackend
@@ -61,7 +62,9 @@ def build_execution_envelope(state: RunState, *, timeout_seconds: int) -> Execut
     workspace_envelope = state.workspace_envelope
     sandbox_backend = workspace_envelope.sandbox_backend if workspace_envelope else "none"
     sandbox_enforced = bool(workspace_envelope.sandbox_enforced) if workspace_envelope else False
-    container_home_host = state.output_dir / "container-home" if sandbox_enforced and sandbox_backend in {"docker", "podman"} else None
+    container_backend = sandbox_backend in {"docker", "podman"}
+    native_backend = sandbox_backend in {"seatbelt", "landlock_seccomp", "wsl2"}
+    container_home_host = state.output_dir / "container-home" if sandbox_enforced and container_backend else None
     writable_roots = (state.workspace.root, container_home_host or state.output_dir / "home")
     return ExecutionEnvelope(
         cwd=state.workspace.root,
@@ -73,13 +76,21 @@ def build_execution_envelope(state: RunState, *, timeout_seconds: int) -> Execut
         denied_paths=(state.output_dir / "artifacts", state.output_dir / "context", state.output_dir / "events.jsonl"),
         network_mode=workspace_envelope.network_mode if workspace_envelope else "deny",
         sandbox_backend=sandbox_backend,
-        sandbox_backend_version=container_backend_version(sandbox_backend) if sandbox_enforced else "",
+        sandbox_backend_version=_sandbox_backend_version(sandbox_backend) if sandbox_enforced else "",
         sandbox_enforced=sandbox_enforced,
-        container_image=default_container_image() if sandbox_enforced else "",
+        container_image=default_container_image() if sandbox_enforced and container_backend else "",
         container_home_host=container_home_host,
         escalation_hint=(
             "Container sandbox is active for shell execution; network is denied unless policy and backend mode allow it."
-            if sandbox_enforced
+            if sandbox_enforced and container_backend
+            else "Native shell sandbox is active; network is denied unless policy and backend mode allow it."
+            if sandbox_enforced and native_backend
             else "Requests outside the local policy require approval; no real sandbox backend is active."
         ),
     )
+
+
+def _sandbox_backend_version(sandbox_backend: SandboxBackend) -> str:
+    if sandbox_backend in {"docker", "podman"}:
+        return container_backend_version(sandbox_backend)
+    return native_backend_version(sandbox_backend)

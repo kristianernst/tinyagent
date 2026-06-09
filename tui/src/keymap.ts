@@ -16,7 +16,7 @@ export const keymap: Record<string, KeyAction> = {
   Escape: "close",
   "Ctrl+C": "interrupt",
   "Ctrl+K": "palette",
-  "Ctrl+R": "rightRail",
+  "Ctrl+B": "rightRail",
   "Ctrl+P": "plan",
   "Ctrl+D": "diff",
   "Ctrl+U": "usage",

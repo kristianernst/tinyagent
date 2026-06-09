@@ -113,9 +113,9 @@ export function explainFailure(events: RunEvent[]): FailureExplanation | null {
     lastSuccessfulEvent: lastSuccessful ? `${lastSuccessful.seq} ${lastSuccessful.type}` : "none",
     failedEvent: `${failed.seq} ${failed.type}`,
     recoveryActions: [
-      "Open /replay and inspect the raw failed event.",
-      "Use /rewind <seq> to project state before failure.",
-      "Use /fork <seq> to create recovery metadata from the last good event.",
+      "Inspect raw failed event with /replay.",
+      "Project state before failure with /rewind <seq>.",
+      "Fork from the last good event with /fork <seq>.",
     ],
   };
 }

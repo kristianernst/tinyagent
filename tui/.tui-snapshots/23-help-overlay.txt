@@ -1,0 +1,38 @@
+ ◆ tinyagent  │  ws : tinyagent  │  model : gpt-5  │  ⎇ ta-revi…arning                      ⦗ idle ⦘   │  ctx ▰▱▱▱▱ 25% 
+  › bring the panel surface in line with the Paper TUI refer│  commands                                    ⌜esc⌟ close  
+                                                            │                                                           
+  ◆ thought  ⌜r⌟ expand                                     │───────────────────────────────────────────────────────────
+                                                            │                                                           
+    ✓ read     Paper overlay reference                      │  commands                                                 
+    ✓ edit     panel widgets                                │                                                           
+                                                            │   ▍ /new                             start new session    
+  The main shell stays one column. Panels slide over the tra│     /context                              show context    
+  terminal rhythm.                                          │     /diff                                show git diff    
+                                                            │     /diff-stat                       show diff summary    
+                                                            │     /replay                         replay current run    
+                                                            │     /sessions                            list sessions    
+                                                            │     /skills                           open skill forge    
+                                                            │     /model                            show model state    
+                                                            │     /resume                             resume session    
+                                                            │     /plan                                    plan mode    
+                                                            │     /build                                  build mode    
+                                                            │     /usage                            show token usage    
+                                                            │     /review                             review failure    
+                                                            │     /eval                               run eval suite    
+                                                            │     /update                           check for update    
+                                                            │     /headless                        show CLI commands    
+                                                            │     /acp                               show ACP bridge    
+                                                            │     /theme                              preview themes    
+                                                            │     /help                                show commands    
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │───────────────────────────────────────────────────────────
+                                                            │  ⌜↑↓⌟ nav   ⌜⏎⌟ run   ⌜esc⌟ close                         

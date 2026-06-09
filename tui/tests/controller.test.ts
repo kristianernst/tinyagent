@@ -14,12 +14,13 @@ test("controller exports parity: handleCommand toggles reasoning UI", async () =
   expect(store.get().ui.showReasoning).toBe(false);
 });
 
-test("controller exports parity: handleCommand toggles rail visibility", async () => {
+test("controller exports parity: rail command stays on the Paper overlay path", async () => {
   const store = new Store(emptyState());
   await handleCommand({} as TinyAgentClient, store, { id: "rail", args: [] }, null);
   expect(store.get().ui.rightRail).toBe(false);
+  expect(store.get().ui.activePanel).toBe("sessions");
   await handleCommand({} as TinyAgentClient, store, { id: "rail", args: [] }, null);
-  expect(store.get().ui.rightRail).toBe(true);
+  expect(store.get().ui.rightRail).toBe(false);
 });
 
 test("controller exports parity: startRunTask streams to the store", async () => {

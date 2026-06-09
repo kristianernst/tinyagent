@@ -14,6 +14,7 @@ from typing import Any
 from tinyagent.core.container_sandbox import ContainerSandboxConfig, build_container_command
 from tinyagent.core.contracts import ToolRuntime
 from tinyagent.core.execution import build_execution_envelope
+from tinyagent.core.native_sandbox import NativeSandboxConfig, build_native_command
 from tinyagent.core.run_control import RunCancelled
 from tinyagent.core.state import RunState, ToolCall, ToolResult
 from tinyagent.core.token_utils import estimate_tokens
@@ -249,18 +250,33 @@ def _communicate_with_cancel(process: subprocess.Popen[str], state: RunState, ti
 
 def shell_preflight(state: RunState | None = None) -> dict[str, Any]:
     paths = {name: shutil.which(name) for name in SHELL_PREFLIGHT_COMMANDS}
-    sandboxed = bool(state and state.workspace_envelope and state.workspace_envelope.sandbox_enforced)
+    envelope = state.workspace_envelope if state else None
+    sandboxed = bool(envelope and envelope.sandbox_enforced)
+    scope = "host"
+    if sandboxed and envelope:
+        scope = "host-preflight-for-container" if envelope.sandbox_backend in {"docker", "podman"} else "host-preflight-for-native-sandbox"
     return {
         "commands": {name: path is not None for name, path in paths.items()},
         "python_available": paths["python3"] is not None or paths["python"] is not None,
-        "scope": "host" if not sandboxed else "host-preflight-for-container",
+        "scope": scope,
         "authoritative": not sandboxed,
     }
 
 
 def _popen_command(cmd: str, envelope, call_id: str = "shell") -> _ProcessLaunch:
-    if not envelope.sandbox_enforced or envelope.sandbox_backend not in {"docker", "podman"}:
+    if not envelope.sandbox_enforced:
         return _ProcessLaunch(args=cmd, shell=True)
+    if envelope.sandbox_backend == "seatbelt":
+        config = NativeSandboxConfig(
+            backend=envelope.sandbox_backend,
+            read_roots=tuple(envelope.read_roots),
+            writable_roots=tuple(envelope.writable_roots),
+            denied_paths=tuple(envelope.denied_paths),
+            network_mode=envelope.network_mode,
+        )
+        return _ProcessLaunch(args=build_native_command(config, cmd), shell=False, container_backend=envelope.sandbox_backend)
+    if envelope.sandbox_backend not in {"docker", "podman"}:
+        raise OSError(f"unsupported shell sandbox backend: {envelope.sandbox_backend}")
     if envelope.container_home_host is None:
         raise OSError("container sandbox home directory is not configured")
     envelope.container_home_host.mkdir(parents=True, exist_ok=True)

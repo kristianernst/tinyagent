@@ -1,0 +1,38 @@
+ ◆ tinyagent  │  ws : tinyagent  │  model : gpt-5  │  ⎇ ta-revi…arning                      ⦗ plan ⦘   │  ctx ▰▱▱▱▱ 25% 
+  › review activity overlay                                 │  activity                                    ⌜esc⌟ close  
+                                                            │                                                           
+    ✓ read     Paper activity reference                     │───────────────────────────────────────────────────────────
+    ⠙ patch    PlanBoardWidget copy                         │                                                           
+                                                            │  2 tool calls                                             
+  The activity panel keeps tool calls and session mode in th│   ▍ ✓ read                    Paper activity reference    
+                                                            │     ⠋ patch                       PlanBoardWidget copy    
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │  ✓ read                                                   
+                                                            │    ▏ status        done                                   
+                                                            │      read                                                 
+                                                            │    ▏ args          Paper activity reference               
+                                                            │      tool input                                           
+                                                            │    ▏ started       20:48                                  
+                                                            │      started at                                           
+                                                            │    ▏ completed     20:48                                  
+                                                            │      completed at                                         
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │  session mode                                             
+                                                            │    ▏ mode          plan                                   
+                                                            │      write tools locked                                   
+                                                            │                                                           
+                                                            │  ⠋ patch activity panel                                   
+                                                            │                                                           
+                                                            │───────────────────────────────────────────────────────────
+                                                            │  ⌜esc⌟ close                                              

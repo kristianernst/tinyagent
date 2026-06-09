@@ -1,0 +1,38 @@
+ ◆ tinyagent  │  ws : tinyagent  │  model : gpt-5  │  ⎇ ta-revi…arning                      ⦗ idle ⦘   │  ctx ▰▱▱▱▱ 14% 
+  › bring the panel surface in line with the Paper TUI refer│  headless parity                             ⌜esc⌟ close  
+                                                            │                                                           
+  ◆ thought  ⌜r⌟ expand                                     │───────────────────────────────────────────────────────────
+                                                            │                                                           
+    ✓ read     Paper overlay reference                      │  headless parity                                          
+    ✓ edit     panel widgets                                │                                                           
+                                                            │   ▏ run            start task                             
+  The main shell stays one column. Panels slide over the tra│     tinyagent run "<prompt>"                              
+  terminal rhythm.                                          │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ stream         watch progress                         
+                                                            │     tinyagent run "<prompt>" --stream text                
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ replay         review run                             
+                                                            │     tinyagent replay <run-id>                             
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ fork           from step 42                           
+                                                            │     tinyagent fork <run-path> --at 42                     
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ eval           run suite                              
+                                                            │     tinyagent eval <suite-path>                           
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ draft skill    capture pattern                        
+                                                            │     tinyagent skills draft-from-run <run-path>            
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ usage          17324 tok · 5 calls                    
+                                                            │     saved with run summary                                
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │   ▏ bridge         connect clients                        
+                                                            │     tinyagent agent stdio --protocol tinyagent            
+                                                            │  ───────────────────────────────────────────────────────  
+                                                            │                                                           
+                                                            │                                                           
+                                                            │                                                           
+                                                            │  same trace · cli parity                                  
+                                                            │                                                           
+                                                            │───────────────────────────────────────────────────────────
+                                                            │  ⌜esc⌟ close                                              

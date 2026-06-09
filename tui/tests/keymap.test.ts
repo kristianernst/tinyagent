@@ -13,17 +13,20 @@ test("command palette exposes only wired commands", () => {
   expect(ids).toContain("eval");
   expect(ids).toContain("skills");
   expect(ids).toContain("update");
+  expect(ids).toContain("diff-stat");
   expect(ids).toContain("replay");
   expect(ids).toContain("fork");
   expect(ids).toContain("headless");
   expect(ids).toContain("acp");
   expect(parseCommand("/eval")).toBe("eval");
   expect(parseCommand("/update")).toBe("update");
+  expect(parseCommand("/diff-stat")).toBe("diff-stat");
   expect(parseCommand("/headless")).toBe("headless");
 });
 
 test("terminal keymap exposes core controls", () => {
   expect(keymap["Ctrl+C"]).toBe("interrupt");
   expect(keymap["Ctrl+K"]).toBe("palette");
+  expect(keymap["Ctrl+B"]).toBe("rightRail");
   expect(keymap["Ctrl+D"]).toBe("diff");
 });

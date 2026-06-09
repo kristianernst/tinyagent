@@ -235,6 +235,7 @@ def _final_text(state: RunState) -> str:
 
 def _metrics(state: RunState) -> dict[str, Any]:
     envelope = state.workspace_envelope
+    started = next((event for event in state.events if event.type == "run.started"), None)
     return {
         "run_id": state.run_id,
         "parent_run_id": state.parent_run_id,
@@ -274,6 +275,7 @@ def _metrics(state: RunState) -> dict[str, Any]:
         "workspace_allowed_roots": [str(root) for root in envelope.allowed_roots] if envelope else [str(state.workspace.root)],
         "approval_mode": state.approval_mode,
         "session_mode": state.session_mode,
+        "permission_profile": started.data.get("permission_profile", "") if started else "",
         "sandbox_mode": envelope.sandbox_mode if envelope else "none",
         "sandbox_backend": envelope.sandbox_backend if envelope else "none",
         "network_mode": envelope.network_mode if envelope else "deny",

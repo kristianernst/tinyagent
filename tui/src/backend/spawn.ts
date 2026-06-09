@@ -1,3 +1,6 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+
 type SpawnOptions = {
   workspace: string;
   provider: string;
@@ -24,11 +27,7 @@ declare const Bun: {
 export async function spawnBackend(options: SpawnOptions): Promise<SpawnedBackend> {
   const host = options.host ?? "127.0.0.1";
   const args = [
-    "uv",
-    "run",
-    "python",
-    "-m",
-    "tinyagent.cli",
+    ...backendCommand(),
     "serve",
     "--workspace",
     options.workspace,
@@ -50,6 +49,20 @@ export async function spawnBackend(options: SpawnOptions): Promise<SpawnedBacken
   const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" });
   const baseUrl = await readServerUrl(proc.stdout, host);
   return { baseUrl, stop: () => proc.kill() };
+}
+
+function backendCommand(): string[] {
+  const override = process.env.TINYAGENT_TUI_PYTHON;
+  if (override) return [override, "-m", "tinyagent.cli"];
+
+  for (const candidate of [
+    join(process.cwd(), ".venv", "bin", "python3"),
+    join(process.cwd(), "..", ".venv", "bin", "python3"),
+  ]) {
+    if (existsSync(candidate)) return [candidate, "-m", "tinyagent.cli"];
+  }
+
+  return ["uv", "run", "python", "-m", "tinyagent.cli"];
 }
 
 export async function readServerUrl(stream: ReadableStream<Uint8Array>, host: string): Promise<string> {

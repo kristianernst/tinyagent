@@ -142,6 +142,17 @@ class LocalPolicy:
             if not path:
                 return PolicyDecision.deny("Edit tool requires a path.", permission="filesystem")
             resolve_workspace_path(state, path, allow_run_artifacts=self.allow_run_artifacts)
+            filesystem = self._decision(
+                call,
+                state,
+                "filesystem",
+                str(path),
+                reason="workspace file mutation",
+                action_kind="patch",
+                risk="medium",
+            )
+            if not filesystem.allowed:
+                return filesystem
             if _dirty_current_workspace(state):
                 return PolicyDecision.needs_approval(
                     "edit would mutate a dirty current workspace",
@@ -155,12 +166,24 @@ class LocalPolicy:
             return PolicyDecision.deny("Patch did not declare any file paths.")
         for path in paths:
             resolve_workspace_path(state, path, allow_run_artifacts=self.allow_run_artifacts)
+            filesystem = self._decision(
+                call,
+                state,
+                "filesystem",
+                path,
+                reason="workspace file mutation",
+                action_kind="patch",
+                risk="medium",
+            )
+            if not filesystem.allowed:
+                return filesystem
         if _dirty_current_workspace(state):
             return PolicyDecision.needs_approval(
                 "patch would mutate a dirty current workspace",
                 _approval_request(call, state, action_kind="dirty_mutation", risk="medium"),
+                permission="filesystem",
             )
-        return PolicyDecision.allow("patch paths are inside workspace")
+        return PolicyDecision.allow("patch paths are inside workspace", permission="filesystem")
 
     def _evaluate_shell(self, call: ToolCall, state: RunState) -> PolicyDecision:
         cmd = str(call.args.get("cmd", ""))
@@ -227,6 +250,18 @@ class LocalPolicy:
             )
         workspace_write = _workspace_write_target(cmd, state)
         if workspace_write:
+            filesystem = self._decision(
+                call,
+                state,
+                "filesystem",
+                workspace_write,
+                reason=f"shell command may write to workspace: {workspace_write}",
+                action_kind="shell",
+                risk="medium",
+                command=cmd,
+            )
+            if not filesystem.allowed:
+                return filesystem
             return PolicyDecision.needs_approval(
                 f"shell command may write to workspace: {workspace_write}",
                 _approval_request(call, state, action_kind="shell", risk="medium", args_preview=cmd, command=cmd),
@@ -808,6 +843,7 @@ def default_policy_config() -> PolicyConfig:
     return PolicyConfig(
         default="deny",
         rules=(
+            PolicyRule("filesystem", "*", "allow"),
             PolicyRule("network", "*", "deny"),
             PolicyRule("contextfs_write", ".tinyagent/**", "deny"),
             PolicyRule("contextfs_write", "./.tinyagent/**", "deny"),

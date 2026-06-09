@@ -1,5 +1,6 @@
 import type { TinyAgentClient } from "../backend/client";
 import type { Store } from "../state/store";
+import { metadataForWorkspaceFiles } from "../ui/fileMetadata";
 import { appendError, safeClientAction } from "./errors";
 
 export type ActiveRun = {
@@ -67,9 +68,11 @@ export async function refreshWorkspaceSurface(client: TinyAgentClient, store: St
   if (!workspaceId) return;
   const [workspaceFiles, git] = await Promise.all([client.workspaceFiles(workspaceId), client.gitStatus(workspaceId)]);
   const state = store.get();
+  const workspace = state.workspaces.find((item) => item.workspace_id === workspaceId);
   store.set({
     ...state,
     workspaceFiles,
+    workspaceFileMetadata: metadataForWorkspaceFiles(workspace?.root, workspaceFiles),
     activeSession: state.activeSession
       ? {
           ...state.activeSession,
