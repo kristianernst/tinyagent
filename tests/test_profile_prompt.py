@@ -34,7 +34,7 @@ def test_tiny_coder_loads_packaged_system_prompt() -> None:
 
 def test_tiny_coder_prompt_matches_current_tool_surface() -> None:
     prompt = ApexCoderProfile().system_prompt()
-    for tool_name in ("shell", "read_file", "search_code", "apply_patch", "str_replace_edit", "context_search", "load_skill"):
+    for tool_name in ("shell", "read_file", "search_code", "apply_patch", "str_replace_edit", "context_search", "load_skill", "agent"):
         assert f"`{tool_name}`" in prompt, f"prompt no longer documents {tool_name}"
     for stale_name in ("search_repo", "list_files"):
         assert stale_name not in prompt, f"prompt references retired tool {stale_name}"

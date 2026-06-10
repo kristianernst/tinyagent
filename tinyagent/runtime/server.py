@@ -34,6 +34,7 @@ from tinyagent.core.workspace import SandboxModeInput, WorkspaceMode
 from tinyagent.evals.runner import default_eval_output_dir, render_eval_report, run_eval_suite
 from tinyagent.extensions.lsp import LspConfig
 from tinyagent.extensions.mcp import McpClient, McpConfig, McpExtension
+from tinyagent.extensions.subagent import subagent_extension
 from tinyagent.extensions.todo_memory import TodoMemoryExtension
 from tinyagent.runtime.conversation import ConversationStore
 from tinyagent.runtime.protocol_v1 import V1_RUN_START_KEYS, error_response, health_response, openapi_spec, run_object
@@ -489,11 +490,13 @@ class RunController:
                 extensions.append(TodoMemoryExtension())
             resolved_profile = profile_for(profile or self.config.profile)
             model = self.config.provider_factory(task)
+            resolved_policy = policy_for_permission_profile(resolved_permission_profile_name)
+            extensions.append(subagent_extension(model=model, policy=resolved_policy))
             kernel = Kernel(
                 model=model,
                 profile=resolved_profile,
                 tools=default_tools(),
-                policy=policy_for_permission_profile(resolved_permission_profile_name),
+                policy=resolved_policy,
                 approval_handler=self._approval_handler_for(model, resolved_approvals_reviewer),
                 event_sink=TeeEventSink(
                     self.bus,

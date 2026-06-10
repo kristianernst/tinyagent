@@ -68,6 +68,7 @@ class ApexCoderProfile:
         "todo_write",
         "apply_patch",
         "shell",
+        "agent",
     )
     runtime_capabilities = DEFAULT_RUNTIME_CAPABILITIES
 

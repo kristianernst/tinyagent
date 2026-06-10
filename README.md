@@ -117,11 +117,16 @@ list_skills
 load_skill
 shell
 apply_patch
+agent
 ```
 
 Use shell for inspection, search, git, tests, and builds. Prefer `rg`, `rg --files`,
 `sed`, `nl`, and normal project commands. Use `apply_patch` for edits. Final
 answers are normal assistant content.
+
+`agent` delegates a self-contained subtask to a bounded child run in the same
+workspace (read-only unless `allow_edits` is set); parent and child runs are
+linked through `child_run.*` events and `parent_run_id`.
 
 Hidden tools such as `list_files` may remain registered for tests or ablations,
 but the kernel blocks registered tools that were not visible in the model request

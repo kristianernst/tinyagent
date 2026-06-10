@@ -45,6 +45,7 @@ from tinyagent.evals.runner import (
     run_eval_suite,
 )
 from tinyagent.evals.variants import VariantSpec
+from tinyagent.extensions.subagent import subagent_extension
 from tinyagent.extensions.workspace_snapshot import create_workspace_snapshot, restore_workspace_snapshot
 from tinyagent.runtime.conversation import ConversationStore
 from tinyagent.runtime.replay import replay_run
@@ -581,6 +582,7 @@ def main(argv: list[str] | None = None) -> int:
             profile=profile,
             tools=default_tools(),
             policy=policy,
+            extensions=(subagent_extension(model=model, policy=policy),),
             resources=ResourceLoader(ResourceLoaderConfig(memory_enabled=args.memory)).load(
                 Path(args.workspace),
                 runtime_capabilities=profile.runtime_capabilities,
@@ -978,11 +980,13 @@ def _handle_agent_stdio_request(
         workspace = Path(args.workspace).expanduser().resolve()
         run_id = str(params.get("run_id") or f"run_stdio_{uuid4().hex}")
         output_dir = workspace / ".tinyagent" / "runs" / run_id
+        policy = default_policy()
         kernel = Kernel(
             model=model,
             profile=profile,
             tools=default_tools(),
-            policy=default_policy(),
+            policy=policy,
+            extensions=(subagent_extension(model=model, policy=policy),),
             resources=ResourceLoader(ResourceLoaderConfig(memory_enabled=False)).load(
                 workspace,
                 runtime_capabilities=profile.runtime_capabilities,
