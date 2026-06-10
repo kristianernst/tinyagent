@@ -124,6 +124,35 @@ def write_json_artifact(state: RunState, name: str, data: dict[str, Any], *, kin
     )
 
 
+def record_child_summary(parent: RunState, child: RunState) -> str:
+    summary = "\n".join(
+        [
+            "# Child Run Summary",
+            "",
+            f"child_run_id: {child.run_id}",
+            f"status: {child.status}",
+            f"output_dir: {child.output_dir}",
+            f"final_output_tokens: {estimate_tokens(child.final_output)}",
+            "",
+            child.final_output,
+            "",
+        ]
+    )
+    artifact = write_text_artifact(parent, f"child-{child.run_id}-summary.md", summary, kind="child_summary")
+    event_type = "child_run.completed" if not child.failed and not child.cancelled else "child_run.failed"
+    parent.emit(
+        event_type,
+        {
+            "child_run_id": child.run_id,
+            "status": child.status,
+            "summary_artifact": artifact,
+            "output_dir": str(child.output_dir),
+        },
+        visibility="user",
+    )
+    return artifact
+
+
 def write_model_request_artifacts(
     state: RunState,
     *,

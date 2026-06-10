@@ -7,8 +7,7 @@ def test_expected_top_level_scaffold_exists() -> None:
     expected_paths = [
         "tinyagent",
         "tinyagent/cli.py",
-        "profiles",
-        "profiles/tiny-coder",
+        "tinyagent/profiles/tiny-coder/system.md",
         "tests",
         "docs",
         "pyproject.toml",

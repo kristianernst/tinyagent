@@ -42,10 +42,17 @@ approval.requested
 approval.resolved
 artifact.materialized
 workspace.mutation.detected
+child_run.started
+child_run.completed
+child_run.failed
 run.completed
 run.failed
 run.cancelled
 ```
+
+`child_run.*` events carry `data.child_run_id` plus a `summary_artifact` path on
+completion; the child run's own events live in the child run directory and are
+not interleaved into the parent stream.
 
 ## Correlation Rules
 

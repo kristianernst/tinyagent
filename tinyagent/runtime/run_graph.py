@@ -1,4 +1,4 @@
-"""Run graph helpers for forks and child run summaries."""
+"""Run graph helpers for forks."""
 
 from __future__ import annotations
 
@@ -7,9 +7,6 @@ import shutil
 from pathlib import Path
 
 from tinyagent.core.events import Event, load_events_jsonl
-from tinyagent.core.output import write_text_artifact
-from tinyagent.core.state import RunState
-from tinyagent.core.token_utils import estimate_tokens
 
 
 def fork_run(run_path: Path, at_event_id: str, output_dir: Path | None = None) -> Path:
@@ -43,34 +40,6 @@ def fork_run(run_path: Path, at_event_id: str, output_dir: Path | None = None) -
     )
     (destination / "summary.md").write_text(summary)
     return destination
-
-
-def record_child_summary(parent: RunState, child: RunState) -> str:
-    summary = "\n".join(
-        [
-            "# Child Run Summary",
-            "",
-            f"child_run_id: {child.run_id}",
-            f"status: {child.status}",
-            f"output_dir: {child.output_dir}",
-            f"final_output_tokens: {estimate_tokens(child.final_output)}",
-            "",
-            child.final_output,
-            "",
-        ]
-    )
-    artifact = write_text_artifact(parent, f"child-{child.run_id}-summary.md", summary, kind="child_summary")
-    event_type = "child_run.completed" if not child.failed and not child.cancelled else "child_run.failed"
-    parent.emit(
-        event_type,
-        {
-            "child_run_id": child.run_id,
-            "status": child.status,
-            "summary_artifact": artifact,
-            "output_dir": str(child.output_dir),
-        },
-    )
-    return artifact
 
 
 def copy_run_stub(source: Path, destination: Path) -> None:
