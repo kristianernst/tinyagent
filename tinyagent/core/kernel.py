@@ -1268,6 +1268,7 @@ def _profile_trace_metadata(profile: Profile, state: RunState, tools: Mapping[st
         "profile": profile.name,
         "profile_variant": str(getattr(profile, "profile_variant", "default")),
         "system_prompt_hash": hashlib.sha256(system_prompt.encode()).hexdigest()[:12],
+        "system_prompt_source": str(getattr(profile, "system_prompt_source", "") or "unknown"),
         "profile_visible_tools": visible_tools,
         "context_policy": str(getattr(profile, "context_policy_name", "dynamic-v1")),
         "skill_policy": str(getattr(profile, "skill_policy_name", "default-v1")),

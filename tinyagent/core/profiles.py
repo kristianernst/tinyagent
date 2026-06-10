@@ -86,14 +86,19 @@ class ApexCoderProfile:
         self.context_config = context_config or ContextConfig(compact_after_tool_steps=64)
         if recent_tool_token_budget is not None:
             self.context_config = replace(self.context_config, max_recent_tool_tokens=recent_tool_token_budget)
-        self._system_prompt = self._load_system_prompt()
+        self.system_prompt_source = ""
+        self._system_prompt = self._load_system_prompt(explicit=system_prompt_path is not None)
 
     def system_prompt(self) -> str:
         return self._system_prompt
 
-    def _load_system_prompt(self) -> str:
+    def _load_system_prompt(self, *, explicit: bool) -> str:
         if self.system_prompt_path.exists():
+            self.system_prompt_source = f"file:{self.system_prompt_path}"
             return self.system_prompt_path.read_text()
+        if explicit:
+            raise ValueError(f"System prompt file not found: {self.system_prompt_path}")
+        self.system_prompt_source = "builtin:default-coder-prompt"
         return DEFAULT_CODER_SYSTEM_PROMPT
 
     def build_context(self, state: RunState, *, visible_tools: Sequence[Tool] | None = None) -> BuiltContext:
@@ -247,6 +252,7 @@ class TinyPiProfile:
     ) -> None:
         self.recent_results = recent_results
         self.visible_tool_names = tuple(visible_tool_names) if visible_tool_names is not None else self.DEFAULT_VISIBLE_TOOL_NAMES
+        self.system_prompt_source = "builtin:tiny-pi"
         self.context_config = context_config or ContextConfig(
             project_instruction_max_tokens=2_000,
             max_recent_tool_tokens=2_000,

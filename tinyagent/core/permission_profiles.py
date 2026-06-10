@@ -10,7 +10,6 @@ from tinyagent.core.policy import LocalPolicy, PolicyConfig, PolicyRule, default
 from tinyagent.core.state import ApprovalMode
 from tinyagent.core.workspace import SandboxModeInput, WorkspaceMode
 
-
 PermissionProfileName = Literal["read-only", "workspace-write", "contained-yolo", "danger-full-access"]
 PERMISSION_PROFILE_NAMES: tuple[PermissionProfileName, ...] = (
     "read-only",

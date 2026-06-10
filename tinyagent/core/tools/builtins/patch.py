@@ -24,7 +24,21 @@ class ApplyPatchTool:
     runtime = ToolRuntime(parallel_safe=False, mutates_workspace=True, lock_key="workspace")
     schema = {
         "name": "apply_patch",
-        "description": "Apply a patch inside the workspace.",
+        "description": (
+            "Apply a patch to workspace files. Example:\n"
+            "*** Begin Patch\n"
+            "*** Update File: relative/path.py\n"
+            "@@\n"
+            " context line\n"
+            "-old line\n"
+            "+new line\n"
+            "*** End Patch\n"
+            "File headers: '*** Add File: path' (body lines all start with '+'), '*** Delete File: path' (no body), "
+            "'*** Update File: path' (optionally followed by '*** Move to: new/path'). "
+            "Update bodies hold one or more hunks separated by '@@' lines; hunk lines start with ' ' (context), "
+            "'-' (remove), or '+' (add), and each hunk's context/removed lines must match the file exactly and in "
+            "order. One patch may touch multiple files."
+        ),
         "parameters": {
             "type": "object",
             "properties": {"patch": {"type": "string"}},

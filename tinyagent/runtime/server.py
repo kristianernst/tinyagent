@@ -466,7 +466,11 @@ class RunController:
         thread: threading.Thread
         resolved_permission_profile_name = permission_profile if permission_profile is not None else self.config.permission_profile
         resolved_permission_profile = permission_profile_for(resolved_permission_profile_name)
-        default_approval_mode = resolved_permission_profile.approval_mode if resolved_permission_profile and approval_mode is None else self.config.approval_mode
+        default_approval_mode = (
+            resolved_permission_profile.approval_mode
+            if resolved_permission_profile and approval_mode is None
+            else self.config.approval_mode
+        )
         resolved_approval_mode = validate_approval_mode(approval_mode, default_approval_mode)
         resolved_session_mode = validate_session_mode(session_mode, self.config.session_mode)
         resolved_approvals_reviewer = approvals_reviewer or self.config.approvals_reviewer
